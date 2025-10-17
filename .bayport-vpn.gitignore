@@ -1,0 +1,14 @@
+# This file documents what should NOT be tracked for the VPN scripts
+# The actual .gitignore is at repo root
+
+# Session cache (contains sensitive Bitwarden session keys)
+.cache/bayport-vpn/
+**/session_key
+
+# Temporary VPN config files (contain credentials)
+*.conf
+*.config
+/tmp/fortivpn*
+
+# VPN connection logs
+*.log
