@@ -46,6 +46,26 @@ log_debug() {
     fi
 }
 
+log_prompt() {
+    echo -e "\n${YELLOW}┌─────────────────────────────────────────────────┐${NC}" >&2
+    echo -e "${YELLOW}│ USER INPUT REQUIRED                              │${NC}" >&2
+    echo -e "${YELLOW}└─────────────────────────────────────────────────┘${NC}" >&2
+    echo -e "${YELLOW}➜${NC} $1" >&2
+    echo "" >&2
+}
+
+log_step() {
+    echo -e "\n${BLUE}━━━ $1${NC}" >&2
+}
+
+log_progress() {
+    echo -ne "${BLUE}[⋯]${NC} $1\r" >&2
+}
+
+log_progress_done() {
+    echo -e "${GREEN}[✓]${NC} $1          " >&2
+}
+
 # Remove VPN routes
 remove_vpn_routes() {
     if [ ${#VPN_ROUTES_ADDED[@]} -eq 0 ]; then
@@ -180,8 +200,7 @@ check_connection() {
     fi
 
     local vpn_item
-    vpn_item=$(get_vpn_config "$item_name" "$session_key")
-    if [ $? -ne 0 ] || [ -z "$vpn_item" ]; then
+    if ! vpn_item=$(get_vpn_config "$item_name" "$session_key") || [ -z "$vpn_item" ]; then
         return 1
     fi
 
@@ -288,8 +307,7 @@ show_config() {
     fi
 
     local vpn_item
-    vpn_item=$(get_vpn_config "$item_name" "$session_key")
-    if [ $? -ne 0 ] || [ -z "$vpn_item" ]; then
+    if ! vpn_item=$(get_vpn_config "$item_name" "$session_key") || [ -z "$vpn_item" ]; then
         return 1
     fi
 
@@ -351,29 +369,82 @@ EOF
 check_dependencies() {
     local missing_deps=()
 
-    log_info "Checking dependencies..."
+    log_progress "Checking dependencies..."
 
     for cmd in bw jq openfortivpn mktemp; do
         if ! command -v $cmd &> /dev/null; then
             missing_deps+=($cmd)
-            log_error "Missing required command: $cmd"
-        else
-            local version=$(if [ "$cmd" = "bw" ]; then $cmd --version; elif [ "$cmd" = "jq" ]; then $cmd --version; elif [ "$cmd" = "openfortivpn" ]; then $cmd --version 2>&1 | head -n1; else echo "installed"; fi)
-            log_success "$cmd is installed ($version)"
         fi
     done
 
     if [ ${#missing_deps[@]} -ne 0 ]; then
+        echo "" >&2  # Clear progress line
         log_error "Missing dependencies: ${missing_deps[*]}"
         log_info "Install missing dependencies and try again"
         return 1
     fi
 
-    # Check sudo access
-    if sudo -n true 2>/dev/null; then
-        log_success "Sudo access confirmed"
-    else
-        log_warn "Sudo access may require password (needed for VPN connection)"
+    log_progress_done "All dependencies installed (bw, jq, openfortivpn, mktemp)"
+
+    return 0
+}
+
+# Pre-check and request all permissions needed
+precheck_permissions() {
+    log_step "Pre-checking required permissions"
+
+    local needs_sudo=false
+    local needs_bw_unlock=false
+
+    # Check if we need sudo (for VPN connection and route management)
+    if ! sudo -n true 2>/dev/null; then
+        needs_sudo=true
+    fi
+
+    # Check if Bitwarden needs unlocking
+    if [ -z "${BW_SESSION:-}" ]; then
+        local cached_session=$(load_cached_session 2>/dev/null)
+        if [ -z "$cached_session" ]; then
+            local vault_status=$(bw status 2>/dev/null | jq -r '.status' 2>/dev/null)
+            if [ "$vault_status" = "locked" ]; then
+                needs_bw_unlock=true
+            fi
+        fi
+    fi
+
+    # Request permissions upfront if needed
+    if [ "$needs_sudo" = true ] || [ "$needs_bw_unlock" = true ]; then
+        echo ""
+        echo -e "${YELLOW}╔════════════════════════════════════════════════╗${NC}" >&2
+        echo -e "${YELLOW}║  PERMISSIONS REQUIRED                           ║${NC}" >&2
+        echo -e "${YELLOW}╚════════════════════════════════════════════════╝${NC}" >&2
+        echo ""
+
+        if [ "$needs_sudo" = true ]; then
+            log_info "✓ Sudo access (for VPN routing and network configuration)"
+        fi
+
+        if [ "$needs_bw_unlock" = true ]; then
+            log_info "✓ Bitwarden vault unlock (for credential retrieval)"
+        fi
+
+        echo ""
+        log_info "Requesting permissions now to avoid interruptions later..."
+        echo ""
+
+        # Pre-authenticate sudo
+        if [ "$needs_sudo" = true ]; then
+            log_prompt "Enter sudo password for VPN operations"
+            if ! sudo -v; then
+                log_error "Sudo authentication failed"
+                return 1
+            fi
+            log_success "Sudo authentication successful"
+            echo ""
+        fi
+
+        # Note: Bitwarden unlock will be handled in get_bitwarden_session
+        # but user is now aware it will be needed
     fi
 
     return 0
@@ -480,11 +551,10 @@ save_session_key() {
     local session_key=$1
     ensure_session_cache_dir
 
-    log_debug "Saving session key to cache"
+    log_progress "Saving session to cache..."
     echo "$session_key" > "$SESSION_CACHE_FILE"
     chmod 600 "$SESSION_CACHE_FILE"
-
-    log_success "Session key cached (valid for ${SESSION_TIMEOUT}s)"
+    log_progress_done "Session cached (valid for $((SESSION_TIMEOUT / 60)) minutes)"
 }
 
 load_cached_session() {
@@ -666,48 +736,131 @@ get_bitwarden_session() {
     # Check if a session key already exists in environment
     if [ -n "${BW_SESSION:-}" ]; then
         log_debug "Using existing BW_SESSION from environment"
-        SESSION_KEY=$BW_SESSION
-        echo "$SESSION_KEY"
-        return 0
+        # FIX: Validate the environment session
+        if bw list items --session "$BW_SESSION" >/dev/null 2>&1; then
+            SESSION_KEY=$BW_SESSION
+            echo "$SESSION_KEY"
+            return 0
+        else
+            log_warn "Environment BW_SESSION is invalid, will try cached session"
+        fi
     fi
 
-    # Try to load cached session
+    # Try to load cached session with validation
     local cached_session=$(load_cached_session)
     if [ -n "$cached_session" ]; then
-        SESSION_KEY=$cached_session
-        echo "$SESSION_KEY"
-        return 0
+        # FIX: Double-check the cached session is still valid right before using it
+        log_debug "Double-checking cached session validity..."
+        if bw list items --session "$cached_session" >/dev/null 2>&1; then
+            SESSION_KEY=$cached_session
+            echo "$SESSION_KEY"
+            return 0
+        else
+            log_warn "Cached session became invalid, clearing and retrying..."
+            clear_session_cache > /dev/null 2>&1
+        fi
     fi
 
     # No cached session, need to unlock
-    log_info "Unlocking Bitwarden vault..."
+    log_step "Unlocking Bitwarden vault"
 
-    # Check vault status
+    log_progress "Checking vault status..."
     local vault_status=$(bw status | jq -r '.status')
+    log_progress_done "Vault status: $vault_status"
     log_debug "Vault status: $vault_status"
 
     if [ "$vault_status" = "locked" ]; then
-        log_info "Please enter your Bitwarden master password to unlock the vault"
-        SESSION_KEY=$(bw unlock --raw 2>&1)
-        local unlock_status=$?
+        local max_attempts=3
+        local attempt=1
+        local unlock_successful=false
 
-        if [ $unlock_status -ne 0 ] || [ -z "$SESSION_KEY" ] || [[ "$SESSION_KEY" == *"Error"* ]]; then
-            log_error "Failed to unlock Bitwarden vault"
-            log_debug "Unlock output: $SESSION_KEY"
-            log_info "Tip: You can also manually unlock and export the session:"
-            log_info "  export BW_SESSION=\$(bw unlock --raw)"
-            log_info "  Then run this script again"
+        while [ $attempt -le $max_attempts ]; do
+            if [ $attempt -gt 1 ]; then
+                echo ""
+                log_warn "Attempt $attempt of $max_attempts"
+            fi
+
+            log_prompt "Please enter your Bitwarden master password to unlock the vault"
+
+            # Capture session key (bw unlock prompts interactively)
+            # Use only stdout, suppress stderr to avoid capturing password prompt
+            SESSION_KEY=$(bw unlock --raw 2>/dev/null)
+            local unlock_status=$?
+
+            echo "" >&2  # Add newline after password input
+
+            # Check if unlock command succeeded
+            if [ $unlock_status -ne 0 ] || [ -z "$SESSION_KEY" ]; then
+                if [ $attempt -lt $max_attempts ]; then
+                    log_error "Unlock failed - incorrect password or 2FA required"
+                    ((attempt++))
+                    continue
+                else
+                    log_error "Failed to unlock Bitwarden vault after $max_attempts attempts"
+                    echo ""
+                    log_info "Troubleshooting tips:"
+                    log_info "  1. Make sure you are entering the correct master password"
+                    log_info "  2. Check if you have 2FA enabled and need to enter a code"
+                    log_info "  3. Try unlocking manually: export BW_SESSION=\$(bw unlock --raw)"
+                    log_info "  4. Then run this script again"
+                    return 1
+                fi
+            fi
+
+            # Validate the session key immediately with visual feedback
+            log_progress "Validating session key..."
+            if bw list items --session "$SESSION_KEY" >/dev/null 2>&1; then
+                log_progress_done "Session key validated successfully"
+                unlock_successful=true
+                break
+            else
+                echo "" >&2  # Clear progress line
+
+                if [ $attempt -lt $max_attempts ]; then
+                    log_error "Authentication failed - please try again"
+                    log_debug "Session validation failed for attempt $attempt"
+                    ((attempt++))
+                else
+                    log_error "Session validation failed after $max_attempts attempts"
+                    log_debug "Session key (first 10 chars): ${SESSION_KEY:0:10}..."
+                    echo ""
+                    log_info "This usually means:"
+                    log_info "  1. Incorrect password was entered multiple times"
+                    log_info "  2. Bitwarden CLI version incompatibility"
+                    log_info "  3. Network connectivity issue with Bitwarden servers"
+                    echo ""
+                    log_info "Try running: bw sync && bw unlock"
+                    return 1
+                fi
+            fi
+        done
+
+        if [ "$unlock_successful" = true ]; then
+            log_success "Bitwarden vault unlocked successfully"
+        else
             return 1
         fi
-        log_success "Bitwarden vault unlocked"
     elif [ "$vault_status" = "unlocked" ]; then
         log_warn "Vault already unlocked, but no session key found"
-        SESSION_KEY=$(bw unlock --raw)
+        log_info "Re-running unlock to get session key..."
+
+        SESSION_KEY=$(bw unlock --raw 2>/dev/null)
+        echo "" >&2  # Add newline after password input
+
+        # Validate the session key
+        log_progress "Validating session key..."
+        if bw list items --session "$SESSION_KEY" >/dev/null 2>&1; then
+            log_progress_done "Session key validated successfully"
+        else
+            echo "" >&2
+            log_error "Session key validation failed"
+            log_info "Try running: bw lock && bw unlock"
+            return 1
+        fi
     else
         log_error "Unexpected vault status: $vault_status"
         return 1
     fi
-
     # Save the new session key to cache
     save_session_key "$SESSION_KEY"
 
@@ -719,14 +872,36 @@ get_vpn_config() {
     local item_name=$1
     local session_key=$2
 
-    log_info "Retrieving VPN configuration from Bitwarden..."
+    log_step "Retrieving VPN configuration from Bitwarden"
     log_debug "Item name: $item_name"
 
-    local vpn_item=$(bw get item "$item_name" --session "$session_key" 2>&1)
-    local bw_exit_code=$?
+    # FIX: Add retry logic for Bitwarden API calls
+    local max_retries=2
+    local retry_count=0
+    local vpn_item=""
+    local bw_exit_code=0
 
+    while [ $retry_count -lt $max_retries ]; do
+        log_progress "Retrieving item '$item_name' from Bitwarden (attempt $((retry_count + 1))/$max_retries)..."
+
+        vpn_item=$(bw get item "$item_name" --session "$session_key" 2>&1)
+        bw_exit_code=$?
+
+        if [ $bw_exit_code -eq 0 ]; then
+            log_progress_done "Retrieved VPN configuration from Bitwarden"
+            break
+        fi
+
+        echo "" >&2  # Clear progress line
+        ((retry_count++))
+
+        if [ $retry_count -lt $max_retries ]; then
+            log_warn "Retrieval failed, retrying in 2 seconds..."
+            sleep 2
+        fi
+    done
     if [ $bw_exit_code -ne 0 ]; then
-        log_error "Failed to retrieve VPN item from Bitwarden"
+        log_error "Failed to retrieve VPN item from Bitwarden after $max_retries attempts"
         log_error "Bitwarden error: $vpn_item"
         echo ""
         log_info "Item '$item_name' not found in your vault."
@@ -745,7 +920,15 @@ get_vpn_config() {
     # Validate it's valid JSON
     if ! echo "$vpn_item" | jq empty 2>/dev/null; then
         log_error "Retrieved item is not valid JSON"
-        log_debug "Raw output: $vpn_item"
+        log_debug "Raw output from Bitwarden:"
+        echo "$vpn_item" | head -10 | sed 's/^/  /'
+        echo ""
+        log_info "This usually means:"
+        log_info "  1. The Bitwarden session expired during retrieval"
+        log_info "  2. There's a network connectivity issue"
+        log_info "  3. The Bitwarden CLI returned an error message instead of JSON"
+        echo ""
+        log_info "Try running: --clear-session to force re-authentication"
         return 1
     fi
 
@@ -934,22 +1117,23 @@ wait_for_vpn_interface() {
     local timeout=${1:-30}
     local count=0
 
-    log_info "Waiting for VPN interface..."
+    log_progress "Waiting for VPN interface ppp0..."
 
     while [ $count -lt $timeout ]; do
         if ifconfig ppp0 >/dev/null 2>&1; then
-            log_success "VPN interface ppp0 is up"
+            log_progress_done "VPN interface ppp0 is up"
             return 0
         fi
         sleep 1
         ((count++))
 
-        # Show progress every 5 seconds
-        if [ $((count % 5)) -eq 0 ]; then
-            log_debug "Still waiting for ppp0... ($count/${timeout}s)"
-        fi
+        # Show progress indicator
+        local dots=$((count % 4))
+        local progress_dots=$(printf '.%.0s' $(seq 1 $dots))
+        log_progress "Waiting for VPN interface ppp0${progress_dots} (${count}/${timeout}s)"
     done
 
+    echo "" >&2  # Clear progress line
     log_error "Timeout waiting for VPN interface (${timeout}s)"
     return 1
 }
@@ -964,9 +1148,7 @@ connect_vpn() {
         return 0
     fi
 
-    log_info "Connecting to VPN at $VPN_HOST:10443..."
-    log_warn "This will require sudo password"
-    echo ""
+    log_step "Connecting to VPN at $VPN_HOST:10443"
 
     # Build openfortivpn command with appropriate verbosity
     local vpn_cmd="sudo openfortivpn --pppd-accept-remote -c \"$config_file\""
@@ -982,8 +1164,7 @@ connect_vpn() {
 
     log_debug "Command: sudo openfortivpn --pppd-accept-remote -c <config_file> [flags]"
 
-    log_info "Establishing VPN connection..."
-    echo ""
+    log_step "Establishing VPN connection"
 
     # Start VPN in background
     eval "$vpn_cmd" &
@@ -991,19 +1172,27 @@ connect_vpn() {
 
     # Wait for interface to come up
     if ! wait_for_vpn_interface 30; then
+        echo "" >&2  # Clear progress line
         log_error "VPN interface failed to initialize"
         kill $vpn_pid 2>/dev/null
         return 1
     fi
 
     # Add routes automatically
+    log_step "Configuring VPN routes"
     if ! add_vpn_routes; then
         log_warn "Route configuration had issues, but continuing..."
     fi
 
     echo ""
-    log_success "VPN connected and configured!"
-    log_info "Press Ctrl+C to disconnect"
+    echo -e "${GREEN}╔════════════════════════════════════════════════╗${NC}" >&2
+    echo -e "${GREEN}║  ✓ VPN CONNECTED AND CONFIGURED               ║${NC}" >&2
+    echo -e "${GREEN}╚════════════════════════════════════════════════╝${NC}" >&2
+    echo ""
+    log_info "VPN Host: $VPN_HOST:10443"
+    log_info "Interface: ppp0"
+    echo ""
+    echo -e "${YELLOW}Press Ctrl+C to disconnect${NC}" >&2
     echo ""
 
     # Wait for VPN process (user will Ctrl+C to exit)
@@ -1017,29 +1206,40 @@ connect_vpn() {
 
 # Main function
 main() {
-    log_info "Starting VPN connection script..."
+    echo ""
+    echo -e "${BLUE}╔════════════════════════════════════════════════╗${NC}" >&2
+    echo -e "${BLUE}║  Bayport VPN Connection Script                 ║${NC}" >&2
+    echo -e "${BLUE}╚════════════════════════════════════════════════╝${NC}" >&2
+    echo ""
 
     # Parse arguments
     parse_args "$@"
 
     # Check dependencies
+    log_step "Checking dependencies"
     if ! check_dependencies; then
         return 1
     fi
 
+    # Pre-check permissions (sudo, Bitwarden)
+    if ! precheck_permissions; then
+        return 1
+    fi
+
     # Get item name
-    local item_name=$(get_item_name)
+    local item_name
+    item_name=$(get_item_name)
 
     # Get Bitwarden session
-    local session_key=$(get_bitwarden_session)
+    local session_key
+    session_key=$(get_bitwarden_session)
     if [ -z "$session_key" ]; then
         return 1
     fi
 
     # Get VPN config from Bitwarden
     local vpn_item
-    vpn_item=$(get_vpn_config "$item_name" "$session_key")
-    if [ $? -ne 0 ] || [ -z "$vpn_item" ]; then
+    if ! vpn_item=$(get_vpn_config "$item_name" "$session_key") || [ -z "$vpn_item" ]; then
         return 1
     fi
 
@@ -1060,7 +1260,8 @@ main() {
     fi
 
     # Create VPN config file
-    local config_file=$(create_vpn_config)
+    local config_file
+    config_file=$(create_vpn_config)
     if [ -z "$config_file" ]; then
         return 1
     fi
