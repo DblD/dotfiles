@@ -1,40 +1,76 @@
-# Dotfiles symlinked on my machine
+# Dotfiles
 
-### Install with stow:
+Managed with [GNU Stow](https://www.gnu.org/software/stow/) targeting `~/.config/`.
+
+## Setup
+
 ```bash
-stow .
+git clone git@github.com:DblD/dotfiles.git ~/.code/dotfiles
+cd ~/.code/dotfiles && ./setup.sh
 ```
 
-## VPN Tools
+### Manual prerequisites
 
-### Bayport VPN Script
-Located in repo root (symlinked to home):
-- `.bayport-vpn.sh` - Main VPN connection script
-- `.bayport-vpn-completion.bash` - Bash completion
-- `home/Documents/bayport-vpn-README.md` - Full documentation
+Create these files in your home directory:
 
-#### Setup
 ```bash
-# Scripts are already in dotfiles, just create symlinks:
-cd ~
-ln -sf .code/dotfiles/.bayport-vpn.sh .bayport-vpn.sh
-ln -sf .code/dotfiles/.bayport-vpn-completion.bash .bayport-vpn-completion.bash
-ln -sf .code/dotfiles/home/Documents/bayport-vpn-README.md Documents/bayport-vpn-README.md
+# ~/.zshenv
+export ZDOTDIR="$HOME/.config/zsh"
 
-# Add completion to your shell:
-echo 'source ~/.bayport-vpn-completion.bash' >> ~/.zshrc
+# ~/.zprofile
+eval "$(/opt/homebrew/bin/brew shellenv)"
 ```
 
-#### Usage
+Copy and customize the work-specific config:
 ```bash
-# Connect to VPN
-~/.bayport-vpn.sh
-
-# Check dependencies
-~/.bayport-vpn.sh --check-deps
-
-# See all options
-~/.bayport-vpn.sh --help
+cp ~/.config/zsh/work.zsh.example ~/.config/zsh/work.zsh
 ```
 
-See `home/Documents/bayport-vpn-README.md` for full documentation.
+## Structure
+
+```
+dotfiles/
+├── .stowrc              # Stow config (target + ignore patterns)
+├── Brewfile              # Homebrew packages
+├── setup.sh              # Bootstrap script
+│
+│  Stowed to ~/.config/
+├── aerospace/            # Window tiling
+├── ghostty/              # Terminal
+├── hammerspoon/          # macOS automation
+├── karabiner/            # Keyboard remapping
+├── nix/                  # Nix config
+├── nushell/              # Nu shell
+├── nvim/                 # Neovim (LazyVim)
+├── sketchybar/           # Status bar
+├── skhd/                 # Hotkey daemon
+├── starship/             # Prompt
+├── tmux/                 # Tmux
+├── wezterm/              # Terminal
+├── zellij/               # Terminal multiplexer
+├── zsh/                  # Shell config
+│
+│  Not stowed
+├── nix-darwin/           # macOS system defaults
+├── scripts/              # Standalone scripts (symlinked by setup.sh)
+├── ssh/                  # SSH config (symlinked by setup.sh)
+└── docs/                 # Documentation
+```
+
+## Daily workflow
+
+```bash
+# Edit any config -- live immediately via stow symlinks
+vim ~/.config/nvim/lua/plugins/go.lua
+
+# Add a brew package
+brew install foo
+echo 'brew "foo"' >> ~/.code/dotfiles/Brewfile
+
+# Apply macOS system defaults (rare)
+darwin-rebuild switch --flake ~/.code/dotfiles/nix-darwin
+```
+
+## VPN
+
+See `docs/bayport-vpn-README.md` for Bayport VPN script documentation.
