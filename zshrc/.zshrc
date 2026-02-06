@@ -59,16 +59,18 @@ alias .....="cd ../../../.."
 alias ......="cd ../../../../.."
 
 # GO
-export GOPATH='/Users/omerxx/go'
+export GOPATH="$HOME/go"
 
 # VIM
-alias v="/Users/omerxx/.nix-profile/bin/nvim"
+alias v="nvim"
 
 # Nmap
 alias nm="nmap -sC -sV -oN nmap"
 
-export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/omer/.vimpkg/bin:${GOPATH}/bin:/Users/omerxx/.cargo/bin
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.vimpkg/bin:${GOPATH}/bin:$HOME/.cargo/bin
 
+
+export PATH="$HOME/.local/bin:$PATH"
 alias cl='clear'
 
 # K8S
@@ -106,7 +108,7 @@ alias massdns='~/hacking/tools/massdns/bin/massdns -r ~/hacking/tools/massdns/li
 alias server='python -m http.server 4445'
 alias tunnel='ngrok http 4445'
 alias fuzz='ffuf -w ~/hacking/SecLists/content_discovery_all.txt -mc all -u'
-alias gr='~/go/src/github.com/tomnomnom/gf/gf'
+alias gf='~/go/src/github.com/tomnomnom/gf/gf'
 
 ### FZF ###
 export FZF_DEFAULT_COMMAND='fd --type f --hidden --follow'
@@ -149,8 +151,25 @@ fv() { nvim "$(find . -type f -not -path '*/.*' | fzf)" }
  fi
  # End Nix
 
-export XDG_CONFIG_HOME="/Users/omerxx/.config"
+export XDG_CONFIG_HOME="$HOME/.config"
 
 eval "$(zoxide init zsh)"
 eval "$(atuin init zsh)"
 eval "$(direnv hook zsh)"
+
+
+# k8s-lab cluster (bare metal Talos)
+export K8SLAB="$HOME/.code/scratch/k8s-bare-metal-lab"
+export KUBECONFIG_K8SLAB="$K8SLAB/talos-new/kubeconfig"
+export TALOSCONFIG_K8SLAB="$K8SLAB/talos-new/talosconfig"
+export KUBECONFIG_K8SLAB_OIDC="$K8SLAB/kubernetes/platform/auth/kubeconfig-oidc.yaml"
+alias klab='KUBECONFIG=$KUBECONFIG_K8SLAB kubectl'       # admin (cert)
+alias ko='KUBECONFIG=$KUBECONFIG_K8SLAB_OIDC kubectl'    # GitLab OIDC
+alias k9s-lab='KUBECONFIG=$KUBECONFIG_K8SLAB k9s'
+alias k9s-oidc='KUBECONFIG=$KUBECONFIG_K8SLAB_OIDC k9s'
+alias tc='talosctl --talosconfig=$TALOSCONFIG_K8SLAB'
+
+eval "$(mise activate zsh)"
+
+# Work-specific config (not tracked in git)
+[ -f "$HOME/.config/zsh/work.zsh" ] && source "$HOME/.config/zsh/work.zsh"
