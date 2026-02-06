@@ -11,6 +11,7 @@ zsh/.zsh_history
 zsh/.zcompdump*
 zsh/.zcompcache/
 zsh/.zsh_sessions/
+zsh/work.zsh
 result
 *.backup
 *.bak*

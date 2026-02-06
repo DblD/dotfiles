@@ -1,4 +1,14 @@
 --target=~/.config
---ignore=.stowrc
+--ignore=\.stowrc
 --ignore=DS_Store
---ignore=atuin/*
+--ignore=nix-darwin
+--ignore=scripts
+--ignore=docs
+--ignore=Brewfile
+--ignore=setup\.sh
+--ignore=README\.md
+--ignore=\.gitignore
+--ignore=\.git
+--ignore=\.claude
+--ignore=ssh
+--ignore=atuin
