@@ -24,6 +24,12 @@ if command -v brew &>/dev/null; then
   brew bundle install
 fi
 
+# macOS file associations
+if command -v duti &>/dev/null; then
+  echo "Setting file associations..."
+  duti -s dev.zed.Zed net.daringfireball.markdown all
+fi
+
 # Shell bootstrap (manual files in ~)
 echo ""
 echo "Manual steps:"
