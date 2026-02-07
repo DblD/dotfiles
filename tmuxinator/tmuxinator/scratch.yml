@@ -1,0 +1,11 @@
+name: scratch
+root: ~
+
+windows:
+  - work:
+      layout: tiled
+      panes:
+        -
+        -
+        -
+        -
