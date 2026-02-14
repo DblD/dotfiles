@@ -1,0 +1,33 @@
+# Work-specific configuration (not tracked in git)
+# Copy to ~/.config/zsh/work.zsh and customize
+
+# Docker aliases
+# alias d="docker"; alias dc="docker compose"
+
+# IDE / Local LLM keys
+# export LOCAL_LLAMA_SWAP_AUTO_SWITCH_API_KEY="dummy"
+
+# Zed IDE config switchers
+# alias zed-local='~/.config/zed/switch-to-local.sh'
+# alias zed-mcp='~/.config/zed/switch-to-mcp.sh'
+
+# LM Studio CLI
+# export PATH="$PATH:$HOME/.lmstudio/bin"
+
+# OpenCode
+# export PATH="$HOME/.opencode/bin:$PATH"
+
+# K8s cluster access (non-lab)
+# export TALOSCONFIG="$HOME/.code/scratch/k8s-bare-metal-lab/talos-ome-lab/talosconfig"
+
+# k9s theme switchers
+# alias k9sd='K9S_SKIN=catppuccin-mocha k9s'
+# alias k9sl='K9S_SKIN=catppuccin-latte k9s'
+# alias k9st='K9S_SKIN=transparent k9s'
+
+# GKE / Cloud credentials
+# export GOOGLE_APPLICATION_CREDENTIALS=~/.config/gcloud/gke-admin-aultech.json
+# alias k9s-aultech-prod="k9s --context gke_aultech-doc-control_africa-south1-a_doccon-prod"
+
+# Secrets
+# [ -f ~/.config/network-media-tools/secrets.env ] && source ~/.config/network-media-tools/secrets.env

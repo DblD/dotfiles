@@ -1,0 +1,12 @@
+# style name or JSON path (default "auto")
+style: "dark"
+# mouse support (TUI-mode only)
+mouse: true
+# use pager to display markdown
+pager: true
+# word-wrap at width
+width: 100
+# show line numbers (TUI-mode only)
+line_numbers: true
+# show all files, including hidden and ignored.
+all: false

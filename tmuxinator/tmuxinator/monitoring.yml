@@ -1,0 +1,9 @@
+name: monitoring
+root: ~
+
+windows:
+  - system:
+      layout: even-horizontal
+      panes:
+        - btop
+        -

@@ -1,0 +1,11 @@
+# General development workspace — pass project dir with: tmuxinator start dev root=~/path/to/project
+<% root ||= File.expand_path("~/.code") %>
+name: <%= File.basename(root).sub(/^\./, '') %>
+root: <%= root %>
+
+windows:
+  - editor:
+      layout: main-vertical
+      panes:
+        - nvim
+        -

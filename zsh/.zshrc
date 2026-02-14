@@ -43,6 +43,15 @@ alias ga='git add -p'
 alias gcoall='git checkout -- .'
 alias gr='git remote'
 alias gre='git reset'
+alias gsw="git switch"
+alias gswc="git switch -c"
+alias gaa="git add -A"
+alias gcam="git commit --amend --no-edit"
+alias gstash="git stash"
+alias gstashp="git stash pop"
+alias gstashl="git stash list"
+alias grecent='git for-each-ref --sort=-committerdate --count=10 --format="%(refname:short) %(committerdate:relative)" refs/heads/'
+alias gbclean='git branch --merged | grep -v "^\*\|main\|master\|develop" | xargs -r git branch -d'
 
 # Docker
 alias dco="docker compose"
@@ -50,6 +59,41 @@ alias dps="docker ps"
 alias dpa="docker ps -a"
 alias dl="docker ps -l -q"
 alias dx="docker exec -it"
+alias dcup="docker compose up -d"
+alias dcdn="docker compose down"
+alias dcl="docker compose logs -f"
+alias dcb="docker compose build"
+alias dcr="docker compose restart"
+
+# Terraform
+alias tf="terraform"
+alias tfi="terraform init"
+alias tfp="terraform plan"
+alias tfa="terraform apply"
+alias tfd="terraform destroy"
+alias tff="terraform fmt -recursive"
+alias tfo="terraform output"
+
+# Helm
+alias h="helm"
+alias hu="helm upgrade --install"
+alias hls="helm list -A"
+alias hs="helm status"
+alias ht="helm template"
+alias hdel="helm uninstall"
+
+# Flux CD
+alias fxr="flux reconcile source git flux-system"
+alias fxrk="flux reconcile kustomization"
+alias fxgs="flux get sources git"
+alias fxgk="flux get kustomizations"
+alias fxgh="flux get helmreleases -A"
+
+# GitLab CLI
+alias glmr="glab mr create --fill"
+alias glmrl="glab mr list"
+alias glmrv="glab mr view --web"
+alias glci="glab ci view"
 
 # Dirs
 alias ..="cd .."
@@ -59,16 +103,18 @@ alias .....="cd ../../../.."
 alias ......="cd ../../../../.."
 
 # GO
-export GOPATH='/Users/omerxx/go'
+export GOPATH="$HOME/go"
 
 # VIM
-alias v="/Users/omerxx/.nix-profile/bin/nvim"
+alias v="nvim"
 
 # Nmap
 alias nm="nmap -sC -sV -oN nmap"
 
-export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/omer/.vimpkg/bin:${GOPATH}/bin:/Users/omerxx/.cargo/bin
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.vimpkg/bin:${GOPATH}/bin:$HOME/.cargo/bin
 
+
+export PATH="$HOME/.local/bin:$PATH"
 alias cl='clear'
 
 # K8S
@@ -78,7 +124,6 @@ alias ka="kubectl apply -f"
 alias kg="kubectl get"
 alias kd="kubectl describe"
 alias kdel="kubectl delete"
-alias kl="kubectl logs"
 alias kgpo="kubectl get pod"
 alias kgd="kubectl get deployments"
 alias kc="kubectx"
@@ -86,7 +131,19 @@ alias kns="kubens"
 alias kl="kubectl logs -f"
 alias ke="kubectl exec -it"
 alias kcns='kubectl config set-context --current --namespace'
-alias podname=''
+alias kgn="kubectl get nodes"
+alias kgs="kubectl get svc"
+alias kgi="kubectl get ingress"
+alias kga="kubectl get all"
+alias kgaa="kubectl get all -A"
+alias kpf="kubectl port-forward"
+alias ktn="kubectl top nodes"
+alias ktp="kubectl top pods"
+alias krun="kubectl run -it --rm debug --image=busybox --restart=Never -- sh"
+
+podname() { kubectl get pods --no-headers -o custom-columns=':metadata.name' | fzf; }
+kexf() { ke "$(podname)" -- "${1:-sh}"; }
+klf() { kl "$(podname)"; }
 
 # HTTP requests with xh!
 alias http="xh"
@@ -99,6 +156,9 @@ alias l="eza -l --icons --git -a"
 alias lt="eza --tree --level=2 --long --icons --git"
 alias ltree="eza --tree --level=2  --icons --git"
 
+# Suffix aliases (type filename to open with tool)
+alias -s md=glow
+
 # SEC STUFF
 alias gobust='gobuster dir --wordlist ~/security/wordlists/diccnoext.txt --wildcard --url'
 alias dirsearch='python dirsearch.py -w db/dicc.txt -b -u'
@@ -106,7 +166,7 @@ alias massdns='~/hacking/tools/massdns/bin/massdns -r ~/hacking/tools/massdns/li
 alias server='python -m http.server 4445'
 alias tunnel='ngrok http 4445'
 alias fuzz='ffuf -w ~/hacking/SecLists/content_discovery_all.txt -mc all -u'
-alias gr='~/go/src/github.com/tomnomnom/gf/gf'
+alias gf='~/go/src/github.com/tomnomnom/gf/gf'
 
 ### FZF ###
 export FZF_DEFAULT_COMMAND='fd --type f --hidden --follow'
@@ -139,9 +199,29 @@ alias rr='ranger'
 
 # navigation
 cx() { cd "$@" && l; }
-fcd() { cd "$(find . -type d -not -path '*/.*' | fzf)" && l; }
-f() { echo "$(find . -type f -not -path '*/.*' | fzf)" | pbcopy }
-fv() { nvim "$(find . -type f -not -path '*/.*' | fzf)" }
+fcd() { cd "$(fd --type d --hidden --follow | fzf)" && l; }
+f() { echo "$(fd --type f --hidden --follow | fzf)" | pbcopy }
+fv() { nvim "$(fd --type f --hidden --follow | fzf)" }
+
+# Quick config editing + reload
+alias ez="nvim ~/.config/zsh/.zshrc"
+alias et="nvim ~/.config/tmux/tmux.conf"
+alias en="nvim ~/.config/nvim/"
+alias edot="cd ~/.code/dotfiles && l"
+alias sz="source ~/.config/zsh/.zshrc"
+
+# Port/process management
+port() { lsof -i :"$1" | grep LISTEN; }
+killport() { lsof -ti :"$1" | xargs kill -9; }
+
+# Network quick checks
+alias myip="curl -s ifconfig.me"
+alias localip="ipconfig getifaddr en0"
+alias ports="lsof -iTCP -sTCP:LISTEN -n -P"
+
+# YAML helpers (yq)
+alias yj="yq -o json"
+alias jy="yq -p json"
 
  # Nix
  if [ -e '/nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh' ]; then
@@ -149,8 +229,25 @@ fv() { nvim "$(find . -type f -not -path '*/.*' | fzf)" }
  fi
  # End Nix
 
-export XDG_CONFIG_HOME="/Users/omerxx/.config"
+export XDG_CONFIG_HOME="$HOME/.config"
 
 eval "$(zoxide init zsh)"
 eval "$(atuin init zsh)"
 eval "$(direnv hook zsh)"
+
+
+# k8s-lab cluster (bare metal Talos)
+export K8SLAB="$HOME/.code/scratch/k8s-bare-metal-lab"
+export KUBECONFIG_K8SLAB="$K8SLAB/talos-new/kubeconfig"
+export TALOSCONFIG_K8SLAB="$K8SLAB/talos-new/talosconfig"
+export KUBECONFIG_K8SLAB_OIDC="$K8SLAB/kubernetes/platform/auth/kubeconfig-oidc.yaml"
+alias klab='KUBECONFIG=$KUBECONFIG_K8SLAB kubectl'       # admin (cert)
+alias ko='KUBECONFIG=$KUBECONFIG_K8SLAB_OIDC kubectl'    # GitLab OIDC
+alias k9s-lab='KUBECONFIG=$KUBECONFIG_K8SLAB k9s'
+alias k9s-oidc='KUBECONFIG=$KUBECONFIG_K8SLAB_OIDC k9s'
+alias tc='talosctl --talosconfig=$TALOSCONFIG_K8SLAB'
+
+eval "$(mise activate zsh)"
+
+# Work-specific config (not tracked in git)
+[ -f "$HOME/.config/zsh/work.zsh" ] && source "$HOME/.config/zsh/work.zsh"
