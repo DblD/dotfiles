@@ -35,6 +35,7 @@ HAS_IP=false
 HAS_NETSTAT=false
 HAS_RESOLVECTL=false
 HAS_SCUTIL=false
+KEYSTORE_BACKEND=""   # Detected keystore (keychain, secret-tool, pass, file)
 
 # Split-tunnel state
 DEFAULT_GW=""
@@ -449,8 +450,14 @@ cleanup() {
     remove_vpn_routes
 
     if [ -n "$TEMP_CONFIG" ] && [ -f "$TEMP_CONFIG" ]; then
-        log_debug "Removing temporary config file: $TEMP_CONFIG"
-        rm -f "$TEMP_CONFIG"
+        log_debug "Securely removing temporary config file: $TEMP_CONFIG"
+        if command -v shred >/dev/null 2>&1; then
+            shred -u "$TEMP_CONFIG" 2>/dev/null
+        elif command -v gshred >/dev/null 2>&1; then
+            gshred -u "$TEMP_CONFIG" 2>/dev/null
+        else
+            rm -f "$TEMP_CONFIG"
+        fi
     fi
 
     # Verify default route is restored
@@ -655,6 +662,11 @@ check_connection() {
     fi
     echo ""
 
+    # 6. DNS leak check (pre-connection baseline)
+    log_info "6. Checking current DNS configuration for leaks..."
+    dns_leak_test false || true
+    echo ""
+
     log_success "Diagnostics complete!"
     echo ""
     log_info "Summary:"
@@ -744,22 +756,91 @@ EOF
 check_dependencies() {
     local missing_deps=()
 
-    log_progress "Checking dependencies..."
+    log_info "Platform: $OS_TYPE ($(uname -m))"
+    log_info "Session storage backend: $KEYSTORE_BACKEND"
+    echo ""
+
+    # Core dependencies
+    log_progress "Checking core dependencies..."
 
     for cmd in bw jq openfortivpn mktemp; do
-        if ! command -v $cmd &> /dev/null; then
-            missing_deps+=($cmd)
+        if ! command -v "$cmd" &> /dev/null; then
+            missing_deps+=("$cmd")
         fi
     done
 
     if [ ${#missing_deps[@]} -ne 0 ]; then
         echo "" >&2  # Clear progress line
-        log_error "Missing dependencies: ${missing_deps[*]}"
+        log_error "Missing core dependencies: ${missing_deps[*]}"
         log_info "Install missing dependencies and try again"
         return 1
     fi
 
-    log_progress_done "All dependencies installed (bw, jq, openfortivpn, mktemp)"
+    log_progress_done "Core: bw, jq, openfortivpn, mktemp"
+
+    # Platform-specific dependencies
+    log_progress "Checking platform dependencies..."
+    local platform_deps=()
+    local platform_missing=()
+
+    if [ "$OS_TYPE" = "Darwin" ]; then
+        platform_deps=("route" "ifconfig" "pppd" "scutil")
+    else
+        # Linux: prefer ip, fall back to route+ifconfig
+        if command -v ip &>/dev/null; then
+            platform_deps=("ip" "pppd")
+        else
+            platform_deps=("route" "ifconfig" "pppd")
+        fi
+    fi
+
+    for cmd in "${platform_deps[@]}"; do
+        if ! command -v "$cmd" &>/dev/null; then
+            platform_missing+=("$cmd")
+        fi
+    done
+
+    if [ ${#platform_missing[@]} -ne 0 ]; then
+        log_warn "Missing platform tools: ${platform_missing[*]}"
+    else
+        log_progress_done "Platform ($OS_TYPE): ${platform_deps[*]}"
+    fi
+
+    # Session storage backend details
+    log_progress "Checking session storage..."
+    case "$KEYSTORE_BACKEND" in
+        keychain)
+            log_progress_done "Session: macOS Keychain (via security)"
+            ;;
+        secret-tool)
+            log_progress_done "Session: GNOME Keyring (via secret-tool)"
+            ;;
+        pass)
+            log_progress_done "Session: password-store (via pass)"
+            ;;
+        file)
+            log_progress_done "Session: file-based ($SESSION_CACHE_DIR)"
+            ;;
+    esac
+
+    # Optional tools
+    local opt_tools=()
+    if command -v shred >/dev/null 2>&1; then
+        opt_tools+=("shred")
+    elif command -v gshred >/dev/null 2>&1; then
+        opt_tools+=("gshred")
+    fi
+    if command -v dig >/dev/null 2>&1; then
+        opt_tools+=("dig")
+    fi
+    if command -v nc >/dev/null 2>&1; then
+        opt_tools+=("nc")
+    fi
+    if [ ${#opt_tools[@]} -gt 0 ]; then
+        log_progress_done "Optional: ${opt_tools[*]}"
+    else
+        log_progress_done "Optional: none detected"
+    fi
 
     # Show platform tool availability
     log_info "Platform: $OS_TYPE"
@@ -942,56 +1023,169 @@ ensure_session_cache_dir() {
     fi
 }
 
+# Detect available keystore backend for session storage
+# Sets KEYSTORE_BACKEND to: keychain, secret-tool, pass, or file
+# Assumes OS_TYPE is already set by detect_platform()
+detect_keystore() {
+    # macOS: try Keychain via security command
+    if [ "$OS_TYPE" = "Darwin" ] && command -v security >/dev/null 2>&1; then
+        KEYSTORE_BACKEND="keychain"
+        log_debug "Keystore backend: macOS Keychain"
+        return 0
+    fi
+
+    # Linux/other: try secret-tool (GNOME Keyring / libsecret)
+    if command -v secret-tool >/dev/null 2>&1; then
+        # Probe whether secret-tool can talk to a keyring (times out if no D-Bus)
+        local st_exit=0
+        timeout 2 secret-tool lookup service bayport-vpn-probe >/dev/null 2>&1 || st_exit=$?
+        # 0 = found, 1 = not found (both mean secret-tool is functional)
+        if [ $st_exit -le 1 ]; then
+            KEYSTORE_BACKEND="secret-tool"
+            log_debug "Keystore backend: secret-tool (GNOME Keyring)"
+            return 0
+        fi
+    fi
+
+    # Try pass (password-store)
+    if command -v pass >/dev/null 2>&1; then
+        # Verify pass is initialized
+        if [ -d "${PASSWORD_STORE_DIR:-$HOME/.password-store}" ]; then
+            KEYSTORE_BACKEND="pass"
+            log_debug "Keystore backend: pass (password-store)"
+            return 0
+        fi
+    fi
+
+    # Fallback: file-based with strict permissions
+    KEYSTORE_BACKEND="file"
+    log_debug "Keystore backend: file-based ($SESSION_CACHE_DIR)"
+    return 0
+}
+
+# Read session key from the active keystore backend (stdout)
+# Returns 0 if a key was found, 1 otherwise
+_read_session_from_backend() {
+    local key=""
+    case "$KEYSTORE_BACKEND" in
+        keychain)
+            key=$(security find-generic-password -a "$USER" -s "bayport-vpn-session" -w 2>/dev/null) || true
+            ;;
+        secret-tool)
+            key=$(secret-tool lookup service bayport-vpn username "$USER" 2>/dev/null) || true
+            ;;
+        pass)
+            key=$(pass show bayport-vpn/session 2>/dev/null) || true
+            ;;
+        file)
+            [ -f "$SESSION_CACHE_FILE" ] && key=$(cat "$SESSION_CACHE_FILE")
+            ;;
+    esac
+    if [ -n "$key" ]; then
+        echo "$key"
+        return 0
+    fi
+    return 1
+}
+
 save_session_key() {
     local session_key=$1
-    ensure_session_cache_dir
 
     log_progress "Saving session to cache..."
-    echo "$session_key" > "$SESSION_CACHE_FILE"
-    chmod 600 "$SESSION_CACHE_FILE"
-    log_progress_done "Session cached (valid for $((SESSION_TIMEOUT / 60)) minutes)"
+    ensure_session_cache_dir
+
+    case "$KEYSTORE_BACKEND" in
+        keychain)
+            security add-generic-password -U -a "$USER" -s "bayport-vpn-session" -w "$session_key" 2>/dev/null
+            ;;
+        secret-tool)
+            echo -n "$session_key" | secret-tool store --label='bayport-vpn session' service bayport-vpn username "$USER" 2>/dev/null
+            ;;
+        pass)
+            echo "$session_key" | pass insert -f bayport-vpn/session >/dev/null 2>&1
+            ;;
+        file)
+            install -m 600 /dev/null "$SESSION_CACHE_FILE"
+            echo "$session_key" > "$SESSION_CACHE_FILE"
+            ;;
+    esac
+
+    # Store timestamp for session timeout tracking (all backends)
+    install -m 600 /dev/null "${SESSION_CACHE_DIR}/session_timestamp"
+    date +%s > "${SESSION_CACHE_DIR}/session_timestamp"
+
+    log_progress_done "Session cached via $KEYSTORE_BACKEND (valid for $((SESSION_TIMEOUT / 60)) minutes)"
 }
 
 load_cached_session() {
-    if [ ! -f "$SESSION_CACHE_FILE" ]; then
-        log_debug "No cached session found"
-        return 1
-    fi
+    local cached_key=""
+    local file_age=$((SESSION_TIMEOUT + 1))
 
-    # Check if cache file is older than timeout
-    if [ "$(uname -s)" = "Darwin" ]; then
-        # macOS
-        local file_age=$(($(date +%s) - $(stat -f %m "$SESSION_CACHE_FILE")))
+    # Check timestamp for timeout (unified across all backends)
+    if [ -f "${SESSION_CACHE_DIR}/session_timestamp" ]; then
+        local saved_ts
+        saved_ts=$(cat "${SESSION_CACHE_DIR}/session_timestamp" 2>/dev/null)
+        if [ -n "$saved_ts" ]; then
+            file_age=$(($(date +%s) - saved_ts))
+        fi
     else
-        # Linux
-        local file_age=$(($(date +%s) - $(stat -c %Y "$SESSION_CACHE_FILE")))
+        log_debug "No session timestamp found"
+        return 1
     fi
 
     if [ $file_age -gt $SESSION_TIMEOUT ]; then
         log_warn "Cached session expired (${file_age}s old, timeout: ${SESSION_TIMEOUT}s)"
-        rm -f "$SESSION_CACHE_FILE"
+        clear_session_cache >/dev/null 2>&1
         return 1
     fi
 
-    local cached_key=$(cat "$SESSION_CACHE_FILE")
+    # Load session key from backend
+    cached_key=$(_read_session_from_backend) || true
+
+    if [ -z "$cached_key" ]; then
+        log_debug "No cached session found in $KEYSTORE_BACKEND"
+        return 1
+    fi
 
     # Verify the session key is still valid
-    log_debug "Found cached session (${file_age}s old), validating..."
+    log_debug "Found cached session (${file_age}s old via $KEYSTORE_BACKEND), validating..."
     if bw list items --session "$cached_key" >/dev/null 2>&1; then
         log_success "Using cached session key (${file_age}s old)"
         echo "$cached_key"
         return 0
     else
         log_warn "Cached session key is invalid, clearing cache"
-        rm -f "$SESSION_CACHE_FILE"
+        clear_session_cache >/dev/null 2>&1
         return 1
     fi
 }
 
 clear_session_cache() {
-    if [ -f "$SESSION_CACHE_FILE" ]; then
+    local cleared=false
+
+    case "$KEYSTORE_BACKEND" in
+        keychain)
+            security delete-generic-password -a "$USER" -s "bayport-vpn-session" 2>/dev/null && cleared=true
+            ;;
+        secret-tool)
+            secret-tool clear service bayport-vpn username "$USER" 2>/dev/null && cleared=true
+            ;;
+        pass)
+            pass rm -f bayport-vpn/session >/dev/null 2>&1 && cleared=true
+            ;;
+        file)
+            [ -f "$SESSION_CACHE_FILE" ] && rm -f "$SESSION_CACHE_FILE" && cleared=true
+            ;;
+    esac
+
+    # Always clean up timestamp
+    if [ -f "${SESSION_CACHE_DIR}/session_timestamp" ]; then
+        rm -f "${SESSION_CACHE_DIR}/session_timestamp"
+        cleared=true
+    fi
+
+    if [ "$cleared" = true ]; then
         log_info "Clearing cached session key..."
-        rm -f "$SESSION_CACHE_FILE"
         log_success "Session cache cleared"
     else
         log_info "No cached session to clear"
@@ -1001,29 +1195,36 @@ clear_session_cache() {
 show_session_status() {
     log_info "Session cache status:"
     echo ""
-    echo "  Cache directory: $SESSION_CACHE_DIR"
-    echo "  Cache file: $SESSION_CACHE_FILE"
+    echo "  Backend: $KEYSTORE_BACKEND"
     echo "  Timeout: ${SESSION_TIMEOUT}s ($(($SESSION_TIMEOUT / 60)) minutes)"
     echo ""
 
-    if [ ! -f "$SESSION_CACHE_FILE" ]; then
+    # Check timestamp
+    local file_age=$((SESSION_TIMEOUT + 1))
+    local has_timestamp=false
+
+    if [ -f "${SESSION_CACHE_DIR}/session_timestamp" ]; then
+        local saved_ts
+        saved_ts=$(cat "${SESSION_CACHE_DIR}/session_timestamp" 2>/dev/null)
+        if [ -n "$saved_ts" ]; then
+            file_age=$(($(date +%s) - saved_ts))
+            has_timestamp=true
+        fi
+    fi
+
+    # Check if a session exists in the backend
+    # Check if a session exists in the backend
+    local has_session=false
+    _read_session_from_backend >/dev/null 2>&1 && has_session=true
+
+    if [ "$has_session" = false ] && [ "$has_timestamp" = false ]; then
         echo "  Status: ${RED}No cached session${NC}"
         return 0
     fi
 
-    # Get file age
-    if [ "$(uname -s)" = "Darwin" ]; then
-        local file_age=$(($(date +%s) - $(stat -f %m "$SESSION_CACHE_FILE")))
-        local created=$(date -r $(stat -f %m "$SESSION_CACHE_FILE") "+%Y-%m-%d %H:%M:%S")
-    else
-        local file_age=$(($(date +%s) - $(stat -c %Y "$SESSION_CACHE_FILE")))
-        local created=$(date -d @$(stat -c %Y "$SESSION_CACHE_FILE") "+%Y-%m-%d %H:%M:%S")
-    fi
+    echo "  Age: ${file_age}s ($(($file_age / 60)) minutes)"
 
     local remaining=$((SESSION_TIMEOUT - file_age))
-
-    echo "  Created: $created"
-    echo "  Age: ${file_age}s ($(($file_age / 60)) minutes)"
 
     if [ $file_age -gt $SESSION_TIMEOUT ]; then
         echo "  Status: ${RED}Expired${NC} (exceeded timeout by $((file_age - SESSION_TIMEOUT))s)"
@@ -1031,12 +1232,14 @@ show_session_status() {
         echo "  Status: ${GREEN}Valid${NC}"
         echo "  Expires in: ${remaining}s ($(($remaining / 60)) minutes)"
 
-        # Validate the key
-        local cached_key=$(cat "$SESSION_CACHE_FILE")
-        if bw list items --session "$cached_key" >/dev/null 2>&1; then
-            echo "  Verification: ${GREEN}Session key is valid${NC}"
-        else
-            echo "  Verification: ${RED}Session key is invalid${NC}"
+        if [ "$has_session" = true ]; then
+            local cached_key=""
+            cached_key=$(_read_session_from_backend) || true
+            if [ -n "$cached_key" ] && bw list items --session "$cached_key" >/dev/null 2>&1; then
+                echo "  Verification: ${GREEN}Session key is valid${NC}"
+            else
+                echo "  Verification: ${RED}Session key is invalid${NC}"
+            fi
         fi
     fi
 }
@@ -1413,6 +1616,22 @@ parse_vpn_config() {
         return 1
     fi
 
+    # Validate field formats to prevent injection of unexpected values
+    if ! [[ "$VPN_HOST" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+        log_error "VPN host contains invalid characters"
+        return 1
+    fi
+
+    if ! [[ "$VPN_USERNAME" =~ ^[a-zA-Z0-9@._-]+$ ]]; then
+        log_error "VPN username contains invalid characters"
+        return 1
+    fi
+
+    if ! [[ "$VPN_TRUSTED_CERT" =~ ^[a-fA-F0-9:]+$ ]]; then
+        log_error "Trusted cert hash contains invalid characters"
+        return 1
+    fi
+
     # Log parsed values if verbose
     if [ "$VERBOSE" = true ]; then
         log_success "Configuration parsed successfully:"
@@ -1430,6 +1649,7 @@ create_vpn_config() {
     log_debug "Creating temporary VPN config file..."
 
     TEMP_CONFIG=$(mktemp)
+    chmod 600 "$TEMP_CONFIG"
     log_debug "Temporary config file: $TEMP_CONFIG"
     log_debug "Operating system: $OS_TYPE"
 
@@ -1839,6 +2059,150 @@ monitor_vpn_connection() {
     done
 }
 
+# DNS leak test — verify VPN DNS is scoped to internal domains only
+# Usage: dns_leak_test <vpn_connected: true|false>
+dns_leak_test() {
+    local vpn_connected="${1:-false}"
+    local test_domain="google.com"
+    local issues=0
+
+    log_info "Checking DNS configuration for leaks..."
+
+    if [ "$OS_TYPE" = "Darwin" ]; then
+        # macOS: check /etc/resolver/ for blanket DNS overrides
+        if [ -d "/etc/resolver" ]; then
+            local has_resolver_files=false
+            for f in /etc/resolver/*; do
+                [ -e "$f" ] || continue
+                has_resolver_files=true
+                local fname
+                fname=$(basename "$f")
+                log_debug "  /etc/resolver/$fname: $(grep nameserver "$f" 2>/dev/null | head -1)"
+
+                # Blanket overrides cover ALL queries for a TLD or default
+                if [[ "$fname" =~ ^(default|com|net|org|io|co)$ ]]; then
+                    log_warn "Blanket DNS override: /etc/resolver/$fname"
+                    log_warn "  Routes ALL .$fname lookups through VPN DNS"
+                    ((issues++))
+                fi
+            done
+            if [ "$has_resolver_files" = false ]; then
+                log_debug "No /etc/resolver/ entries found"
+            fi
+        fi
+
+        # Check scutil DNS for global override to private IP
+        if command -v scutil >/dev/null 2>&1; then
+            local global_dns
+            global_dns=$(scutil --dns 2>/dev/null | awk '/^resolver #1/{found=1} found && /nameserver\[0\]/{print $3; exit}')
+            if [ -n "$global_dns" ]; then
+                log_debug "Primary DNS resolver: $global_dns"
+                if [[ "$global_dns" =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.) ]]; then
+                    log_warn "Primary DNS is a private IP ($global_dns) — likely VPN DNS"
+                    log_warn "  All DNS queries may be routed through VPN"
+                    ((issues++))
+                fi
+            fi
+        fi
+
+    else
+        # Linux: check systemd-resolved and resolv.conf
+        if command -v resolvectl >/dev/null 2>&1 && systemctl is-active systemd-resolved >/dev/null 2>&1; then
+            log_debug "systemd-resolved is active"
+
+            # Check if VPN DNS is set as global default
+            local global_dns
+            global_dns=$(resolvectl dns 2>/dev/null | grep "Global:" | awk '{for(i=2;i<=NF;i++) print $i}')
+            if [ -n "$global_dns" ]; then
+                for dns in $global_dns; do
+                    if [[ "$dns" =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.) ]]; then
+                        log_warn "Global DNS set to private IP ($dns) — VPN DNS leak"
+                        ((issues++))
+                    fi
+                done
+            fi
+
+            # Check if VPN interface has default routing domain (~.)
+            local vpn_iface="ppp0"
+            if ip link show "$vpn_iface" >/dev/null 2>&1; then
+                local vpn_domains
+                vpn_domains=$(resolvectl domain "$vpn_iface" 2>/dev/null)
+                if echo "$vpn_domains" | grep -q '~\.$'; then
+                    log_warn "VPN interface ($vpn_iface) is the default DNS route (~.)"
+                    log_warn "  All DNS queries are being routed through VPN"
+                    ((issues++))
+                fi
+            fi
+        else
+            # No systemd-resolved — check /etc/resolv.conf
+            if [ -f "/etc/resolv.conf" ]; then
+                local nameservers
+                nameservers=$(grep "^nameserver" /etc/resolv.conf | awk '{print $2}')
+                local private_count=0
+                local total_count=0
+                for ns in $nameservers; do
+                    ((total_count++))
+                    if [[ "$ns" =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.) ]]; then
+                        log_debug "resolv.conf has private DNS: $ns"
+                        ((private_count++))
+                    fi
+                done
+                # If ALL nameservers are private, that's likely a full VPN DNS override
+                if [ $total_count -gt 0 ] && [ $private_count -eq $total_count ]; then
+                    log_warn "All nameservers in /etc/resolv.conf are private IPs"
+                    log_warn "  DNS is fully overridden — likely VPN DNS leak"
+                    ((issues++))
+                elif [ $private_count -gt 0 ]; then
+                    log_debug "Some private nameservers in resolv.conf ($private_count/$total_count)"
+                fi
+            fi
+        fi
+    fi
+
+    # Active DNS resolution test (only meaningful when VPN is connected)
+    if [ "$vpn_connected" = true ] && command -v dig >/dev/null 2>&1; then
+        log_info "Testing DNS resolution path for $test_domain..."
+
+        local dig_server
+        dig_server=$(dig +time=3 +tries=1 "$test_domain" 2>/dev/null | grep "^;; SERVER:" | awk '{print $3}' | sed 's/#.*//')
+
+        if [ -n "$dig_server" ]; then
+            log_debug "DNS server used for $test_domain: $dig_server"
+            if [[ "$dig_server" =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.) ]]; then
+                log_warn "Public domain ($test_domain) resolved via private DNS ($dig_server)"
+                log_warn "  DNS is leaking through VPN"
+                ((issues++))
+            else
+                log_success "Public DNS ($test_domain) resolved via $dig_server (not VPN)"
+            fi
+        else
+            log_debug "Could not determine DNS server for $test_domain"
+        fi
+    elif [ "$vpn_connected" = true ]; then
+        log_debug "dig not available — skipping active DNS resolution test"
+    fi
+
+    # Summary
+    if [ $issues -gt 0 ]; then
+        echo ""
+        log_warn "DNS leak check found $issues issue(s)"
+        log_info "Remediation:"
+        if [ "$OS_TYPE" = "Darwin" ]; then
+            log_info "  - Remove blanket overrides from /etc/resolver/"
+            log_info "  - Only keep resolver files for internal domains"
+            log_info "  - Example: /etc/resolver/corp.internal with VPN DNS"
+        else
+            log_info "  - Configure split DNS via systemd-resolved"
+            log_info "  - Set VPN DNS only for internal domains, not globally"
+            log_info "  - Example: resolvectl domain ppp0 '~corp.internal'"
+        fi
+        return 1
+    else
+        log_success "No DNS leak detected"
+        return 0
+    fi
+}
+
 # Connect to VPN
 connect_vpn() {
     local config_file=$1
@@ -1846,6 +2210,10 @@ connect_vpn() {
     if [ "$DRY_RUN" = true ]; then
         log_warn "DRY RUN MODE - Not actually connecting to VPN"
         log_info "Would execute: sudo openfortivpn --pppd-accept-remote -c $config_file"
+        echo ""
+        # Run DNS leak check against current system state
+        log_step "DNS leak pre-check (current system state)"
+        dns_leak_test false || true
         return 0
     fi
 
@@ -1858,14 +2226,14 @@ connect_vpn() {
         return 1
     fi
 
-    # Build openfortivpn command as array (no eval — safe from injection)
+    # Build openfortivpn command as array (avoids eval and shell injection)
     local vpn_args=("sudo" "openfortivpn" "--pppd-accept-remote" "-c" "$config_file")
 
     # Add verbose flag if requested
     [ "$VERBOSE" = true ] && vpn_args+=("-v")
     [ "$DEBUG" = true ] && vpn_args+=("-vv")
 
-    log_debug "Command: ${vpn_args[*]/<config_file>/}"
+    log_debug "Command: sudo openfortivpn --pppd-accept-remote -c <config_file> [flags]"
 
     log_step "Establishing VPN connection"
 
@@ -1899,6 +2267,10 @@ connect_vpn() {
     # Configure split DNS
     log_step "Configuring split DNS"
     configure_split_dns
+
+    # DNS leak check (post-connection)
+    log_step "DNS leak check"
+    dns_leak_test true || log_warn "DNS leak issues detected — review warnings above"
 
     echo ""
     echo -e "${GREEN}╔════════════════════════════════════════════════╗${NC}" >&2
@@ -1936,6 +2308,9 @@ main() {
     echo -e "${BLUE}║  Bayport VPN Connection Script                 ║${NC}" >&2
     echo -e "${BLUE}╚════════════════════════════════════════════════╝${NC}" >&2
     echo ""
+
+    # Detect keystore backend (OS_TYPE already set by detect_platform at top level)
+    detect_keystore
 
     # Parse arguments
     parse_args "$@"
