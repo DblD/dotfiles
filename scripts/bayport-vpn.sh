@@ -569,12 +569,14 @@ OPTIONS:
     --show-config       Show the generated OpenFortiVPN config file
     --session-status    Show cached session status
     --clear-session     Clear cached session key
-    --session-timeout   Set session timeout in seconds (default: 3600)
+    --session-timeout N Set session timeout in seconds (0 = until reboot, default: 0)
     --netbird-status    Check NetBird status and conflicts
     --no-reconnect      Disable automatic reconnection on VPN drop
     --max-reconnects N  Max reconnection attempts (default: 3, env: MAX_RECONNECTS)
     --init-routes       Create routes/DNS config files from defaults for customization
     --verify-routes     Check current routing table for split-tunnel correctness
+    --check-cert        Check if server certificate has changed and offer to update
+    --ignore-conflicts  Skip VPN conflict warnings (NetBird, OpenVPN, etc.)
 
 ENVIRONMENT VARIABLES:
     BW_SESSION          Bitwarden session key (optional, will prompt if not set)
@@ -621,6 +623,9 @@ EXAMPLES:
 
     # Verify split-tunnel routing is correct
     $(basename $0) --verify-routes
+
+    # Check if server certificate changed and update Bitwarden
+    $(basename $0) --check-cert
 
 REQUIREMENTS:
     - bw (Bitwarden CLI)
@@ -1453,6 +1458,14 @@ parse_args() {
                 verify_routes
                 exit $?
                 ;;
+            --check-cert)
+                CHECK_CERT_ONLY=true
+                shift
+                ;;
+            --ignore-conflicts)
+                IGNORE_CONFLICTS=true
+                shift
+                ;;
             *)
                 log_error "Unknown option: $1"
                 echo ""
@@ -1752,6 +1765,136 @@ parse_vpn_config() {
     fi
 
     return 0
+}
+
+# Fetch the current SSL certificate hash from the VPN server
+# Returns the SHA-256 fingerprint in the format openfortivpn expects
+fetch_server_cert() {
+    local host=$1
+    local port=${2:-10443}
+
+    log_progress "Fetching certificate from $host:$port..."
+
+    local cert_output
+    cert_output=$(echo "Q" | _timeout 10 openssl s_client -connect "$host:$port" 2>/dev/null)
+
+    if [ -z "$cert_output" ]; then
+        log_error "Could not connect to $host:$port to fetch certificate"
+        return 1
+    fi
+
+    # Get SHA-256 fingerprint (openfortivpn uses this format)
+    local fingerprint
+    fingerprint=$(echo "$cert_output" | openssl x509 -outform der 2>/dev/null | openssl dgst -sha256 2>/dev/null | awk '{print $NF}')
+
+    if [ -z "$fingerprint" ]; then
+        log_error "Could not extract certificate fingerprint"
+        return 1
+    fi
+
+    log_progress_done "Certificate fetched"
+    echo "$fingerprint"
+}
+
+# Check if the stored trusted-cert matches the server's current cert
+# If mismatched, offer to update the Bitwarden item
+check_and_update_cert() {
+    local item_name=$1
+    local session_key=$2
+
+    log_step "Verifying server certificate"
+
+    local server_cert
+    if ! server_cert=$(fetch_server_cert "$VPN_HOST" 10443) || [ -z "$server_cert" ]; then
+        log_warn "Could not fetch server certificate — skipping verification"
+        log_info "Connection will proceed with stored cert; openfortivpn will reject if wrong"
+        return 0
+    fi
+
+    # Normalize both for comparison (lowercase, no colons)
+    local stored_norm server_norm
+    stored_norm=$(echo "$VPN_TRUSTED_CERT" | tr '[:upper:]' '[:lower:]' | tr -d ':')
+    server_norm=$(echo "$server_cert" | tr '[:upper:]' '[:lower:]' | tr -d ':')
+
+    if [ "$stored_norm" = "$server_norm" ]; then
+        log_success "Server certificate matches stored hash"
+        return 0
+    fi
+
+    echo ""
+    log_warn "SERVER CERTIFICATE HAS CHANGED"
+    echo ""
+    echo "  Stored:  ${VPN_TRUSTED_CERT}" >&2
+    echo "  Server:  ${server_cert}" >&2
+    echo ""
+    log_warn "This can happen when the server's SSL certificate is renewed."
+    log_info "If you expect this change, update the stored cert to continue connecting."
+    echo ""
+
+    log_prompt "Update the trusted-cert in Bitwarden? (y/N)"
+    read -r update_cert || update_cert="n"
+
+    if [[ ! "$update_cert" =~ ^[Yy] ]]; then
+        log_info "Keeping old certificate. Connection may fail."
+        return 0
+    fi
+
+    # Update the Bitwarden item
+    log_progress "Updating trusted-cert in Bitwarden..."
+
+    # Get the full item JSON, update the trusted-cert field
+    local item_json
+    item_json=$(bw get item "$item_name" --session "$session_key" 2>/dev/null)
+    if [ -z "$item_json" ]; then
+        log_error "Failed to retrieve Bitwarden item for update"
+        return 1
+    fi
+
+    # Update the trusted-cert field and strip read-only server fields
+    # bw edit rejects fields like object, revisionDate, deletedDate etc.
+    local item_id
+    item_id=$(echo "$item_json" | jq -r '.id')
+    local updated_json
+    updated_json=$(echo "$item_json" | jq --arg cert "$server_cert" '
+        del(.object, .revisionDate, .creationDate, .deletedDate) |
+        .fields = [(.fields // [])[] | if .name == "trusted-cert" then .value = $cert else . end]
+    ')
+
+    if [ -z "$updated_json" ]; then
+        log_error "Failed to construct updated JSON"
+        return 1
+    fi
+
+    log_debug "Encoding and pushing updated item to Bitwarden (id: $item_id)..."
+
+    # bw edit expects: <json> | bw encode | bw edit item <id>
+    local encoded
+    encoded=$(echo "$updated_json" | bw encode 2>&1)
+    if [ -z "$encoded" ]; then
+        log_error "bw encode produced empty output"
+        log_info "You can manually update the trusted-cert field in Bitwarden to:"
+        echo "  $server_cert"
+        return 1
+    fi
+    log_debug "Encoded payload length: ${#encoded}"
+
+    local edit_result
+    edit_result=$(echo "$encoded" | bw edit item "$item_id" --session "$session_key" 2>&1) || true
+
+    if echo "$edit_result" | jq -e '.id' >/dev/null 2>&1; then
+        log_progress_done "Certificate updated in Bitwarden"
+        VPN_TRUSTED_CERT="$server_cert"
+        log_success "Trusted cert updated to: ${server_cert}"
+        return 0
+    else
+        log_error "Failed to update Bitwarden item."
+        if [ -n "$edit_result" ]; then
+            log_debug "bw edit output: $edit_result"
+        fi
+        log_info "You can manually update the trusted-cert field in Bitwarden to:"
+        echo "  $server_cert"
+        return 1
+    fi
 }
 
 # Create VPN configuration file
@@ -2472,6 +2615,37 @@ main() {
     # Parse VPN config
     if ! parse_vpn_config "$vpn_item"; then
         return 1
+    fi
+
+    # Verify server certificate matches stored hash (and offer to update if changed)
+    check_and_update_cert "$item_name" "$session_key"
+
+    # Cert-check-only mode
+    if [ "${CHECK_CERT_ONLY:-false}" = true ]; then
+        log_success "Certificate check complete"
+        return 0
+    fi
+
+    # Check for VPN conflicts (NetBird, stale ppp, other VPNs)
+    if ! check_vpn_conflicts; then
+        if [ "${IGNORE_CONFLICTS:-false}" = true ]; then
+            log_warn "Ignoring conflicts (--ignore-conflicts)"
+        else
+            log_warn "Proceeding in 5s unless you press Ctrl+C (use --ignore-conflicts to skip)..."
+            local countdown=5
+            while [ $countdown -gt 0 ]; do
+                printf "\r  Continuing in %ds... " "$countdown" >&2
+                if read -r -t 1 abort_input 2>/dev/null; then
+                    # User pressed Enter or typed something — abort
+                    echo "" >&2
+                    log_info "Resolve conflicts and try again"
+                    return 1
+                fi
+                countdown=$((countdown - 1))
+            done
+            printf "\r                        \r" >&2  # Clear countdown line
+            log_info "Proceeding with conflicts..."
+        fi
     fi
 
     # Create VPN config file
