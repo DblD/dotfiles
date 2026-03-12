@@ -981,12 +981,20 @@ precheck_permissions() {
 
         # Pre-authenticate sudo
         if [ "$needs_sudo" = true ]; then
-            log_prompt "Enter sudo password for VPN operations"
-            if ! sudo -v; then
-                log_error "Sudo authentication failed"
-                return 1
+            # Try non-interactive first (sudo already cached, or NOPASSWD rule)
+            if sudo -n -v 2>/dev/null; then
+                log_success "Sudo authentication successful (cached)"
+            elif sudo -n openfortivpn --version >/dev/null 2>&1; then
+                log_success "Sudo authentication successful (NOPASSWD rule for openfortivpn)"
+            else
+                # Fall back to interactive prompt (requires a tty)
+                log_prompt "Enter sudo password for VPN operations"
+                if ! sudo -v; then
+                    log_error "Sudo authentication failed"
+                    return 1
+                fi
+                log_success "Sudo authentication successful"
             fi
-            log_success "Sudo authentication successful"
             echo ""
         fi
 
@@ -1222,10 +1230,12 @@ load_cached_session() {
         if [ -n "$saved_ts" ]; then
             file_age=$(($(date +%s) - saved_ts))
         fi
-    else
+    elif [ "${SESSION_TIMEOUT:-0}" -gt 0 ]; then
+        # Timestamp required only when timeout enforcement is active
         log_debug "No session timestamp found"
         return 1
     fi
+    # SESSION_TIMEOUT=0: persist until reboot — timestamp not required
 
     if [ "$SESSION_TIMEOUT" -gt 0 ] && [ $file_age -gt $SESSION_TIMEOUT ]; then
         log_warn "Cached session expired (${file_age}s old, timeout: ${SESSION_TIMEOUT}s)"
@@ -2172,8 +2182,11 @@ add_vpn_routes() {
     log_info "Configuring VPN split-tunnel routes..."
 
     # Load subnets from config file or use defaults
+    # mapfile is bash 4+ only; macOS ships bash 3.2, so use a while-read loop
     local -a subnets
-    mapfile -t subnets < <(load_routes)
+    while IFS= read -r line; do
+        subnets+=("$line")
+    done < <(load_routes)
 
     local routes_added=0
     local routes_failed=0

@@ -111,22 +111,27 @@ run_checks() {
     current_gw=$(netstat -rn 2>/dev/null | awk '/^default/ && /[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/ {print $2; exit}')
     current_iface=$(netstat -rn 2>/dev/null | awk '/^default/ && /[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/ {print $NF; exit}')
 
-    if [ -n "$GW" ] && [ "$current_gw" = "$GW" ]; then
-        ok "Default gateway unchanged: $current_gw via $current_iface"
-    elif [ -n "$GW" ]; then
-        fail "DEFAULT GATEWAY HIJACKED! Was: $GW via $IFACE → Now: $current_gw via $current_iface"
+    # Compare interface only — IP can change if laptop switches networks
+    if [ -n "$IFACE" ] && [ "$current_iface" = "$IFACE" ]; then
+        ok "Default gateway via $current_iface (interface preserved): $current_gw"
+        if [ -n "$GW" ] && [ "$current_gw" != "$GW" ]; then
+            warn "Gateway IP changed ($GW → $current_gw) — likely network switch, not VPN hijack"
+        fi
+    elif [ -n "$IFACE" ]; then
+        fail "DEFAULT GATEWAY INTERFACE CHANGED! Was: $IFACE → Now: $current_iface ($current_gw)"
         fail "ALL traffic may be going through the VPN — SPLIT TUNNEL BROKEN"
     else
         warn "No baseline to compare — current default: $current_gw via $current_iface"
         info "Run --baseline before connecting next time"
     fi
 
-    # Is default route going through ppp0?
-    default_via_ppp=$(netstat -rn 2>/dev/null | awk '/^default/ {print $NF}' | grep -c "ppp" || echo 0)
-    if [ "$default_via_ppp" -gt 0 ]; then
-        fail "Default route goes through ppp0 — ALL traffic is VPN-routed (full tunnel leak!)"
+    # Is the *preferred* default route going through ppp0?
+    # pppd adds a subsidiary default (UCSIg) — check for UGScg (preferred) via ppp0
+    preferred_default_iface=$(netstat -rn 2>/dev/null | awk '/^default/ && /UGS/ {print $NF; exit}')
+    if [ "$preferred_default_iface" = "ppp0" ]; then
+        fail "Preferred default route goes through ppp0 — ALL traffic is VPN-routed (full tunnel leak!)"
     else
-        ok "Default route does NOT go through ppp0 (split-tunnel working)"
+        ok "Preferred default route via $preferred_default_iface (not ppp0) — split-tunnel working"
     fi
 
     # ── 4. VPN routes: Bayport subnets go through ppp0 ───────────────────────
@@ -144,9 +149,9 @@ run_checks() {
         fail "No VPN routes via ppp0 — Bayport traffic is NOT being routed through VPN"
     fi
 
-    # Check key subnets are present
+    # Check key subnets are present — macOS shows routes as 10.1/16 or 10.1.0.0/16
     for subnet in "10.1" "10.14" "10.213" "10.250"; do
-        if netstat -rn 2>/dev/null | grep "ppp0" | grep -q "^${subnet}\."; then
+        if netstat -rn 2>/dev/null | grep "ppp0" | grep -qE "^${subnet}(/|\.0\.0)"; then
             ok "Route: ${subnet}.0.0/16 → ppp0"
         else
             fail "Missing route: ${subnet}.x.x → ppp0"
@@ -170,10 +175,10 @@ run_checks() {
         info "Current public IP: $current_public (no baseline to compare)"
     fi
 
-    # Verify 8.8.8.8 route is NOT via ppp0
-    dns_route=$(netstat -rn 2>/dev/null | awk '$1 == "8.8.8.8" {print $NF}' | head -1)
-    if [ -z "$dns_route" ] || [ "$dns_route" != "ppp0" ]; then
-        ok "8.8.8.8 (Google DNS) routes via local network (not VPN)"
+    # Verify 8.8.8.8 actual routing decision (not netstat cache — pppd adds host entries)
+    dns_iface=$(route -n get 8.8.8.8 2>/dev/null | awk '/interface:/ {print $2}')
+    if [ -z "$dns_iface" ] || [ "$dns_iface" != "ppp0" ]; then
+        ok "8.8.8.8 (Google DNS) routes via ${dns_iface:-local} (not VPN)"
     else
         fail "8.8.8.8 is routed through ppp0 — public DNS going through VPN"
     fi
@@ -195,9 +200,9 @@ run_checks() {
             split(ip, tip, ".")
             # Simple prefix match for /16 and /24
             len = (parts[2]+0 == 24) ? 3 : 2
-            match = 1
-            for (i=1; i<=len; i++) if (octets[i] != tip[i]) { match=0; break }
-            if (match && parts[2]+0 > best_len) { best=$NF; best_len=parts[2]+0 }
+            matched = 1
+            for (i=1; i<=len; i++) if (octets[i] != tip[i]) { matched=0; break }
+            if (matched && parts[2]+0 > best_len) { best=$NF; best_len=parts[2]+0 }
         }
         END { print best }
     ')
