@@ -25,6 +25,9 @@ VPN_ROUTES_ADDED=()  # Track routes we added for cleanup
 NO_RECONNECT=false
 MAX_RECONNECTS=${MAX_RECONNECTS:-3}
 SUDO_KEEPALIVE_PID=""
+VPN_PID=""   # Track VPN process for reliable shutdown
+VPN_LOG=""   # Capture openfortivpn output for failure classification
+TAIL_PID=""  # Track verbose log tail for cleanup
 ROUTES_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/bayport-vpn/routes.conf"
 DNS_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/bayport-vpn/dns.conf"
 
@@ -468,10 +471,39 @@ remove_vpn_routes() {
     VPN_ROUTES_ADDED=()
 }
 
-# Cleanup function
+# Cleanup function (guarded against double-run from INT+EXIT)
+CLEANUP_DONE=false
 cleanup() {
+    if [ "$CLEANUP_DONE" = true ]; then return; fi
+    CLEANUP_DONE=true
     local exit_code=$?
     log_debug "Running cleanup..."
+
+    # Kill verbose log tail if running
+    if [ -n "$TAIL_PID" ]; then
+        kill "$TAIL_PID" 2>/dev/null || true
+        TAIL_PID=""
+    fi
+
+    # Kill VPN process and pppd (runs as root via sudo)
+    if [ -n "$VPN_PID" ]; then
+        log_info "Stopping VPN process (PID: $VPN_PID)..."
+        sudo kill "$VPN_PID" 2>/dev/null || true
+        # Give it a moment to exit cleanly
+        local wait_count=0
+        while kill -0 "$VPN_PID" 2>/dev/null && [ $wait_count -lt 5 ]; do
+            sleep 1
+            wait_count=$((wait_count + 1))
+        done
+        # Force kill if still alive
+        if kill -0 "$VPN_PID" 2>/dev/null; then
+            log_warn "VPN process didn't stop gracefully, force killing..."
+            sudo kill -9 "$VPN_PID" 2>/dev/null || true
+        fi
+        VPN_PID=""
+    fi
+    # Clean up any orphaned pppd processes from our VPN
+    sudo pkill -x pppd 2>/dev/null || true
 
     # Stop sudo keepalive if running
     stop_sudo_keepalive
@@ -482,16 +514,19 @@ cleanup() {
     # Remove VPN routes if any were added
     remove_vpn_routes
 
-    if [ -n "$TEMP_CONFIG" ] && [ -f "$TEMP_CONFIG" ]; then
-        log_debug "Securely removing temporary config file: $TEMP_CONFIG"
-        if command -v shred >/dev/null 2>&1; then
-            shred -u "$TEMP_CONFIG" 2>/dev/null
-        elif command -v gshred >/dev/null 2>&1; then
-            gshred -u "$TEMP_CONFIG" 2>/dev/null
-        else
-            rm -f "$TEMP_CONFIG"
+    # Clean up temp files (config may contain password, log may contain sensitive data)
+    for tmpfile in "$TEMP_CONFIG" "$VPN_LOG"; do
+        if [ -n "$tmpfile" ] && [ -f "$tmpfile" ]; then
+            log_debug "Securely removing: $tmpfile"
+            if command -v shred >/dev/null 2>&1; then
+                shred -u "$tmpfile" 2>/dev/null
+            elif command -v gshred >/dev/null 2>&1; then
+                gshred -u "$tmpfile" 2>/dev/null
+            else
+                rm -f "$tmpfile"
+            fi
         fi
-    fi
+    done
 
     # Verify default route is restored
     if [ -n "$DEFAULT_GW" ]; then
