@@ -89,6 +89,39 @@ log_progress_done() {
 
 # ─── Platform Detection & Helpers ─────────────────────────────────────────────
 
+# Portable timeout: uses coreutils timeout if available, else bash-native fallback
+_timeout() {
+    local secs=$1; shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$secs" "$@"
+    elif command -v gtimeout >/dev/null 2>&1; then
+        gtimeout "$secs" "$@"
+    else
+        # Bash-native fallback for stock macOS (no coreutils)
+        "$@" &
+        local cmd_pid=$!
+        ( sleep "$secs"; kill "$cmd_pid" 2>/dev/null ) &
+        local watchdog_pid=$!
+        wait "$cmd_pid" 2>/dev/null
+        local ret=$?
+        kill "$watchdog_pid" 2>/dev/null
+        wait "$watchdog_pid" 2>/dev/null
+        return $ret
+    fi
+}
+
+# Get a unique identifier for the current boot session
+# Changes on reboot, used to invalidate cached BW sessions
+_get_boot_id() {
+    if [ -f /proc/sys/kernel/random/boot_id ]; then
+        # Linux: kernel boot_id is unique per boot
+        cat /proc/sys/kernel/random/boot_id
+    else
+        # macOS: use kernel boot time (seconds since epoch)
+        sysctl -n kern.boottime 2>/dev/null | sed 's/^{ sec = \([0-9]*\).*/\1/'
+    fi
+}
+
 detect_platform() {
     OS_TYPE=$(uname -s)
     command -v ifconfig >/dev/null 2>&1 && HAS_IFCONFIG=true
@@ -638,12 +671,12 @@ check_connection() {
     # 4. SSL/TLS test
     log_info "4. Testing SSL/TLS handshake..."
     if command -v openssl >/dev/null 2>&1; then
-        if echo "Q" | timeout 5 openssl s_client -connect "$VPN_HOST:10443" >/dev/null 2>&1; then
+        if echo "Q" | _timeout 5 openssl s_client -connect "$VPN_HOST:10443" >/dev/null 2>&1; then
             log_success "SSL/TLS handshake successful"
 
             # Show certificate info
             log_info "Certificate details:"
-            echo "Q" | timeout 5 openssl s_client -connect "$VPN_HOST:10443" 2>/dev/null | openssl x509 -noout -subject -issuer -dates 2>/dev/null | sed 's/^/  /'
+            echo "Q" | _timeout 5 openssl s_client -connect "$VPN_HOST:10443" 2>/dev/null | openssl x509 -noout -subject -issuer -dates 2>/dev/null | sed 's/^/  /'
         else
             log_warn "SSL/TLS handshake failed (may require VPN auth)"
         fi
@@ -655,7 +688,7 @@ check_connection() {
     # 5. OpenFortiVPN test
     log_info "5. Testing with openfortivpn..."
     log_info "Running: openfortivpn $VPN_HOST:10443 --no-routes --pppd-log /dev/null (will timeout after 10s)"
-    if timeout 10 openfortivpn "$VPN_HOST:10443" --no-routes --pppd-log /dev/null 2>&1 | grep -q "STATUS"; then
+    if _timeout 10 openfortivpn "$VPN_HOST:10443" --no-routes --pppd-log /dev/null 2>&1 | grep -q "STATUS"; then
         log_success "OpenFortiVPN can communicate with server"
     else
         log_warn "OpenFortiVPN test inconclusive"
@@ -1038,7 +1071,7 @@ detect_keystore() {
     if command -v secret-tool >/dev/null 2>&1; then
         # Probe whether secret-tool can talk to a keyring (times out if no D-Bus)
         local st_exit=0
-        timeout 2 secret-tool lookup service bayport-vpn-probe >/dev/null 2>&1 || st_exit=$?
+        _timeout 2 secret-tool lookup service bayport-vpn-probe >/dev/null 2>&1 || st_exit=$?
         # 0 = found, 1 = not found (both mean secret-tool is functional)
         if [ $st_exit -le 1 ]; then
             KEYSTORE_BACKEND="secret-tool"
