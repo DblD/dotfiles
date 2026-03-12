@@ -2228,8 +2228,27 @@ wait_for_vpn_interface() {
             log_progress_done "VPN interface ppp0 is up"
             return 0
         fi
+
+        # Early abort: check log for auth/cert failure every 3s
+        if [ $((count % 3)) -eq 2 ] && [ -n "${VPN_LOG:-}" ] && [ -f "$VPN_LOG" ]; then
+            local early_class
+            early_class=$(classify_vpn_failure "$VPN_LOG")
+            if [ "$early_class" = "auth" ] || [ "$early_class" = "cert" ]; then
+                echo "" >&2
+                log_debug "Detected $early_class failure in log — aborting wait early"
+                return 1
+            fi
+        fi
+
+        # Also abort if VPN process already exited
+        if [ -n "${VPN_PID:-}" ] && ! kill -0 "$VPN_PID" 2>/dev/null; then
+            echo "" >&2
+            log_debug "VPN process exited during interface wait"
+            return 1
+        fi
+
         sleep 1
-        ((count++))
+        count=$((count + 1))
 
         # Show progress indicator
         local dots=$((count % 4))
@@ -2242,7 +2261,124 @@ wait_for_vpn_interface() {
     return 1
 }
 
+# Classify VPN failure from log output
+# Returns: "auth", "cert", "network", or "unknown"
+# Auth/cert failures must NOT be retried (account lockout risk)
+classify_vpn_failure() {
+    local log_file=$1
+
+    if [ ! -f "$log_file" ]; then
+        echo "unknown"
+        return
+    fi
+
+    local log_tail
+    log_tail=$(tail -50 "$log_file" 2>/dev/null)
+
+    # Auth failures — DO NOT retry (account lockout risk)
+    if echo "$log_tail" | grep -qi "could not authenticate to gateway"; then
+        echo "auth"
+        return
+    fi
+    if echo "$log_tail" | grep -qi "login failed\|authentication failed\|invalid credentials"; then
+        echo "auth"
+        return
+    fi
+    if echo "$log_tail" | grep -qi "permission denied.*login\|access denied"; then
+        echo "auth"
+        return
+    fi
+
+    # Certificate failures — DO NOT retry (needs manual intervention)
+    if echo "$log_tail" | grep -qi "certificate.*validation failed\|gateway certificate.*failed"; then
+        echo "cert"
+        return
+    fi
+    if echo "$log_tail" | grep -qi "trusted-cert.*mismatch\|server certificate.*changed"; then
+        echo "cert"
+        return
+    fi
+    if echo "$log_tail" | grep -qi "SSL.*error\|TLS.*handshake.*failed"; then
+        echo "cert"
+        return
+    fi
+
+    # Network failures — safe to retry
+    if echo "$log_tail" | grep -qi "timed\? out\|connection refused\|network unreachable\|no route to host\|connection reset\|connection closed"; then
+        echo "network"
+        return
+    fi
+
+    echo "unknown"
+}
+
+# Handle VPN failure based on classification
+# Returns 0 if retry is safe, 1 if we should bail out
+handle_vpn_failure() {
+    local log_file=$1
+    local failure_type
+    failure_type=$(classify_vpn_failure "$log_file")
+
+    case "$failure_type" in
+        auth)
+            echo ""
+            log_error "AUTHENTICATION FAILURE — not retrying to prevent account lockout"
+            echo ""
+            log_info "Possible causes:"
+            log_info "  - Incorrect password (may have changed)"
+            log_info "  - Account locked or disabled on the VPN gateway"
+            log_info "  - 2FA/MFA required but not provided"
+            echo ""
+            log_info "Actions:"
+            log_info "  1. Verify your credentials: $(basename "$0") --test-config"
+            log_info "  2. Update password in Bitwarden if changed"
+            log_info "  3. Check with IT if your VPN account is active"
+            echo ""
+            if [ -f "$log_file" ]; then
+                log_info "Last few lines from VPN log:"
+                tail -5 "$log_file" 2>/dev/null | sed 's/^/  /' >&2
+            fi
+            return 1
+            ;;
+        cert)
+            echo ""
+            log_error "CERTIFICATE FAILURE — not retrying"
+            echo ""
+            log_info "The server's SSL certificate doesn't match the stored trusted-cert."
+            log_info "This usually means the certificate was renewed."
+            echo ""
+            log_info "Actions:"
+            log_info "  1. Update certificate: $(basename "$0") --check-cert"
+            log_info "  2. Then reconnect"
+            echo ""
+            if [ -f "$log_file" ]; then
+                log_info "Last few lines from VPN log:"
+                tail -5 "$log_file" 2>/dev/null | sed 's/^/  /' >&2
+            fi
+            return 1
+            ;;
+        network)
+            log_warn "Network connectivity issue detected"
+            return 0  # Safe to retry
+            ;;
+        *)
+            UNKNOWN_FAILURE_COUNT=$((${UNKNOWN_FAILURE_COUNT:-0} + 1))
+            log_warn "VPN process exited (cause unclear) [$UNKNOWN_FAILURE_COUNT consecutive]"
+            if [ -f "$log_file" ]; then
+                log_debug "Last few lines from VPN log:"
+                tail -5 "$log_file" 2>/dev/null | sed 's/^/  /' >&2
+            fi
+            if [ "$UNKNOWN_FAILURE_COUNT" -ge 2 ]; then
+                log_error "Multiple unknown failures — stopping to prevent possible account lockout"
+                return 1
+            fi
+            return 0  # Unknown — allow one cautious retry
+            ;;
+    esac
+}
+
 # Monitor VPN connection and auto-reconnect on failure
+# Distinguishes auth/cert failures (bail immediately) from network drops (retry)
 monitor_vpn_connection() {
     local vpn_pid=$1
     local config_file=$2
@@ -2262,6 +2398,12 @@ monitor_vpn_connection() {
         if ! kill -0 "$vpn_pid" 2>/dev/null; then
             log_warn "VPN process died (PID: $vpn_pid)"
 
+            # Classify the failure before deciding whether to retry
+            if ! handle_vpn_failure "$VPN_LOG"; then
+                # Auth or cert failure — bail immediately
+                return 1
+            fi
+
             if [ "$NO_RECONNECT" = true ]; then
                 log_info "Auto-reconnect disabled (--no-reconnect). Exiting."
                 return 1
@@ -2272,15 +2414,22 @@ monitor_vpn_connection() {
                 return 1
             fi
 
-            ((reconnect_count++))
+            reconnect_count=$((reconnect_count + 1))
             log_info "Attempting reconnection ($reconnect_count/$max_reconnects)..."
 
-            # Brief backoff
-            sleep $((reconnect_count * 5))
+            # Exponential backoff: 5s, 15s, 30s, 60s, capped at 60s
+            local backoff=$((reconnect_count * reconnect_count * 5))
+            if [ $backoff -gt 60 ]; then backoff=60; fi
+            log_info "Waiting ${backoff}s before reconnecting..."
+            sleep "$backoff"
+
+            # Clear old log for fresh failure classification
+            : > "$VPN_LOG"
 
             # Restart VPN
-            "${vpn_args[@]}" &
+            "${vpn_args[@]}" >> "$VPN_LOG" 2>&1 &
             vpn_pid=$!
+            VPN_PID=$vpn_pid  # Update global for cleanup trap
 
             if wait_for_vpn_interface 30; then
                 # Re-verify default gateway after reconnect
@@ -2292,7 +2441,14 @@ monitor_vpn_connection() {
                 configure_split_dns
                 log_success "Reconnected successfully (PID: $vpn_pid)"
                 reconnect_count=0  # reset on success
+                UNKNOWN_FAILURE_COUNT=0
             else
+                # Check if reconnect failed due to auth/cert
+                if ! kill -0 "$vpn_pid" 2>/dev/null; then
+                    if ! handle_vpn_failure "$VPN_LOG"; then
+                        return 1  # Auth/cert — stop retrying
+                    fi
+                fi
                 log_error "Reconnection failed"
                 kill "$vpn_pid" 2>/dev/null
             fi
@@ -2488,19 +2644,42 @@ connect_vpn() {
 
     log_debug "Command: sudo openfortivpn --pppd-accept-remote -c <config_file> [flags]"
 
+    # Create log file to capture VPN output for failure classification
+    VPN_LOG=$(mktemp)
+    chmod 600 "$VPN_LOG"
+    log_debug "VPN output log: $VPN_LOG"
+
     log_step "Establishing VPN connection"
 
-    # Start VPN in background
-    "${vpn_args[@]}" &
+    # Start VPN in background, capturing output for failure analysis
+    "${vpn_args[@]}" > "$VPN_LOG" 2>&1 &
     local vpn_pid=$!
+    VPN_PID=$vpn_pid  # Store globally for cleanup trap
+
+    # Tail the log in background if verbose
+    TAIL_PID=""
+    if [ "$VERBOSE" = true ]; then
+        tail -f "$VPN_LOG" 2>/dev/null | sed 's/^/  [vpn] /' >&2 &
+        TAIL_PID=$!
+    fi
 
     # Wait for interface to come up
     if ! wait_for_vpn_interface 30; then
         echo "" >&2  # Clear progress line
+        [ -n "$TAIL_PID" ] && kill "$TAIL_PID" 2>/dev/null && TAIL_PID=""
+
+        # Check log for auth/cert failure (process may still be alive doing internal retries)
+        if ! handle_vpn_failure "$VPN_LOG"; then
+            kill "$vpn_pid" 2>/dev/null || true
+            return 1  # Auth or cert failure — do not retry
+        fi
+
         log_error "VPN interface failed to initialize"
-        kill $vpn_pid 2>/dev/null
+        kill "$vpn_pid" 2>/dev/null
         return 1
     fi
+
+    [ -n "$TAIL_PID" ] && kill "$TAIL_PID" 2>/dev/null && TAIL_PID=""
 
     # CRITICAL: Verify default gateway was NOT hijacked by openfortivpn
     log_step "Verifying split-tunnel integrity"
@@ -2541,8 +2720,12 @@ connect_vpn() {
     # Monitor connection with auto-reconnect, or simple wait if disabled
     if [ "$NO_RECONNECT" = true ]; then
         log_debug "Auto-reconnect disabled, waiting for VPN process"
-        wait $vpn_pid
-        local exit_code=$?
+        local exit_code=0
+        wait $vpn_pid || exit_code=$?
+        # Show failure reason even when not retrying
+        if [ $exit_code -ne 0 ]; then
+            handle_vpn_failure "$VPN_LOG" || true
+        fi
     else
         log_debug "Monitoring VPN connection (max reconnects: $MAX_RECONNECTS)"
         monitor_vpn_connection "$vpn_pid" "$config_file"
