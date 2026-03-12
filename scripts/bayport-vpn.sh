@@ -421,7 +421,7 @@ remove_vpn_routes() {
 
     for route in "${VPN_ROUTES_ADDED[@]}"; do
         if platform_route_delete "$route"; then
-            ((removed++))
+            removed=$((removed + 1))
             log_debug "Removed route: $route"
         else
             log_debug "Could not remove route: $route (may already be gone)"
@@ -889,7 +889,7 @@ precheck_permissions() {
     if [ "$needs_sudo" = true ] || [ "$needs_bw_unlock" = true ]; then
         echo ""
         echo -e "${YELLOW}╔════════════════════════════════════════════════╗${NC}" >&2
-        echo -e "${YELLOW}║  PERMISSIONS REQUIRED                           ║${NC}" >&2
+        echo -e "${YELLOW}║  PERMISSIONS REQUIRED                          ║${NC}" >&2
         echo -e "${YELLOW}╚════════════════════════════════════════════════╝${NC}" >&2
         echo ""
 
@@ -931,8 +931,8 @@ show_netbird_status() {
     # Check if NetBird is running
     if pgrep -x netbird >/dev/null 2>&1; then
         local netbird_pid=$(pgrep -x netbird)
-        echo "  Status: ${RED}RUNNING${NC} (PID: $netbird_pid)" >&2
-        echo "  ${YELLOW}⚠ WARNING: NetBird interferes with VPN routing${NC}" >&2
+        echo -e "  Status: ${RED}RUNNING${NC} (PID: $netbird_pid)" >&2
+        echo -e "  ${YELLOW}⚠ WARNING: NetBird interferes with VPN routing${NC}" >&2
         echo "" >&2
 
         # Show NetBird interfaces
@@ -948,14 +948,14 @@ show_netbird_status() {
         echo "  Routes via utun: $netbird_routes" >&2
         echo "" >&2
 
-        echo "  ${BLUE}To stop NetBird:${NC}" >&2
+        echo -e "  ${BLUE}To stop NetBird:${NC}" >&2
         echo "    sudo netbird down" >&2
         echo "" >&2
 
         return 1
     else
-        echo "  Status: ${GREEN}STOPPED${NC}" >&2
-        echo "  ${GREEN}✓ Safe to connect VPN${NC}" >&2
+        echo -e "  Status: ${GREEN}STOPPED${NC}" >&2
+        echo -e "  ${GREEN}✓ Safe to connect VPN${NC}" >&2
         echo "" >&2
 
         if command -v netbird >/dev/null 2>&1; then
@@ -979,7 +979,7 @@ check_vpn_conflicts() {
         log_warn "NetBird can interfere with routing. Consider stopping it:"
         log_info "  sudo netbird down"
         log_info "  OR: sudo brew services stop netbird"
-        ((conflicts_found++))
+        conflicts_found=$((conflicts_found + 1))
 
         # Show NetBird interfaces
         local netbird_ifaces
@@ -990,19 +990,19 @@ check_vpn_conflicts() {
     # Check for other VPN software
     if pgrep -i "openvpn" >/dev/null 2>&1; then
         log_warn "OpenVPN is running - may conflict"
-        ((conflicts_found++))
+        conflicts_found=$((conflicts_found + 1))
     fi
 
     if pgrep -i "wireguard\|wg" >/dev/null 2>&1; then
         log_warn "WireGuard is running - may conflict"
-        ((conflicts_found++))
+        conflicts_found=$((conflicts_found + 1))
     fi
 
     # Check for existing ppp interfaces
     if check_ppp_interface_exists; then
         log_warn "PPP interface already exists - previous VPN connection may not be cleaned up"
         log_info "Run: sudo pkill -9 openfortivpn && sudo pkill -9 pppd"
-        ((conflicts_found++))
+        conflicts_found=$((conflicts_found + 1))
     fi
 
     if [ $conflicts_found -gt 0 ]; then
@@ -1432,7 +1432,7 @@ get_bitwarden_session() {
             if [ $unlock_status -ne 0 ] || [ -z "$SESSION_KEY" ]; then
                 if [ $attempt -lt $max_attempts ]; then
                     log_error "Unlock failed - incorrect password or 2FA required"
-                    ((attempt++))
+                    attempt=$((attempt + 1))
                     continue
                 else
                     log_error "Failed to unlock Bitwarden vault after $max_attempts attempts"
@@ -1458,7 +1458,7 @@ get_bitwarden_session() {
                 if [ $attempt -lt $max_attempts ]; then
                     log_error "Authentication failed - please try again"
                     log_debug "Session validation failed for attempt $attempt"
-                    ((attempt++))
+                    attempt=$((attempt + 1))
                 else
                     log_error "Session validation failed after $max_attempts attempts"
                     log_debug "Session key validation failed (key redacted)"
@@ -1532,7 +1532,7 @@ get_vpn_config() {
         fi
 
         echo "" >&2  # Clear progress line
-        ((retry_count++))
+        retry_count=$((retry_count + 1))
 
         if [ $retry_count -lt $max_retries ]; then
             log_warn "Retrieval failed, retrying in 2 seconds..."
@@ -1745,7 +1745,7 @@ load_routes() {
         done < <(default_routes)
     fi
 
-    echo "${routes[@]}"
+    printf '%s\n' "${routes[@]}"
 }
 
 # Create routes and DNS config files from defaults
@@ -1835,7 +1835,7 @@ verify_routes() {
     if [[ "${current_iface:-}" == *ppp* ]]; then
         log_error "   LEAK DETECTED: Default route goes through VPN tunnel!"
         log_error "   ALL traffic is going through the VPN — this is NOT split-tunnel"
-        ((issues++))
+        issues=$((issues + 1))
     else
         log_success "   Default route is on local interface (not through VPN)"
     fi
@@ -1845,7 +1845,7 @@ verify_routes() {
             log_success "   Matches saved gateway: $DEFAULT_GW via $DEFAULT_GW_IFACE"
         else
             log_warn "   Does NOT match saved gateway: $DEFAULT_GW via $DEFAULT_GW_IFACE"
-            ((issues++))
+            issues=$((issues + 1))
         fi
     fi
     echo ""
@@ -1878,10 +1878,10 @@ verify_routes() {
             # Check specifically for default route through ppp0
             if echo "$suspicious" | grep -qi "default\|0\.0\.0\.0"; then
                 log_error "   CRITICAL: Default route is going through ppp0!"
-                ((issues++))
+                issues=$((issues + 1))
             else
                 log_warn "   These routes may indicate partial leakage"
-                ((issues++))
+                issues=$((issues + 1))
             fi
         else
             log_success "   No suspicious routes through ppp0"
@@ -1920,7 +1920,7 @@ add_vpn_routes() {
 
     # Load subnets from config file or use defaults
     local -a subnets
-    read -ra subnets <<< "$(load_routes)"
+    mapfile -t subnets < <(load_routes)
 
     local routes_added=0
     local routes_failed=0
@@ -1928,10 +1928,10 @@ add_vpn_routes() {
     for subnet in "${subnets[@]}"; do
         if platform_route_add "$subnet"; then
             VPN_ROUTES_ADDED+=("$subnet")
-            ((routes_added++))
+            routes_added=$((routes_added + 1))
             log_debug "Added route: $subnet -> ppp0"
         else
-            ((routes_failed++))
+            routes_failed=$((routes_failed + 1))
             log_debug "Failed to add route: $subnet (may already exist)"
         fi
     done
@@ -2083,7 +2083,7 @@ dns_leak_test() {
                 if [[ "$fname" =~ ^(default|com|net|org|io|co)$ ]]; then
                     log_warn "Blanket DNS override: /etc/resolver/$fname"
                     log_warn "  Routes ALL .$fname lookups through VPN DNS"
-                    ((issues++))
+                    issues=$((issues + 1))
                 fi
             done
             if [ "$has_resolver_files" = false ]; then
@@ -2100,7 +2100,7 @@ dns_leak_test() {
                 if [[ "$global_dns" =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.) ]]; then
                     log_warn "Primary DNS is a private IP ($global_dns) — likely VPN DNS"
                     log_warn "  All DNS queries may be routed through VPN"
-                    ((issues++))
+                    issues=$((issues + 1))
                 fi
             fi
         fi
@@ -2117,7 +2117,7 @@ dns_leak_test() {
                 for dns in $global_dns; do
                     if [[ "$dns" =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.) ]]; then
                         log_warn "Global DNS set to private IP ($dns) — VPN DNS leak"
-                        ((issues++))
+                        issues=$((issues + 1))
                     fi
                 done
             fi
@@ -2130,7 +2130,7 @@ dns_leak_test() {
                 if echo "$vpn_domains" | grep -q '~\.$'; then
                     log_warn "VPN interface ($vpn_iface) is the default DNS route (~.)"
                     log_warn "  All DNS queries are being routed through VPN"
-                    ((issues++))
+                    issues=$((issues + 1))
                 fi
             fi
         else
@@ -2141,17 +2141,17 @@ dns_leak_test() {
                 local private_count=0
                 local total_count=0
                 for ns in $nameservers; do
-                    ((total_count++))
+                    total_count=$((total_count + 1))
                     if [[ "$ns" =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.) ]]; then
                         log_debug "resolv.conf has private DNS: $ns"
-                        ((private_count++))
+                        private_count=$((private_count + 1))
                     fi
                 done
                 # If ALL nameservers are private, that's likely a full VPN DNS override
                 if [ $total_count -gt 0 ] && [ $private_count -eq $total_count ]; then
                     log_warn "All nameservers in /etc/resolv.conf are private IPs"
                     log_warn "  DNS is fully overridden — likely VPN DNS leak"
-                    ((issues++))
+                    issues=$((issues + 1))
                 elif [ $private_count -gt 0 ]; then
                     log_debug "Some private nameservers in resolv.conf ($private_count/$total_count)"
                 fi
@@ -2171,7 +2171,7 @@ dns_leak_test() {
             if [[ "$dig_server" =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.) ]]; then
                 log_warn "Public domain ($test_domain) resolved via private DNS ($dig_server)"
                 log_warn "  DNS is leaking through VPN"
-                ((issues++))
+                issues=$((issues + 1))
             else
                 log_success "Public DNS ($test_domain) resolved via $dig_server (not VPN)"
             fi
