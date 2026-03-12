@@ -20,7 +20,7 @@ TEMP_CONFIG=""
 SESSION_KEY=""
 SESSION_CACHE_DIR="${HOME}/.cache/bayport-vpn"
 SESSION_CACHE_FILE="${SESSION_CACHE_DIR}/session_key"
-SESSION_TIMEOUT=3600  # 1 hour in seconds (configurable)
+SESSION_TIMEOUT=0  # 0 = persist until reboot (default); >0 = wall-clock seconds
 VPN_ROUTES_ADDED=()  # Track routes we added for cleanup
 NO_RECONNECT=false
 MAX_RECONNECTS=${MAX_RECONNECTS:-3}
@@ -903,7 +903,8 @@ precheck_permissions() {
     local needs_bw_unlock=false
 
     # Check if we need sudo (for VPN connection and route management)
-    if ! sudo -n true 2>/dev/null; then
+    # Skip for dry-run — no routes or interfaces are touched
+    if [ "$DRY_RUN" != true ] && ! sudo -n true 2>/dev/null; then
         needs_sudo=true
     fi
 
@@ -1143,18 +1144,38 @@ save_session_key() {
             ;;
     esac
 
-    # Store timestamp for session timeout tracking (all backends)
+    # Store timestamp and boot ID for session validity tracking
     install -m 600 /dev/null "${SESSION_CACHE_DIR}/session_timestamp"
     date +%s > "${SESSION_CACHE_DIR}/session_timestamp"
 
-    log_progress_done "Session cached via $KEYSTORE_BACKEND (valid for $((SESSION_TIMEOUT / 60)) minutes)"
+    # Store boot ID so session is invalidated on reboot
+    install -m 600 /dev/null "${SESSION_CACHE_DIR}/session_boot_id"
+    _get_boot_id > "${SESSION_CACHE_DIR}/session_boot_id"
+
+    if [ "$SESSION_TIMEOUT" -gt 0 ]; then
+        log_progress_done "Session cached via $KEYSTORE_BACKEND (valid for $((SESSION_TIMEOUT / 60)) minutes)"
+    else
+        log_progress_done "Session cached via $KEYSTORE_BACKEND (valid until reboot)"
+    fi
 }
 
 load_cached_session() {
     local cached_key=""
-    local file_age=$((SESSION_TIMEOUT + 1))
+    local file_age=0
 
-    # Check timestamp for timeout (unified across all backends)
+    # Check boot ID — invalidate session if machine was rebooted
+    if [ -f "${SESSION_CACHE_DIR}/session_boot_id" ]; then
+        local saved_boot_id current_boot_id
+        saved_boot_id=$(cat "${SESSION_CACHE_DIR}/session_boot_id" 2>/dev/null)
+        current_boot_id=$(_get_boot_id)
+        if [ "$saved_boot_id" != "$current_boot_id" ]; then
+            log_warn "Machine was rebooted since last session — clearing cache"
+            clear_session_cache >/dev/null 2>&1
+            return 1
+        fi
+    fi
+
+    # Check timestamp for wall-clock timeout (only if SESSION_TIMEOUT > 0)
     if [ -f "${SESSION_CACHE_DIR}/session_timestamp" ]; then
         local saved_ts
         saved_ts=$(cat "${SESSION_CACHE_DIR}/session_timestamp" 2>/dev/null)
@@ -1166,7 +1187,7 @@ load_cached_session() {
         return 1
     fi
 
-    if [ $file_age -gt $SESSION_TIMEOUT ]; then
+    if [ "$SESSION_TIMEOUT" -gt 0 ] && [ $file_age -gt $SESSION_TIMEOUT ]; then
         log_warn "Cached session expired (${file_age}s old, timeout: ${SESSION_TIMEOUT}s)"
         clear_session_cache >/dev/null 2>&1
         return 1
@@ -1180,9 +1201,9 @@ load_cached_session() {
         return 1
     fi
 
-    # Verify the session key is still valid
+    # Verify the session key is still valid (bw status is fast, avoids slow bw list items)
     log_debug "Found cached session (${file_age}s old via $KEYSTORE_BACKEND), validating..."
-    if bw list items --session "$cached_key" >/dev/null 2>&1; then
+    if bw status --session "$cached_key" 2>/dev/null | jq -r '.status' 2>/dev/null | grep -q "unlocked"; then
         log_success "Using cached session key (${file_age}s old)"
         echo "$cached_key"
         return 0
@@ -1211,11 +1232,13 @@ clear_session_cache() {
             ;;
     esac
 
-    # Always clean up timestamp
-    if [ -f "${SESSION_CACHE_DIR}/session_timestamp" ]; then
-        rm -f "${SESSION_CACHE_DIR}/session_timestamp"
-        cleared=true
-    fi
+    # Always clean up timestamp and boot ID
+    for f in "${SESSION_CACHE_DIR}/session_timestamp" "${SESSION_CACHE_DIR}/session_boot_id"; do
+        if [ -f "$f" ]; then
+            rm -f "$f"
+            cleared=true
+        fi
+    done
 
     if [ "$cleared" = true ]; then
         log_info "Clearing cached session key..."
@@ -1229,11 +1252,26 @@ show_session_status() {
     log_info "Session cache status:"
     echo ""
     echo "  Backend: $KEYSTORE_BACKEND"
-    echo "  Timeout: ${SESSION_TIMEOUT}s ($(($SESSION_TIMEOUT / 60)) minutes)"
+    if [ "$SESSION_TIMEOUT" -gt 0 ]; then
+        echo "  Timeout: ${SESSION_TIMEOUT}s ($((SESSION_TIMEOUT / 60)) minutes)"
+    else
+        echo "  Timeout: persist until reboot"
+    fi
     echo ""
 
+    # Check boot ID
+    local boot_match=true
+    if [ -f "${SESSION_CACHE_DIR}/session_boot_id" ]; then
+        local saved_boot_id current_boot_id
+        saved_boot_id=$(cat "${SESSION_CACHE_DIR}/session_boot_id" 2>/dev/null)
+        current_boot_id=$(_get_boot_id)
+        if [ "$saved_boot_id" != "$current_boot_id" ]; then
+            boot_match=false
+        fi
+    fi
+
     # Check timestamp
-    local file_age=$((SESSION_TIMEOUT + 1))
+    local file_age=0
     local has_timestamp=false
 
     if [ -f "${SESSION_CACHE_DIR}/session_timestamp" ]; then
@@ -1246,32 +1284,36 @@ show_session_status() {
     fi
 
     # Check if a session exists in the backend
-    # Check if a session exists in the backend
     local has_session=false
     _read_session_from_backend >/dev/null 2>&1 && has_session=true
 
     if [ "$has_session" = false ] && [ "$has_timestamp" = false ]; then
-        echo "  Status: ${RED}No cached session${NC}"
+        echo -e "  Status: ${RED}No cached session${NC}"
         return 0
     fi
 
-    echo "  Age: ${file_age}s ($(($file_age / 60)) minutes)"
+    echo "  Age: ${file_age}s ($((file_age / 60)) minutes)"
 
-    local remaining=$((SESSION_TIMEOUT - file_age))
-
-    if [ $file_age -gt $SESSION_TIMEOUT ]; then
-        echo "  Status: ${RED}Expired${NC} (exceeded timeout by $((file_age - SESSION_TIMEOUT))s)"
+    if [ "$boot_match" = false ]; then
+        echo -e "  Status: ${RED}Expired${NC} (machine was rebooted)"
+    elif [ "$SESSION_TIMEOUT" -gt 0 ] && [ $file_age -gt $SESSION_TIMEOUT ]; then
+        echo -e "  Status: ${RED}Expired${NC} (exceeded timeout by $((file_age - SESSION_TIMEOUT))s)"
     else
-        echo "  Status: ${GREEN}Valid${NC}"
-        echo "  Expires in: ${remaining}s ($(($remaining / 60)) minutes)"
+        echo -e "  Status: ${GREEN}Valid${NC}"
+        if [ "$SESSION_TIMEOUT" -gt 0 ]; then
+            local remaining=$((SESSION_TIMEOUT - file_age))
+            echo "  Expires in: ${remaining}s ($((remaining / 60)) minutes)"
+        else
+            echo "  Expires: on reboot"
+        fi
 
         if [ "$has_session" = true ]; then
             local cached_key=""
             cached_key=$(_read_session_from_backend) || true
-            if [ -n "$cached_key" ] && bw list items --session "$cached_key" >/dev/null 2>&1; then
-                echo "  Verification: ${GREEN}Session key is valid${NC}"
+            if [ -n "$cached_key" ] && bw status --session "$cached_key" 2>/dev/null | jq -r '.status' 2>/dev/null | grep -q "unlocked"; then
+                echo -e "  Verification: ${GREEN}Session key is valid${NC}"
             else
-                echo "  Verification: ${RED}Session key is invalid${NC}"
+                echo -e "  Verification: ${RED}Session key is invalid${NC}"
             fi
         fi
     fi
@@ -1346,13 +1388,12 @@ parse_args() {
                 ;;
             --session-timeout)
                 shift
-                if [[ $1 =~ ^[0-9]+$ ]]; then
-                    SESSION_TIMEOUT=$1
-                    log_info "Session timeout set to ${SESSION_TIMEOUT}s"
-                else
-                    log_error "Invalid timeout value: $1 (must be a number)"
+                if [ $# -eq 0 ] || [[ ! $1 =~ ^[0-9]+$ ]]; then
+                    log_error "--session-timeout requires a numeric value"
                     exit 1
                 fi
+                SESSION_TIMEOUT=$1
+                log_info "Session timeout set to ${SESSION_TIMEOUT}s"
                 shift
                 ;;
             --no-reconnect)
@@ -1361,13 +1402,12 @@ parse_args() {
                 ;;
             --max-reconnects)
                 shift
-                if [[ $1 =~ ^[0-9]+$ ]]; then
-                    MAX_RECONNECTS=$1
-                    log_info "Max reconnects set to $MAX_RECONNECTS"
-                else
-                    log_error "Invalid max-reconnects value: $1 (must be a number)"
+                if [ $# -eq 0 ] || [[ ! $1 =~ ^[0-9]+$ ]]; then
+                    log_error "--max-reconnects requires a numeric value"
                     exit 1
                 fi
+                MAX_RECONNECTS=$1
+                log_info "Max reconnects set to $MAX_RECONNECTS"
                 shift
                 ;;
             --init-routes)
@@ -1408,29 +1448,27 @@ get_bitwarden_session() {
     # Check if a session key already exists in environment
     if [ -n "${BW_SESSION:-}" ]; then
         log_debug "Using existing BW_SESSION from environment"
-        # FIX: Validate the environment session
-        if bw list items --session "$BW_SESSION" >/dev/null 2>&1; then
+        if bw status --session "$BW_SESSION" 2>/dev/null | jq -r '.status' 2>/dev/null | grep -q "unlocked"; then
             SESSION_KEY=$BW_SESSION
-            echo "$SESSION_KEY"
-            return 0
         else
             log_warn "Environment BW_SESSION is invalid, will try cached session"
         fi
     fi
 
-    # Try to load cached session with validation
-    local cached_session=$(load_cached_session)
-    if [ -n "$cached_session" ]; then
-        # FIX: Double-check the cached session is still valid right before using it
-        log_debug "Double-checking cached session validity..."
-        if bw list items --session "$cached_session" >/dev/null 2>&1; then
+    # Try to load cached session with validation (load_cached_session already validates)
+    if [ -z "$SESSION_KEY" ]; then
+        local cached_session=$(load_cached_session)
+        if [ -n "$cached_session" ]; then
             SESSION_KEY=$cached_session
-            echo "$SESSION_KEY"
-            return 0
-        else
-            log_warn "Cached session became invalid, clearing and retrying..."
-            clear_session_cache > /dev/null 2>&1
         fi
+    fi
+
+    # If we got a session from env or cache, sync and return
+    if [ -n "$SESSION_KEY" ]; then
+        log_debug "Syncing Bitwarden vault..."
+        bw sync --session "$SESSION_KEY" >/dev/null 2>&1 || log_debug "Sync failed (non-fatal, continuing with local cache)"
+        echo "$SESSION_KEY"
+        return 0
     fi
 
     # No cached session, need to unlock
@@ -1481,7 +1519,7 @@ get_bitwarden_session() {
 
             # Validate the session key immediately with visual feedback
             log_progress "Validating session key..."
-            if bw list items --session "$SESSION_KEY" >/dev/null 2>&1; then
+            if bw status --session "$SESSION_KEY" 2>/dev/null | jq -r '.status' 2>/dev/null | grep -q "unlocked"; then
                 log_progress_done "Session key validated successfully"
                 unlock_successful=true
                 break
@@ -1521,7 +1559,7 @@ get_bitwarden_session() {
 
         # Validate the session key
         log_progress "Validating session key..."
-        if bw list items --session "$SESSION_KEY" >/dev/null 2>&1; then
+        if bw status --session "$SESSION_KEY" 2>/dev/null | jq -r '.status' 2>/dev/null | grep -q "unlocked"; then
             log_progress_done "Session key validated successfully"
         else
             echo "" >&2
@@ -1533,6 +1571,10 @@ get_bitwarden_session() {
         log_error "Unexpected vault status: $vault_status"
         return 1
     fi
+    # Sync vault so all reads/edits use the latest data
+    log_debug "Syncing Bitwarden vault..."
+    bw sync --session "$SESSION_KEY" >/dev/null 2>&1 || log_debug "Sync failed (non-fatal, continuing with local cache)"
+
     # Save the new session key to cache
     save_session_key "$SESSION_KEY"
 
@@ -2359,8 +2401,10 @@ main() {
         return 1
     fi
 
-    # Keep sudo alive throughout the session
-    start_sudo_keepalive
+    # Keep sudo alive throughout the session (skip for dry-run)
+    if [ "$DRY_RUN" != true ]; then
+        start_sudo_keepalive
+    fi
 
     # Get item name
     local item_name
