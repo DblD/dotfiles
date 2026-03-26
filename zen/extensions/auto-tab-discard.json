@@ -1,0 +1,28 @@
+{
+  "id": "{c2c003ee-bd69-42a2-b0e9-6f34222cb046}",
+  "name": "Auto Tab Discard",
+  "description": "Aggressive memory-saving config for 8GB machines",
+  "settings": {
+    "period": 180,
+    "number": 3,
+    "audio": true,
+    "pinned": true,
+    "form": true,
+    "battery": false,
+    "online": false,
+    "notification.permission": false,
+    "favicon": true,
+    "go-hidden": true,
+    "startup-unpinned": true,
+    "startup-pinned": false,
+    "startup-release-pinned": false,
+    "log": false,
+    "faqs": false,
+    "simultaneous-jobs": 10,
+    "memory-enabled": false,
+    "whitelist": [
+      "meet.google.com",
+      "app.slack.com"
+    ]
+  }
+}
