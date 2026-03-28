@@ -12,3 +12,5 @@
 --ignore=\.claude
 --ignore=ssh
 --ignore=atuin
+--ignore=specs
+--ignore=tests
