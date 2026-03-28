@@ -1,0 +1,835 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# claude-team — tmux control room for coordinated Claude Code agent teams
+# Usage: claude-team [options] [config]
+
+readonly VERSION="2.1.0"
+readonly CONFIG_DIR="${HOME}/.config/claude-teams"
+readonly TEMPLATES_DIR="${CONFIG_DIR}/_templates"
+readonly GLOBAL_FRAGMENTS_DIR="${CONFIG_DIR}/_fragments"
+readonly GLOBAL_PROFILES_DIR="${CONFIG_DIR}/_profiles"
+readonly TEAM_DIR=".claude-team"
+
+# Colors
+red()    { printf '\033[0;31m%s\033[0m\n' "$*"; }
+green()  { printf '\033[0;32m%s\033[0m\n' "$*"; }
+yellow() { printf '\033[0;33m%s\033[0m\n' "$*"; }
+dim()    { printf '\033[0;90m%s\033[0m\n' "$*"; }
+bold()   { printf '\033[1m%s\033[0m\n' "$*"; }
+
+DRY_RUN=false
+YOLO=false
+VERBOSE=false
+
+# Build the claude launch command (accounts for nesting + permission mode)
+claude_cmd() {
+  local cmd="clear && unset CLAUDECODE && claude"
+  # Always enable the option so workers can self-escalate if needed
+  cmd+=" --allow-dangerously-skip-permissions"
+  if $YOLO; then
+    cmd+=" --dangerously-skip-permissions"
+  fi
+  echo "$cmd"
+}
+
+run_cmd() {
+  if $DRY_RUN; then
+    dim "[dry-run] $*"
+  else
+    "$@"
+  fi
+}
+
+usage() {
+  cat <<EOF
+claude-team v${VERSION} — tmux control room for Claude Code agent teams
+
+Usage:
+  claude-team <config>                 Launch from saved config (name or path)
+  claude-team --project <path>         Start interactive control room
+  claude-team spawn <config>           Spawn workers from config (used by team lead)
+  claude-team --pick                   fzf picker for saved configs
+  claude-team --list                   List saved configs
+  claude-team cleanup [session-name]   Kill completed worker windows
+  claude-team --stop [session-name]    Stop a team session
+  claude-team --help                   Show this help
+
+Options:
+  --yolo                               Skip all Claude permission prompts
+  --dry-run                            Print commands without executing
+  --verbose                            Show assembled prompts in dry-run
+  --session-name <name>                Override tmux session name
+
+Config format (v2 — task + fragments):
+  agents:
+    - name: backend
+      task: .claude-team/tasks/backend.md     # task-specific instructions
+      profile: code-worker                     # permission profile
+      fragments: "api-patterns,svelte5-patterns"  # extra context fragments
+      verify: svelte                           # verification fragment
+      branch: feat/my-feature                  # branch context
+      owns: "app/src/routes/api/"              # file ownership
+      commit_style: per-task                   # per-task or single
+      mode: interactive                        # interactive or headless
+
+Config format (v1 — legacy monolithic prompt):
+  agents:
+    - name: backend
+      prompt: .claude-team/prompts/backend.md  # full self-contained prompt
+      mode: interactive
+
+Examples:
+  claude-team --project ~/code/my-app
+  claude-team .claude-team/team-config.yml --yolo
+  claude-team --dry-run --verbose .claude-team/team-config.yml
+  claude-team --stop team-my-app
+EOF
+}
+
+# --- Config resolution ---
+
+resolve_config() {
+  local input="$1"
+
+  # Absolute or relative path to a .yml file
+  if [[ -f "$input" ]]; then
+    echo "$input"
+    return
+  fi
+
+  # Name without extension — look in config dir
+  if [[ -f "${CONFIG_DIR}/${input}.yml" ]]; then
+    echo "${CONFIG_DIR}/${input}.yml"
+    return
+  fi
+
+  red "Config not found: $input"
+  red "Looked in: $input, ${CONFIG_DIR}/${input}.yml"
+  exit 1
+}
+
+# --- Prompt resolution (legacy v1 style) ---
+
+resolve_prompt() {
+  local prompt_path="$1"
+  local work_dir="$2"
+
+  # No prompt — interactive mode
+  if [[ -z "$prompt_path" ]]; then
+    return
+  fi
+
+  # Absolute path
+  if [[ "$prompt_path" == /* || "$prompt_path" == ~/* ]]; then
+    local expanded
+    expanded=$(eval echo "$prompt_path")
+    if [[ -f "$expanded" ]]; then
+      echo "$expanded"
+    else
+      yellow "Warning: prompt not found: $expanded (falling back to interactive)"
+    fi
+    return
+  fi
+
+  # _templates/ prefix — resolve from global templates
+  if [[ "$prompt_path" == _templates/* ]]; then
+    local template="${CONFIG_DIR}/${prompt_path}"
+    if [[ -f "$template" ]]; then
+      echo "$template"
+    else
+      yellow "Warning: template not found: $template (falling back to interactive)"
+    fi
+    return
+  fi
+
+  # Relative path — resolve from working directory
+  local relative="${work_dir}/${prompt_path}"
+  if [[ -f "$relative" ]]; then
+    echo "$relative"
+    return
+  fi
+
+  yellow "Warning: prompt not found: $relative (falling back to interactive)"
+}
+
+# --- Session naming ---
+
+session_name_from_path() {
+  local path="$1"
+  # Use the last directory component, sanitize for tmux
+  basename "$path" | tr '.' '-' | tr ' ' '-'
+}
+
+# --- Fragment/Profile resolution with fallback ---
+# Checks project-local first, then global
+
+resolve_fragment() {
+  local filename="$1"
+  local project_path="$2"
+  local local_path="${project_path}/${TEAM_DIR}/fragments/${filename}"
+  local global_path="${GLOBAL_FRAGMENTS_DIR}/${filename}"
+
+  if [[ -f "$local_path" ]]; then
+    echo "$local_path"
+  elif [[ -f "$global_path" ]]; then
+    echo "$global_path"
+  else
+    return 1
+  fi
+}
+
+resolve_profile() {
+  local filename="$1"
+  local project_path="$2"
+  local local_path="${project_path}/${TEAM_DIR}/profiles/${filename}"
+  local global_path="${GLOBAL_PROFILES_DIR}/${filename}"
+
+  if [[ -f "$local_path" ]]; then
+    echo "$local_path"
+  elif [[ -f "$global_path" ]]; then
+    echo "$global_path"
+  else
+    return 1
+  fi
+}
+
+# --- v2 Prompt Assembly ---
+# Assembles a full prompt from fragments + task file
+# Returns path to a temp file containing the assembled prompt
+
+assemble_prompt() {
+  local agent_name="$1"
+  local task_file="$2"
+  local project_path="$3"
+  local fragments="${4:-}"
+  local verify="${5:-}"
+  local branch="${6:-}"
+  local owns="${7:-}"
+  local commit_style="${8:-}"
+
+  local assembled=""
+
+  # Header
+  assembled+="# Worker: ${agent_name}
+
+"
+
+  # Branch context
+  if [[ -n "$branch" && "$branch" != "null" ]]; then
+    assembled+="**Branch:** \`${branch}\` (you are already on it)
+
+"
+  fi
+
+  # File ownership
+  if [[ -n "$owns" && "$owns" != "null" ]]; then
+    assembled+="**Files you own:** ${owns}
+Do NOT edit files outside your ownership scope. Other workers handle those.
+
+"
+  fi
+
+  # Common rules fragment (project-local → global fallback)
+  local rules_path
+  if rules_path=$(resolve_fragment "_rules.md" "$project_path"); then
+    local rules
+    rules=$(cat "$rules_path")
+    if [[ "$commit_style" == "per-task" ]]; then
+      rules=$(echo "$rules" | sed '/Co-Authored-By/a\
+- Commit after EACH task (not all at once)')
+    fi
+    assembled+="${rules}
+
+"
+    $VERBOSE && dim "    + rules: ${rules_path}" >&2
+  fi
+
+  # Status file fragment (project-local → global fallback)
+  local status_path
+  if status_path=$(resolve_fragment "_status-file.md" "$project_path"); then
+    assembled+="$(sed "s/{{AGENT_NAME}}/${agent_name}/g" "$status_path")
+
+"
+    $VERBOSE && dim "    + status: ${status_path}" >&2
+  fi
+
+  # Domain-specific fragments (project-local → global fallback)
+  if [[ -n "$fragments" && "$fragments" != "null" ]]; then
+    local IFS=','
+    for frag in $fragments; do
+      frag=$(echo "$frag" | xargs)  # trim whitespace
+      local frag_path
+      if frag_path=$(resolve_fragment "_${frag}.md" "$project_path"); then
+        assembled+="$(cat "$frag_path")
+
+"
+        $VERBOSE && dim "    + fragment: _${frag}.md (${frag_path})" >&2
+      else
+        yellow "    ! fragment not found: _${frag}.md (checked project + global)" >&2
+      fi
+    done
+  fi
+
+  # Separator
+  assembled+="---
+
+"
+
+  # Task body
+  local resolved_task="${project_path}/${task_file}"
+  if [[ -f "$resolved_task" ]]; then
+    assembled+="$(cat "$resolved_task")
+
+"
+  else
+    red "    Task file not found: $resolved_task" >&2
+    return 1
+  fi
+
+  # Verification fragment (project-local → global fallback)
+  if [[ -n "$verify" && "$verify" != "null" ]]; then
+    local verify_path
+    if verify_path=$(resolve_fragment "_verify-${verify}.md" "$project_path"); then
+      assembled+="
+$(cat "$verify_path")
+"
+      $VERBOSE && dim "    + verify: _verify-${verify}.md (${verify_path})" >&2
+    else
+      yellow "    ! verify fragment not found: _verify-${verify}.md (checked project + global)" >&2
+    fi
+  fi
+
+  # Write to temp file
+  local tmpfile
+  tmpfile=$(mktemp /tmp/claude-team-prompt-XXXXXXXXXX)
+  echo "$assembled" > "$tmpfile"
+
+  if $VERBOSE; then
+    dim "    Assembled: $(wc -c < "$tmpfile" | tr -d ' ') bytes, $(wc -l < "$tmpfile" | tr -d ' ') lines → $tmpfile" >&2
+  fi
+
+  echo "$tmpfile"
+}
+
+# --- Build per-agent claude command with profile ---
+
+build_worker_cmd() {
+  local prompt_file="$1"
+  local profile="${2:-}"
+  local project_path="${3:-}"
+  local mode="${4:-interactive}"
+
+  local cmd
+  cmd=$(claude_cmd)
+
+  # Apply permission profile via --settings (project-local → global fallback)
+  if [[ -n "$profile" && "$profile" != "null" ]]; then
+    local profile_path
+    if profile_path=$(resolve_profile "${profile}.json" "$project_path"); then
+      cmd+=" --settings '${profile_path}'"
+      $VERBOSE && dim "    + profile: ${profile}.json (${profile_path})" >&2
+    else
+      yellow "    ! profile not found: ${profile}.json (checked project + global)" >&2
+    fi
+  fi
+
+  if [[ "$mode" == "headless" ]]; then
+    cmd+=" -p"
+    cmd+=" --append-system-prompt \"\$(cat '${prompt_file}')\""
+  else
+    cmd+=" --append-system-prompt \"\$(cat '${prompt_file}')\""
+    cmd+=" \"Execute your task.\""
+  fi
+
+  echo "$cmd"
+}
+
+# --- Project mode: start control room with team lead ---
+
+cmd_project() {
+  local project_path="$1"
+  project_path=$(cd "$project_path" && pwd)  # resolve to absolute
+
+  local session
+  if [[ -n "${SESSION_NAME_OVERRIDE:-}" ]]; then
+    session="$SESSION_NAME_OVERRIDE"
+  else
+    session="team-$(session_name_from_path "$project_path")"
+  fi
+
+  # Check if session already exists
+  if tmux has-session -t "$session" 2>/dev/null; then
+    yellow "Session '$session' already exists. Attaching..."
+    run_cmd tmux attach-session -t "$session"
+    return
+  fi
+
+  # Create .claude-team directories in project
+  run_cmd mkdir -p "${project_path}/${TEAM_DIR}/agents"
+  run_cmd mkdir -p "${project_path}/${TEAM_DIR}/tasks"
+
+  green "Starting control room: $session"
+  green "Project: $project_path"
+
+  # Create tmux session with lead window
+  run_cmd tmux new-session -d -s "$session" -n "lead" -c "$project_path"
+
+  # Start Claude with team lead system prompt via --append-system-prompt
+  local lead_prompt="${TEMPLATES_DIR}/team-lead.md"
+  if [[ -f "$lead_prompt" ]]; then
+    run_cmd tmux send-keys -t "${session}:lead" \
+      "$(claude_cmd) --append-system-prompt \"\$(cat '${lead_prompt}')\"" Enter
+  else
+    yellow "No team lead template found at $lead_prompt"
+    yellow "Starting plain Claude Code session"
+    run_cmd tmux send-keys -t "${session}:lead" "$(claude_cmd)" Enter
+  fi
+
+  # Attach to the session
+  if [[ -z "${TMUX:-}" ]]; then
+    run_cmd tmux attach-session -t "$session"
+  else
+    run_cmd tmux switch-client -t "$session"
+  fi
+}
+
+# --- Spawn workers from config ---
+
+cmd_spawn() {
+  local config_file
+  config_file=$(resolve_config "$1")
+
+  local project_path
+  project_path=$(yq -r '.project // ""' "$config_file")
+  if [[ -z "$project_path" ]]; then
+    red "Config missing 'project' field"
+    exit 1
+  fi
+  project_path=$(eval echo "$project_path")
+  project_path=$(cd "$project_path" && pwd)
+
+  local config_name
+  config_name=$(yq -r '.name // "unnamed"' "$config_file")
+
+  local session
+  if [[ -n "${SESSION_NAME_OVERRIDE:-}" ]]; then
+    session="$SESSION_NAME_OVERRIDE"
+  else
+    session="team-$(session_name_from_path "$project_path")"
+  fi
+
+  # Ensure session exists (might be called by team lead from within session)
+  if ! tmux has-session -t "$session" 2>/dev/null; then
+    green "Creating session: $session"
+    run_cmd tmux new-session -d -s "$session" -n "lead" -c "$project_path"
+  fi
+
+  local use_worktrees
+  use_worktrees=$(yq -r '.worktrees // false' "$config_file")
+  local worktree_base
+  worktree_base=$(yq -r '.worktree_base // "../worktrees"' "$config_file")
+  local base_branch
+  base_branch=$(yq -r '.base_branch // "develop"' "$config_file")
+  local branch_prefix
+  branch_prefix=$(yq -r '.branch_prefix // "agent"' "$config_file")
+
+  # Create team dirs
+  run_cmd mkdir -p "${project_path}/${TEAM_DIR}/agents"
+
+  # Count agents
+  local agent_count
+  agent_count=$(yq -r '.agents | length' "$config_file")
+
+  bold "Spawning $agent_count agents for: $config_name"
+  dim "Session: $session"
+  echo ""
+
+  # Track temp files for cleanup
+  local temp_files=()
+
+  for i in $(seq 0 $((agent_count - 1))); do
+    local name role mode
+    name=$(yq -r ".agents[$i].name" "$config_file")
+    role=$(yq -r ".agents[$i].role // \"worker\"" "$config_file")
+    mode=$(yq -r ".agents[$i].mode // \"interactive\"" "$config_file")
+
+    # Skip lead if it already exists as a window
+    if [[ "$role" == "lead" ]]; then
+      if tmux list-windows -t "$session" -F '#{window_name}' 2>/dev/null | grep -q "^lead$"; then
+        dim "  Lead window exists, skipping"
+        continue
+      fi
+    fi
+
+    # Read v2 fields (task + fragments) or v1 field (prompt)
+    local task prompt profile fragments verify branch owns commit_style
+    task=$(yq -r ".agents[$i].task // \"\"" "$config_file")
+    prompt=$(yq -r ".agents[$i].prompt // \"\"" "$config_file")
+    profile=$(yq -r ".agents[$i].profile // \"\"" "$config_file")
+    fragments=$(yq -r ".agents[$i].fragments // \"\"" "$config_file")
+    verify=$(yq -r ".agents[$i].verify // \"\"" "$config_file")
+    branch=$(yq -r ".agents[$i].branch // \"${base_branch}\"" "$config_file")
+    owns=$(yq -r ".agents[$i].owns // \"\"" "$config_file")
+    commit_style=$(yq -r ".agents[$i].commit_style // \"\"" "$config_file")
+    local agent_worktree
+    agent_worktree=$(yq -r ".agents[$i].worktree // \"auto\"" "$config_file")
+
+    # Determine working directory
+    local work_dir="$project_path"
+
+    if [[ "$use_worktrees" == "true" && "$role" != "lead" && "$agent_worktree" != "false" ]]; then
+      local wt_path="${project_path}/${worktree_base}/${name}"
+      local wt_branch="${branch_prefix}/${name}"
+
+      if [[ -d "$wt_path" ]]; then
+        dim "  Reusing worktree: $wt_path"
+      else
+        green "  Creating worktree: $wt_path (branch: $wt_branch)"
+        run_cmd git -C "$project_path" worktree add "$wt_path" -b "$wt_branch" "$base_branch" 2>/dev/null || \
+          run_cmd git -C "$project_path" worktree add "$wt_path" "$wt_branch" 2>/dev/null || \
+          { red "  Failed to create worktree for $name"; continue; }
+      fi
+      work_dir="$wt_path"
+    fi
+
+    # --- Determine prompt source ---
+    local final_prompt_file=""
+
+    if [[ -n "$task" ]]; then
+      # v2 style: assemble from fragments + task file
+      green "  [$name] v2 task=${task} profile=${profile}"
+      final_prompt_file=$(assemble_prompt \
+        "$name" "$task" "$project_path" \
+        "$fragments" "$verify" "$branch" "$owns" "$commit_style") || {
+        red "  Failed to assemble prompt for $name"
+        continue
+      }
+      temp_files+=("$final_prompt_file")
+
+    elif [[ -n "$prompt" ]]; then
+      # v1 style: monolithic prompt file
+      yellow "  [$name] v1 (legacy) prompt=${prompt}"
+      final_prompt_file=$(resolve_prompt "$prompt" "$work_dir")
+
+    else
+      # No prompt — plain interactive
+      dim "  [$name] no prompt (interactive)"
+    fi
+
+    # --- Show assembled prompt in verbose dry-run (v2 only — v1 prompts are already readable files) ---
+    if $DRY_RUN && $VERBOSE && [[ -n "$task" && -n "$final_prompt_file" && -f "$final_prompt_file" ]]; then
+      echo ""
+      dim "  ┌─── Assembled prompt for [$name] ───"
+      sed 's/^/  │ /' "$final_prompt_file" | head -40
+      local total_lines
+      total_lines=$(wc -l < "$final_prompt_file" | tr -d ' ')
+      if [[ "$total_lines" -gt 40 ]]; then
+        dim "  │ ... ($((total_lines - 40)) more lines)"
+      fi
+      dim "  └─── end prompt ───"
+      echo ""
+    fi
+
+    # --- Create tmux window ---
+    run_cmd tmux new-window -t "$session" -n "$name" -c "$work_dir"
+
+    # --- Build and send claude command ---
+    if [[ -n "$final_prompt_file" ]]; then
+      local worker_cmd
+      worker_cmd=$(build_worker_cmd "$final_prompt_file" "$profile" "$project_path" "$mode")
+
+      if [[ "$mode" == "headless" ]]; then
+        run_cmd tmux set-option -t "${session}:${name}" remain-on-exit off 2>/dev/null
+        run_cmd tmux send-keys -t "${session}:${name}" "${worker_cmd} ; exit" Enter
+      else
+        run_cmd tmux send-keys -t "${session}:${name}" "${worker_cmd}" Enter
+      fi
+    else
+      # No prompt — plain claude
+      run_cmd tmux send-keys -t "${session}:${name}" "$(claude_cmd)" Enter
+    fi
+
+    # --- Initialize status file ---
+    if [[ "$role" != "lead" ]]; then
+      local status_file="${project_path}/${TEAM_DIR}/agents/${name}.md"
+      if ! $DRY_RUN; then
+        cat > "$status_file" <<STATUSEOF
+# Agent: ${name}
+**Status:** Starting
+**Current task:** Initializing
+**Completed:** (none yet)
+**Blockers:** (none)
+**Updated:** $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+STATUSEOF
+      else
+        dim "  [dry-run] Would create status file: $status_file"
+      fi
+    fi
+
+    echo ""
+  done
+
+  # Note: temp files are intentionally NOT cleaned up here.
+  # Claude reads them via $(cat ...) after tmux sends the command.
+  # They live in /tmp and will be cleaned up by the OS.
+  if [[ ${#temp_files[@]} -gt 0 ]]; then
+    dim "Temp prompt files (auto-cleaned by OS):"
+    for tf in "${temp_files[@]}"; do
+      dim "  $tf"
+    done
+  fi
+
+  echo ""
+  green "All agents spawned. Switch windows with prefix+<number> or prefix+n/p"
+}
+
+# --- Launch from saved config ---
+
+cmd_launch() {
+  local config_file
+  config_file=$(resolve_config "$1")
+
+  local project_path
+  project_path=$(yq -r '.project // ""' "$config_file")
+  if [[ -z "$project_path" ]]; then
+    red "Config missing 'project' field"
+    exit 1
+  fi
+  project_path=$(eval echo "$project_path")
+  project_path=$(cd "$project_path" && pwd)
+
+  local session
+  if [[ -n "${SESSION_NAME_OVERRIDE:-}" ]]; then
+    session="$SESSION_NAME_OVERRIDE"
+  else
+    session="team-$(session_name_from_path "$project_path")"
+  fi
+
+  # Check if session already exists
+  if tmux has-session -t "$session" 2>/dev/null; then
+    yellow "Session '$session' already exists. Attaching..."
+    if [[ -z "${TMUX:-}" ]]; then
+      run_cmd tmux attach-session -t "$session"
+    else
+      run_cmd tmux switch-client -t "$session"
+    fi
+    return
+  fi
+
+  # Create session
+  run_cmd tmux new-session -d -s "$session" -n "lead" -c "$project_path"
+
+  # Spawn all agents
+  cmd_spawn "$1"
+
+  # Attach
+  # Select lead window
+  run_cmd tmux select-window -t "${session}:lead"
+
+  if [[ -z "${TMUX:-}" ]]; then
+    run_cmd tmux attach-session -t "$session"
+  else
+    run_cmd tmux switch-client -t "$session"
+  fi
+}
+
+# --- List saved configs ---
+
+cmd_list() {
+  if [[ ! -d "$CONFIG_DIR" ]] || ! ls "${CONFIG_DIR}"/*.yml &>/dev/null; then
+    yellow "No saved configs found in $CONFIG_DIR"
+    return
+  fi
+
+  echo "Saved team configs:"
+  for f in "${CONFIG_DIR}"/*.yml; do
+    [[ "$(basename "$f")" == "_"* ]] && continue  # skip _templates etc
+    local name
+    name=$(basename "$f" .yml)
+    local desc
+    desc=$(yq -r '.name // ""' "$f" 2>/dev/null)
+    if [[ -n "$desc" ]]; then
+      printf "  %-20s %s\n" "$name" "$desc"
+    else
+      printf "  %s\n" "$name"
+    fi
+  done
+}
+
+# --- fzf picker ---
+
+cmd_pick() {
+  if [[ ! -d "$CONFIG_DIR" ]] || ! ls "${CONFIG_DIR}"/*.yml &>/dev/null; then
+    red "No saved configs found in $CONFIG_DIR"
+    exit 1
+  fi
+
+  local choice
+  choice=$(for f in "${CONFIG_DIR}"/*.yml; do
+    [[ "$(basename "$f")" == _* ]] && continue
+    basename "$f" .yml
+  done | fzf --prompt="Team config: " --preview "yq '.' ${CONFIG_DIR}/{}.yml" \
+  ) || exit 0
+
+  cmd_launch "$choice"
+}
+
+# --- Cleanup dead worker windows ---
+
+cmd_cleanup() {
+  local session="${1:-}"
+
+  if [[ -z "$session" ]]; then
+    # Try to find current team session
+    session=$(tmux display-message -p '#{session_name}' 2>/dev/null || true)
+  fi
+
+  if [[ -z "$session" ]] || ! tmux has-session -t "$session" 2>/dev/null; then
+    red "No active team session found"
+    return
+  fi
+
+  local count=0
+  # Kill all windows except 'lead'
+  for window in $(tmux list-windows -t "$session" -F '#{window_name}' 2>/dev/null); do
+    if [[ "$window" != "lead" ]]; then
+      run_cmd tmux kill-window -t "${session}:${window}" 2>/dev/null && ((count++)) || true
+    fi
+  done
+
+  green "Cleaned up $count worker windows from $session"
+}
+
+# --- Stop session ---
+
+cmd_stop() {
+  local session="${1:-}"
+
+  if [[ -z "$session" ]]; then
+    # Pick from running team sessions
+    local sessions
+    sessions=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^team-' || true)
+
+    if [[ -z "$sessions" ]]; then
+      yellow "No team sessions running"
+      return
+    fi
+
+    if command -v fzf &>/dev/null; then
+      session=$(echo "$sessions" | fzf --prompt="Stop session: ") || return
+    else
+      echo "Running team sessions:"
+      echo "$sessions"
+      echo ""
+      read -rp "Session to stop: " session
+    fi
+  fi
+
+  # Add team- prefix if not present
+  if [[ "$session" != team-* ]]; then
+    session="team-${session}"
+  fi
+
+  if ! tmux has-session -t "$session" 2>/dev/null; then
+    red "Session not found: $session"
+    exit 1
+  fi
+
+  # Check for worktrees
+  local session_path
+  session_path=$(tmux display-message -t "$session" -p '#{pane_current_path}' 2>/dev/null || true)
+
+  if [[ -n "$session_path" && -d "${session_path}/.git" ]]; then
+    local worktrees
+    worktrees=$(git -C "$session_path" worktree list --porcelain 2>/dev/null | grep '^worktree ' | grep -v "^worktree $session_path$" || true)
+    if [[ -n "$worktrees" ]]; then
+      echo "Active worktrees:"
+      echo "$worktrees" | sed 's/^worktree /  /'
+      echo ""
+      read -rp "Remove worktrees? [y/N] " -n 1 reply
+      echo ""
+      if [[ "$reply" =~ ^[Yy]$ ]]; then
+        echo "$worktrees" | sed 's/^worktree //' | while read -r wt; do
+          green "Removing worktree: $wt"
+          run_cmd git -C "$session_path" worktree remove "$wt" --force
+        done
+      fi
+    fi
+  fi
+
+  green "Stopping session: $session"
+  run_cmd tmux kill-session -t "$session"
+}
+
+# --- Main ---
+
+main() {
+  if [[ $# -eq 0 ]]; then
+    usage
+    exit 0
+  fi
+
+  # Check dependencies
+  for cmd in tmux yq; do
+    if ! command -v "$cmd" &>/dev/null; then
+      red "Required: $cmd is not installed"
+      exit 1
+    fi
+  done
+
+  # Parse global flags first
+  local args=()
+  SESSION_NAME_OVERRIDE=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) DRY_RUN=true ;;
+      --yolo) YOLO=true ;;
+      --verbose) VERBOSE=true ;;
+      --session-name) SESSION_NAME_OVERRIDE="$2"; shift ;;
+      *) args+=("$1") ;;
+    esac
+    shift
+  done
+  set -- "${args[@]}"
+
+  case "${1:-}" in
+    --help|-h)
+      usage
+      ;;
+    --project|-p)
+      [[ -z "${2:-}" ]] && { red "Missing project path"; exit 1; }
+      cmd_project "$2"
+      ;;
+    --pick)
+      cmd_pick
+      ;;
+    --list|-l)
+      cmd_list
+      ;;
+    --stop|-s)
+      cmd_stop "${2:-}"
+      ;;
+    spawn)
+      [[ -z "${2:-}" ]] && { red "Missing config file"; exit 1; }
+      cmd_spawn "$2"
+      ;;
+    cleanup)
+      cmd_cleanup "${2:-}"
+      ;;
+    --version|-v)
+      echo "claude-team v${VERSION}"
+      ;;
+    -*)
+      red "Unknown option: $1"
+      usage
+      exit 1
+      ;;
+    *)
+      # Treat as config name/path
+      cmd_launch "$1"
+      ;;
+  esac
+}
+
+main "$@"
