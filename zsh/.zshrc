@@ -251,3 +251,11 @@ eval "$(mise activate zsh)"
 
 # Work-specific config (not tracked in git)
 [ -f "$HOME/.config/zsh/work.zsh" ] && source "$HOME/.config/zsh/work.zsh"
+
+# bun
+export BUN_INSTALL="$HOME/.bun"
+export PATH="$BUN_INSTALL/bin:$PATH"
+[ -s "$HOME/.bun/_bun" ] && source "$HOME/.bun/_bun"
+
+# Claude Code aliases
+[ -f ~/.claude/shell-aliases.sh ] && source ~/.claude/shell-aliases.sh
