@@ -82,6 +82,7 @@ brew "pandoc"
 
 # AI Tools
 brew "anomalyco/tap/opencode"
+brew "yq"
 
 # Casks
 cask "bruno"

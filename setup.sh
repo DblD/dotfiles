@@ -17,6 +17,9 @@ ln -sf "$PWD/ssh/ssh-config" ~/.ssh/config
 echo "Linking scripts..."
 ln -sf "$PWD/scripts/bayport-vpn.sh" ~/.bayport-vpn.sh
 ln -sf "$PWD/scripts/bayport-vpn-completion.bash" ~/.bayport-vpn-completion.bash
+mkdir -p ~/.local/bin
+ln -sf "$PWD/scripts/claude-team" ~/.local/bin/claude-team
+mkdir -p ~/.config/claude-teams/_templates
 
 # Homebrew packages
 if command -v brew &>/dev/null; then

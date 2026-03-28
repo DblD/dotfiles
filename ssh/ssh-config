@@ -7,6 +7,10 @@ Host *
   ServerAliveInterval 15
   ConnectTimeout 20
 
+Host gitlab.mwlab.dev
+    HostName mw-lab-gitlab.netbird.cloud
+    User git
+
 Host bastion
     User ec2-user
     Hostname bastion.domain.com
