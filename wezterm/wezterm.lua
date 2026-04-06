@@ -1,8 +1,39 @@
 local wezterm = require 'wezterm'
 local act = wezterm.action
 
--- Catppuccin themes (light to dark)
+-- Sepia Latte — warm parchment variant of Catppuccin Latte
+local sepia_colors = {
+	background = '#f5ead0',
+	foreground = '#5c4a32',
+	cursor_bg = '#8a6d4b',
+	cursor_fg = '#f5ead0',
+	selection_bg = '#e0d1b0',
+	selection_fg = '#5c4a32',
+	ansi = {
+		'#ede3d0', -- black (warm parchment — code block bg)
+		'#d9b0a0', -- red (warm blush parchment — diff removed bg)
+		'#c5d4b0', -- green (warm sage parchment — diff added bg)
+		'#9e7a2a', -- yellow (amber)
+		'#62728a', -- blue (dusty)
+		'#876080', -- magenta (muted)
+		'#5f8a78', -- cyan (sage)
+		'#5c4a32', -- white (warm dark)
+	},
+	brights = {
+		'#c8b898', -- bright black (warm tan — diff context bg)
+		'#b86060', -- bright red
+		'#6f8e60', -- bright green
+		'#b08a30', -- bright yellow
+		'#7282a0', -- bright blue
+		'#9a7093', -- bright magenta
+		'#70a090', -- bright cyan
+		'#4a3a24', -- bright white
+	},
+}
+
+-- Catppuccin themes (light to dark) + Sepia variant
 local catppuccin_themes = {
+	'Sepia Latte',        -- Warm light
 	'Catppuccin Latte',   -- Light
 	'Catppuccin Frappe',  -- Light-dark
 	'Catppuccin Macchiato', -- Dark-light
@@ -48,33 +79,48 @@ config.keys = {
 			choices = theme_choices,
 			action = wezterm.action_callback(function(window, pane, id, label)
 				if id then
-					window:set_config_overrides { color_scheme = id }
+					local overrides = window:get_config_overrides() or {}
+					if id == 'Sepia Latte' then
+						overrides.color_scheme = 'Catppuccin Latte'
+						overrides.colors = sepia_colors
+					else
+						overrides.color_scheme = id
+						overrides.colors = nil
+					end
+					window:set_config_overrides(overrides)
 				end
 			end),
 		},
 	},
-	-- Quick toggle: Latte (light) <-> Mocha (dark) (Ctrl+Shift+L)
+	-- Quick toggle: Sepia Latte (warm light) <-> Mocha (dark) (Ctrl+Shift+L)
 	{
 		key = 'l',
 		mods = 'CTRL|SHIFT',
 		action = wezterm.action_callback(function(window, pane)
 			local overrides = window:get_config_overrides() or {}
 			local current = overrides.color_scheme or 'Catppuccin Mocha'
-			if current == 'Catppuccin Latte' then
+			local is_light = current == 'Catppuccin Latte' or overrides.colors ~= nil
+			if is_light then
 				overrides.color_scheme = 'Catppuccin Mocha'
+				overrides.colors = nil
 			else
 				overrides.color_scheme = 'Catppuccin Latte'
+				overrides.colors = sepia_colors
 			end
 			window:set_config_overrides(overrides)
 		end),
 	},
-	-- Cycle through all Catppuccin themes (Ctrl+Shift+C)
+	-- Cycle through all themes (Ctrl+Shift+C)
 	{
 		key = 'c',
 		mods = 'CTRL|SHIFT',
 		action = wezterm.action_callback(function(window, pane)
 			local overrides = window:get_config_overrides() or {}
 			local current = overrides.color_scheme or 'Catppuccin Mocha'
+			-- Detect if we're on sepia (has color overrides on Latte base)
+			if overrides.colors ~= nil then
+				current = 'Sepia Latte'
+			end
 			local next_theme = catppuccin_themes[1]
 			for i, theme in ipairs(catppuccin_themes) do
 				if theme == current then
@@ -82,7 +128,13 @@ config.keys = {
 					break
 				end
 			end
-			overrides.color_scheme = next_theme
+			if next_theme == 'Sepia Latte' then
+				overrides.color_scheme = 'Catppuccin Latte'
+				overrides.colors = sepia_colors
+			else
+				overrides.color_scheme = next_theme
+				overrides.colors = nil
+			end
 			window:set_config_overrides(overrides)
 			wezterm.log_info('Switched to: ' .. next_theme)
 		end),
