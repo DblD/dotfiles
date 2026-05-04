@@ -5,10 +5,16 @@ zstyle ':completion:*' matcher-list 'm:{a-z}={A-Za-z}'
 autoload bashcompinit && bashcompinit
 autoload -Uz compinit
 compinit
-source <(kubectl completion zsh)
-complete -C '/usr/local/bin/aws_completer' aws
+# Cross-platform completions/plugins — guarded so non-mac hosts don't print errors on every shell startup
+command -v kubectl >/dev/null 2>&1 && source <(kubectl completion zsh)
+[ -x /usr/local/bin/aws_completer ] && complete -C '/usr/local/bin/aws_completer' aws
 
-source $(brew --prefix)/share/zsh-autosuggestions/zsh-autosuggestions.zsh
+# zsh-autosuggestions: try brew (mac), then /usr/share (Arch/Debian), silently skip if absent
+if command -v brew >/dev/null 2>&1 && [ -f "$(brew --prefix)/share/zsh-autosuggestions/zsh-autosuggestions.zsh" ]; then
+  source "$(brew --prefix)/share/zsh-autosuggestions/zsh-autosuggestions.zsh"
+elif [ -f /usr/share/zsh/plugins/zsh-autosuggestions/zsh-autosuggestions.zsh ]; then
+  source /usr/share/zsh/plugins/zsh-autosuggestions/zsh-autosuggestions.zsh
+fi
 bindkey '^w' autosuggest-execute
 bindkey '^e' autosuggest-accept
 bindkey '^u' autosuggest-toggle

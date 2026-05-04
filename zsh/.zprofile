@@ -1,5 +1,5 @@
-# Homebrew (sets PATH early)
-eval "$(/opt/homebrew/bin/brew shellenv)"
+# Homebrew (sets PATH early) — guarded so the file works on Linux hosts too
+[ -x /opt/homebrew/bin/brew ] && eval "$(/opt/homebrew/bin/brew shellenv)"
 
 # Nix: put bin on PATH explicitly
 export PATH="/nix/var/nix/profiles/default/bin:$PATH"
