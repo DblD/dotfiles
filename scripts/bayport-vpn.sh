@@ -30,6 +30,7 @@ SUDO_KEEPALIVE_PID=""
 VPN_PID=""   # Track VPN process for reliable shutdown
 VPN_LOG=""   # Capture openfortivpn output for failure classification
 TAIL_PID=""  # Track verbose log tail for cleanup
+VPN_PORT="10443"  # Default; overridden by `port` custom field on the BW item if present
 ROUTES_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/bayport-vpn/routes.conf"
 DNS_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/bayport-vpn/dns.conf"
 
@@ -664,7 +665,7 @@ check_connection() {
         return 1
     fi
 
-    log_info "Running connectivity diagnostics for $VPN_HOST:10443"
+    log_info "Running connectivity diagnostics for $VPN_HOST:$VPN_PORT"
     echo ""
 
     # 1. DNS Resolution
@@ -692,15 +693,15 @@ check_connection() {
     echo ""
 
     # 3. Port connectivity
-    log_info "3. Testing TCP connection to port 10443..."
+    log_info "3. Testing TCP connection to port $VPN_PORT..."
     if command -v nc >/dev/null 2>&1; then
-        if nc -z -w 5 "$VPN_HOST" 10443 2>/dev/null; then
-            log_success "Port 10443 is open and accepting connections"
+        if nc -z -w 5 "$VPN_HOST" "$VPN_PORT" 2>/dev/null; then
+            log_success "Port $VPN_PORT is open and accepting connections"
         else
-            log_error "Cannot connect to port 10443"
+            log_error "Cannot connect to port $VPN_PORT"
             log_info "This is likely why the VPN connection times out"
             log_info "Possible causes:"
-            log_info "  - Corporate firewall blocking port 10443"
+            log_info "  - Corporate firewall blocking port $VPN_PORT"
             log_info "  - VPN server is down"
             log_info "  - You need to be on a different network"
             return 1
@@ -713,12 +714,12 @@ check_connection() {
     # 4. SSL/TLS test
     log_info "4. Testing SSL/TLS handshake..."
     if command -v openssl >/dev/null 2>&1; then
-        if echo "Q" | _timeout 5 openssl s_client -connect "$VPN_HOST:10443" >/dev/null 2>&1; then
+        if echo "Q" | _timeout 5 openssl s_client -connect "$VPN_HOST:$VPN_PORT" >/dev/null 2>&1; then
             log_success "SSL/TLS handshake successful"
 
             # Show certificate info
             log_info "Certificate details:"
-            echo "Q" | _timeout 5 openssl s_client -connect "$VPN_HOST:10443" 2>/dev/null | openssl x509 -noout -subject -issuer -dates 2>/dev/null | sed 's/^/  /'
+            echo "Q" | _timeout 5 openssl s_client -connect "$VPN_HOST:$VPN_PORT" 2>/dev/null | openssl x509 -noout -subject -issuer -dates 2>/dev/null | sed 's/^/  /'
         else
             log_warn "SSL/TLS handshake failed (may require VPN auth)"
         fi
@@ -729,8 +730,8 @@ check_connection() {
 
     # 5. OpenFortiVPN test
     log_info "5. Testing with openfortivpn..."
-    log_info "Running: openfortivpn $VPN_HOST:10443 --no-routes --pppd-log /dev/null (will timeout after 10s)"
-    if _timeout 10 openfortivpn "$VPN_HOST:10443" --no-routes --pppd-log /dev/null 2>&1 | grep -q "STATUS"; then
+    log_info "Running: openfortivpn $VPN_HOST:$VPN_PORT --no-routes --pppd-log /dev/null (will timeout after 10s)"
+    if _timeout 10 openfortivpn "$VPN_HOST:$VPN_PORT" --no-routes --pppd-log /dev/null 2>&1 | grep -q "STATUS"; then
         log_success "OpenFortiVPN can communicate with server"
     else
         log_warn "OpenFortiVPN test inconclusive"
@@ -746,10 +747,10 @@ check_connection() {
     echo ""
     log_info "Summary:"
     log_info "  VPN Host: $VPN_HOST"
-    log_info "  Port: 10443"
+    log_info "  Port: $VPN_PORT"
     log_info "  Username: $VPN_USERNAME"
     echo ""
-    log_info "If port 10443 is blocked, try:"
+    log_info "If port $VPN_PORT is blocked, try:"
     log_info "  - Connecting from a different network (home/mobile hotspot)"
     log_info "  - Checking with your network admin about firewall rules"
     log_info "  - Verifying the VPN server is online and accessible"
@@ -783,7 +784,7 @@ show_config() {
     cat << EOF
 persistent=10              # Keep connection alive, retry 10 times
 host = $VPN_HOST          # VPN server hostname
-port = 10443               # VPN port
+port = $VPN_PORT           # VPN port (from BW item, default 10443)
 username = $VPN_USERNAME   # Your username
 password = ********        # Password (hidden)
 trusted-cert = $VPN_TRUSTED_CERT  # Server certificate fingerprint
@@ -1726,6 +1727,13 @@ parse_vpn_config() {
     VPN_TRUSTED_CERT=$(echo "$vpn_item" | jq -r '.fields[]? | select(.name=="trusted-cert") | .value' 2>&1)
     VPN_HOST=$(echo "$vpn_item" | jq -r '.fields[]? | select(.name=="host") | .value' 2>&1)
 
+    # Optional `port` custom field; falls back to existing VPN_PORT default if absent
+    local vpn_port
+    vpn_port=$(echo "$vpn_item" | jq -r '.fields[]? | select(.name=="port") | .value' 2>&1)
+    if [ -n "$vpn_port" ] && [ "$vpn_port" != "null" ]; then
+        VPN_PORT="$vpn_port"
+    fi
+
     # Validate required fields
     local missing_fields=()
 
@@ -1767,6 +1775,11 @@ parse_vpn_config() {
         return 1
     fi
 
+    if ! [[ "$VPN_PORT" =~ ^[0-9]+$ ]]; then
+        log_error "VPN port must be numeric: $VPN_PORT"
+        return 1
+    fi
+
     # Log parsed values if verbose
     if [ "$VERBOSE" = true ]; then
         log_success "Configuration parsed successfully:"
@@ -1783,7 +1796,7 @@ parse_vpn_config() {
 # Returns the SHA-256 fingerprint in the format openfortivpn expects
 fetch_server_cert() {
     local host=$1
-    local port=${2:-10443}
+    local port=${2:-${VPN_PORT:-10443}}
 
     log_progress "Fetching certificate from $host:$port..."
 
@@ -1817,7 +1830,7 @@ check_and_update_cert() {
     log_step "Verifying server certificate"
 
     local server_cert
-    if ! server_cert=$(fetch_server_cert "$VPN_HOST" 10443) || [ -z "$server_cert" ]; then
+    if ! server_cert=$(fetch_server_cert "$VPN_HOST" "$VPN_PORT") || [ -z "$server_cert" ]; then
         log_warn "Could not fetch server certificate — skipping verification"
         log_info "Connection will proceed with stored cert; openfortivpn will reject if wrong"
         return 0
@@ -1931,7 +1944,7 @@ create_vpn_config() {
     cat > "$TEMP_CONFIG" << EOF
 persistent=10
 host = $VPN_HOST
-port = 10443
+port = $VPN_PORT
 username = $VPN_USERNAME
 password = $VPN_PASSWORD
 trusted-cert = $VPN_TRUSTED_CERT
@@ -2669,7 +2682,7 @@ connect_vpn() {
         return 0
     fi
 
-    log_step "Connecting to VPN at $VPN_HOST:10443"
+    log_step "Connecting to VPN at $VPN_HOST:$VPN_PORT"
 
     # Clean up stale resolver files from a previous crashed session.
     # If the VPN was killed with SIGKILL or the terminal died, the cleanup
@@ -2767,7 +2780,7 @@ connect_vpn() {
     echo -e "${GREEN}║  ✓ VPN CONNECTED AND CONFIGURED               ║${NC}" >&2
     echo -e "${GREEN}╚════════════════════════════════════════════════╝${NC}" >&2
     echo ""
-    log_info "VPN Host: $VPN_HOST:10443"
+    log_info "VPN Host: $VPN_HOST:$VPN_PORT"
     log_info "Interface: ppp0"
     log_info "Split-tunnel: ENFORCED (only internal subnets via VPN)"
     log_info "Default gateway: $DEFAULT_GW via $DEFAULT_GW_IFACE (preserved)"
