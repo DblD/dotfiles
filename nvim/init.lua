@@ -688,7 +688,17 @@ do
   local servers = {
     -- All servers below are installed via NIX (home/roles/dev.nix), not mason.
     clangd = {}, -- C/C++
-    gopls = {}, -- Go
+    gopls = { -- Go
+      settings = {
+        gopls = {
+          analyses = { unusedparams = true },
+          staticcheck = true,
+          usePlaceholders = true,
+          completeUnimported = true, -- auto-import
+          gofumpt = true,
+        },
+      },
+    },
     pyright = {}, -- Python
     ts_ls = {}, -- TypeScript/JavaScript
     nixd = {}, -- Nix
