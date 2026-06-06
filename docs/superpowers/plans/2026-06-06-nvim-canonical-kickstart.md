@@ -438,3 +438,25 @@ git -C ~/.code/dotfiles commit -am "nvim: add codesnap (optional)"
 - **Risk:** none of this can break *input* (that's Ring 2/kanata). Worst case is nvim failing to open; the frame nix change is `--rollback`-safe and the Mac swap is tag-recoverable.
 - **Identifier consistency:** the env var is `NVIM_NIX_LSP` everywhere (init.lua gate, dev.nix sessionVariable, frame verify). mason package names (e.g. `typescript-language-server`, `lua-language-server`) are mason's, matching the `servers` lspconfig names by mason-lspconfig's mapping.
 - **Known non-blocking gaps:** `yamlfmt` runtime install (Task 6 note); Mac language runtimes assumed present (spec out-of-scope); codesnap build hook (Task 11).
+
+---
+
+## Execution log (2026-06-06) — completed
+
+All tasks done; resolved `init.lua` identical on Mac & frame (both dotfiles @ `92e20cb`).
+Deviations / findings worth recording:
+
+- **Mac nvim upgrade:** 0.11.6 → 0.12.2 via `brew upgrade neovim` (now matches frame). vim.pack confirmed (not lazy.nvim) — spec corrected mid-flight.
+- **Mac runtime deps the frame gets from nix:**
+  - `tree-sitter` CLI — brew's `tree-sitter` is library-only (no bin); installed the CLI via `npm install -g tree-sitter-cli` (0.26.9, matches lib). Required or kickstart-master parser compile fails with ENOENT.
+  - `yamlfmt` — NOT installed on the Mac yet (only needed for `<leader>f` on yaml). `brew install yamlfmt` when wanted.
+- **nixd:** dropped from the Mac mason list (not in mason registry). Decision: **skip nixd on Mac entirely** (brew has no formula; would require installing Nix). `servers` table keeps `nixd={}` so it attaches on the frame (nix-provided) and would attach on the Mac if a binary ever appears.
+- **mason residue:** the Mac's `~/.local/share/nvim/mason/` still holds LazyVim-era extras (docker/helm/hadolint/marksman/etc.). Harmless; left in place.
+- **Frame git-auth saga (Task 9):** the frame can't reach `gitlab.mwlab.dev` over SSH (Cloudflare fronts 443 only — known, see brainlayer `manual-fbe1ee028d724f1f`). dotfiles pulled via its GitHub mirror (`origin`, SSH works). nix-config is mwlab-only and the frame's HTTPS token had vanished from `~/.git-credentials` → minted a fresh repo-scoped project access token (`dbldframe`, read+write, expires 2027-06-06) via `glab` on the Mac and wrote it to the frame (0600). **TODO: store that token in Bitwarden per bw-doctrine.**
+- **Self-inflicted bug:** first frame commit (`6a83790`) used `git commit -m` without `-a`, so the `dev.nix` changes were left uncommitted; the frame deployed a no-op. Fixed with a follow-up commit `ac9e771` (no force-push). Lesson: stage explicitly or verify `git show HEAD` after committing config edits.
+
+## Deferred decision — full nix on the Mac
+Hitting nixd surfaced the bigger question: adopt nix-darwin + home-manager on the Mac (level 3)?
+That would let nix provide LSPs on the Mac too and **collapse the entire `$NVIM_NIX_LSP` mason
+split** (both machines `=1`, drop mason). Decided to **defer** — finish nvim on brew/mason now;
+treat full-nix-on-Mac as its own brainstorm later. The current design degrades gracefully into it.

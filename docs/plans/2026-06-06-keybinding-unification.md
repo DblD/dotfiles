@@ -55,6 +55,13 @@
 
 ## Ring 1 — nvim + tmux become literally identical
 
+> **STATUS 2026-06-06:** Ring 1 COMPLETE. tmux done (frame byte-identical to Mac). nvim done
+> via the dedicated spec+plan — canonical = **kickstart.nvim master** (not LazyVim; decided
+> after brainstorm, see `docs/superpowers/specs/2026-06-06-nvim-distro-design.md` and
+> `docs/superpowers/plans/2026-06-06-nvim-canonical-kickstart.md`). Resolved `init.lua` is
+> identical on both machines; LSPs via mason on Mac / nix on frame, switched by `$NVIM_NIX_LSP`.
+> Next ring: Ring 2 (kanata).
+
 ### Task 1.1: Bring the frame's tmux up to the canonical (plugin-rich) config
 
 *The frame currently uses a bare home-manager `programs.tmux`; the Mac has the rich `tmux/tmux.conf` (sessionx, floax, theme pickers, `prefix2 C-Space`). Make the frame read the same `tmux.conf`.*
