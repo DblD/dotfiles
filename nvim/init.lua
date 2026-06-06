@@ -764,10 +764,13 @@ do
   -- Anywhere else (the Mac, no nix), mason installs the toolchain.
   local ensure_installed = {}
   if vim.env.NVIM_NIX_LSP ~= '1' then
+    -- mason package names (Mac only — the frame uses nix). nixd is intentionally absent:
+    -- it is not in mason's registry; on the frame it comes from nix, and the `servers`
+    -- table still declares nixd so it attaches wherever the binary is on PATH.
     ensure_installed = {
       'lua-language-server', 'stylua',
       'gopls', 'pyright', 'typescript-language-server',
-      'clangd', 'nixd', 'jdtls', 'rust-analyzer',
+      'clangd', 'jdtls', 'rust-analyzer',
     }
   end
 
