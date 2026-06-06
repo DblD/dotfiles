@@ -749,9 +749,17 @@ do
   --    :Mason
   --
   -- You can press `g?` for help in this menu.
-  -- On NixOS, all LSPs/tools come from nix (home/roles/dev.nix) on PATH — mason installs
-  -- NOTHING so it can't shadow the working nix binaries with broken prebuilt ones.
+  -- On the frame, home-manager sets $NVIM_NIX_LSP=1 → mason installs NOTHING; nix supplies
+  -- the LSP/tool binaries on PATH (so mason can't shadow them with broken prebuilt ones).
+  -- Anywhere else (the Mac, no nix), mason installs the toolchain.
   local ensure_installed = {}
+  if vim.env.NVIM_NIX_LSP ~= '1' then
+    ensure_installed = {
+      'lua-language-server', 'stylua',
+      'gopls', 'pyright', 'typescript-language-server',
+      'clangd', 'nixd', 'jdtls', 'rust-analyzer',
+    }
+  end
 
   require('mason-tool-installer').setup { ensure_installed = ensure_installed }
 
