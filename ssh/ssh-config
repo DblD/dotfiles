@@ -15,3 +15,45 @@ Host bastion
     User ec2-user
     Hostname bastion.domain.com
     IdentityFile ~/.ssh/id_rsa
+
+# Bayport Nova environments (via bayport VPN)
+Host nova-uat nova-uat-02 bwdcuatlnova02 10.16.52.10
+    HostName 10.16.52.10
+    User dariom
+    IdentityFile ~/.ssh/id_rsa_bayport
+    IdentitiesOnly yes
+
+Host novaperf05 nova-perf 10.16.52.102
+    HostName 10.16.52.102
+    User dariom
+    IdentityFile ~/.ssh/id_rsa_bayport
+    IdentitiesOnly yes
+
+Host nova-db-106 10.16.52.106
+    HostName 10.16.52.106
+    User dariom
+    IdentityFile ~/.ssh/id_rsa_bayport
+    IdentitiesOnly yes
+
+# ===== OME NixOS lab (managed via gitlab.mwlab.dev:DblD/nix-config) =====
+# Memorable names -> `ssh ome-dev`, `ssh ome-cache`, etc. User=dbld since the 2026-06-04
+# dario->dbld migration: key-only login (Mac key), passwordless sudo (no password needed).
+Host ome-pve
+    HostName 10.226.20.152
+    User root
+Host ome-cache
+    HostName 10.226.20.181
+Host ome-dev
+    HostName 10.226.20.23
+    # NOTE: DHCP lease — update HostName if it changes (qm guest cmd 350 network-get-interfaces on ome-pve)
+Host ome-box ome-lab
+    HostName 10.226.20.180
+Host ome-netboot
+    HostName 10.226.100.2
+Host ome-*
+    User dbld
+    IdentityFile ~/.ssh/id_ed25519
+    IdentitiesOnly yes
+    StrictHostKeyChecking accept-new
+# ome-garage (10.226.90.31, user ubuntu) is admin'd via the key in
+# k8s-platform secrets/garage-vms.enc.yaml (sops) — not added here (key isn't a file).

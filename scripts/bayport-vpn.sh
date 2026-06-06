@@ -50,6 +50,22 @@ VPN_DNS_CONFIGURED=false
 VPN_DNS_SERVERS=()
 VPN_DNS_DOMAINS=()
 
+# VPN tunnel interface. pppd mode uses ppp0; tun mode (OFV_TUN) uses a
+# kernel-assigned utunN parsed from the openfortivpn log after connect.
+VPN_IFACE="ppp0"
+
+# In tun mode, learn the actual utunN openfortivpn created (logs
+# "interface <utunN> created"). No-op in pppd mode. Safe to call repeatedly.
+detect_vpn_iface() {
+    [ -n "${OFV_TUN:-}" ] || return 0
+    [ -n "${VPN_LOG:-}" ] && [ -f "$VPN_LOG" ] || return 0
+    local dev
+    dev=$(grep -oE 'interface <utun[0-9]+> created' "$VPN_LOG" 2>/dev/null \
+          | grep -oE 'utun[0-9]+' | tail -1)
+    [ -n "$dev" ] && VPN_IFACE="$dev"
+    return 0
+}
+
 # Logging functions
 log_info() {
     echo -e "${BLUE}[INFO]${NC} $1" >&2
@@ -138,22 +154,33 @@ detect_platform() {
     log_debug "Platform: $OS_TYPE (ifconfig=$HAS_IFCONFIG, ip=$HAS_IP, netstat=$HAS_NETSTAT, resolvectl=$HAS_RESOLVECTL, scutil=$HAS_SCUTIL)"
 }
 
-# Cross-platform: check if VPN interface is up
+# Cross-platform: check if VPN interface is up. In tun mode, first try to learn
+# the utunN from the log; if not yet known, treat the appearance of the
+# log line "interface <utunN> created" as up (the kernel iface exists by then).
 check_interface_up() {
+    if [ -n "${OFV_TUN:-}" ]; then
+        detect_vpn_iface
+        if [ "$VPN_IFACE" != "ppp0" ]; then
+            ifconfig "$VPN_IFACE" >/dev/null 2>&1
+        else
+            return 1
+        fi
+        return
+    fi
     if [ "$OS_TYPE" = "Darwin" ] || { [ "$HAS_IFCONFIG" = true ] && [ "$HAS_IP" != true ]; }; then
-        ifconfig ppp0 >/dev/null 2>&1
+        ifconfig "$VPN_IFACE" >/dev/null 2>&1
     else
-        ip link show ppp0 >/dev/null 2>&1
+        ip link show "$VPN_IFACE" >/dev/null 2>&1
     fi
 }
 
-# Cross-platform: add a route through ppp0
+# Cross-platform: add a route through the VPN interface
 platform_route_add() {
     local subnet=$1
     if [ "$OS_TYPE" = "Darwin" ]; then
-        sudo route add -net "$subnet" -interface ppp0 >/dev/null 2>&1
+        sudo route add -net "$subnet" -interface "$VPN_IFACE" >/dev/null 2>&1
     else
-        sudo ip route add "$subnet" dev ppp0 >/dev/null 2>&1
+        sudo ip route add "$subnet" dev "$VPN_IFACE" >/dev/null 2>&1
     fi
 }
 
@@ -163,34 +190,34 @@ platform_route_delete() {
     if [ "$OS_TYPE" = "Darwin" ]; then
         sudo route delete -net "$subnet" >/dev/null 2>&1
     else
-        sudo ip route del "$subnet" dev ppp0 >/dev/null 2>&1
+        sudo ip route del "$subnet" dev "$VPN_IFACE" >/dev/null 2>&1
     fi
 }
 
-# Cross-platform: count VPN routes via ppp0 for 10.x.x.x subnets
+# Cross-platform: count VPN routes via the VPN interface for 10.x.x.x subnets
 count_vpn_routes() {
     if [ "$OS_TYPE" = "Darwin" ] || { [ "$HAS_NETSTAT" = true ] && [ "$HAS_IP" != true ]; }; then
-        netstat -rn 2>/dev/null | grep "ppp0" | grep -c "^10\." || echo "0"
+        netstat -rn 2>/dev/null | grep "$VPN_IFACE" | grep -c "^10\." || echo "0"
     else
-        ip route show dev ppp0 2>/dev/null | grep -c "^10\." || echo "0"
+        ip route show dev "$VPN_IFACE" 2>/dev/null | grep -c "^10\." || echo "0"
     fi
 }
 
 # Cross-platform: list VPN routes
 list_vpn_routes() {
     if [ "$OS_TYPE" = "Darwin" ] || { [ "$HAS_NETSTAT" = true ] && [ "$HAS_IP" != true ]; }; then
-        netstat -rn 2>/dev/null | grep "ppp0" | grep "^10\."
+        netstat -rn 2>/dev/null | grep "$VPN_IFACE" | grep "^10\."
     else
-        ip route show dev ppp0 2>/dev/null | grep "^10\."
+        ip route show dev "$VPN_IFACE" 2>/dev/null | grep "^10\."
     fi
 }
 
-# Cross-platform: list all routes through ppp0 (for leak detection)
+# Cross-platform: list all routes through the VPN interface (for leak detection)
 list_all_ppp0_routes() {
     if [ "$OS_TYPE" = "Darwin" ] || { [ "$HAS_NETSTAT" = true ] && [ "$HAS_IP" != true ]; }; then
-        netstat -rn 2>/dev/null | grep "ppp0"
+        netstat -rn 2>/dev/null | grep "$VPN_IFACE"
     else
-        ip route show dev ppp0 2>/dev/null
+        ip route show dev "$VPN_IFACE" 2>/dev/null
     fi
 }
 
@@ -284,11 +311,11 @@ restore_default_gateway() {
     log_warn "Restoring default gateway to $DEFAULT_GW via $DEFAULT_GW_IFACE..."
 
     if [ "$OS_TYPE" = "Darwin" ]; then
-        sudo route delete default -interface ppp0 2>/dev/null || true
+        sudo route delete default -interface "$VPN_IFACE" 2>/dev/null || true
         sudo route delete default 2>/dev/null || true
         sudo route add default "$DEFAULT_GW" 2>/dev/null || true
     else
-        sudo ip route del default dev ppp0 2>/dev/null || true
+        sudo ip route del default dev "$VPN_IFACE" 2>/dev/null || true
         sudo ip route del default 2>/dev/null || true
         sudo ip route add default via "$DEFAULT_GW" dev "$DEFAULT_GW_IFACE" 2>/dev/null || true
     fi
@@ -416,6 +443,38 @@ configure_split_dns() {
         # No supported split DNS method on this Linux system
         log_warn "Split DNS requires systemd-resolved on Linux (resolvectl not found)"
         log_info "VPN will work but DNS for internal domains must be configured manually"
+    fi
+}
+
+# Remove split-DNS resolver files left behind by a previous crashed/ungraceful
+# session. remove_split_dns() only clears files THIS session created
+# (VPN_DNS_CONFIGURED + VPN_DNS_DOMAINS), so a leftover from a dead session is
+# invisible to it — and it blocks the next connect because getaddrinfo pins the
+# VPN domain (incl. the gateway's own hostname) to internal DNS only reachable
+# over the tunnel we're trying to build. Only removes our own files whose pinned
+# nameservers don't answer (so a live resolver is never ripped out).
+cleanup_stale_resolvers() {
+    [ "$OS_TYPE" = "Darwin" ] && [ -d /etc/resolver ] || return 0
+    local f removed=0
+    for f in /etc/resolver/*; do
+        [ -e "$f" ] || continue
+        grep -q "Auto-generated by bayport-vpn" "$f" 2>/dev/null || continue
+        local ns reachable=0
+        for ns in $(awk '/^nameserver/{print $2}' "$f"); do
+            if dig +time=2 +tries=1 @"$ns" . NS >/dev/null 2>&1; then
+                reachable=1
+                break
+            fi
+        done
+        if [ "$reachable" = 0 ]; then
+            log_warn "Stale split-DNS resolver $f pins $(basename "$f") to unreachable DNS — removing"
+            sudo rm -f "$f" && removed=1
+        fi
+    done
+    if [ "$removed" = 1 ]; then
+        sudo dscacheutil -flushcache 2>/dev/null || true
+        sudo killall -HUP mDNSResponder 2>/dev/null || true
+        log_info "  Flushed DNS after removing stale resolver(s)"
     fi
 }
 
@@ -1057,6 +1116,14 @@ check_vpn_conflicts() {
     log_info "Checking for VPN conflicts..."
 
     local conflicts_found=0
+
+    # Sweep stale split-DNS resolver files left by a previous crashed session.
+    # These pin the VPN domain (incl. the gateway hostname) to internal DNS
+    # only reachable over the tunnel, so a leftover bricks the next connect
+    # (getaddrinfo fails: "nodename nor servname provided"). Runs before the
+    # gateway is resolved. Only removes our own files whose nameservers are
+    # unreachable, so a live split-DNS is never touched.
+    cleanup_stale_resolvers
 
     # Check for NetBird
     if pgrep -x netbird >/dev/null 2>&1; then
@@ -1950,8 +2017,18 @@ password = $VPN_PASSWORD
 trusted-cert = $VPN_TRUSTED_CERT
 set-routes = 0
 set-dns = 0
-pppd-use-peerdns = 1
 EOF
+
+    # Opt-in native tun/utun method (no pppd). Requires an openfortivpn build
+    # with TUN support (the macOS-utun build). Enable with: OFV_TUN=1.
+    # pppd-use-peerdns is incompatible with tun mode (no pppd), so only emit
+    # it in the default pppd path.
+    if [ -n "${OFV_TUN:-}" ]; then
+        echo "tun = 1" >> "$TEMP_CONFIG"
+        log_info "  tun = 1: using native utun (no pppd) — OFV_TUN set"
+    else
+        echo "pppd-use-peerdns = 1" >> "$TEMP_CONFIG"
+    fi
 
     # Verify config file was created
     if [ ! -f "$TEMP_CONFIG" ]; then
@@ -2088,9 +2165,9 @@ verify_routes() {
     # 1. Check VPN interface
     log_info "1. VPN interface status"
     if check_interface_up; then
-        log_success "   ppp0 interface is UP"
+        log_success "   $VPN_IFACE interface is UP"
     else
-        log_warn "   ppp0 interface is DOWN (VPN not connected)"
+        log_warn "   $VPN_IFACE interface is DOWN (VPN not connected)"
         echo ""
         log_info "Connect to VPN first, then re-run --verify-routes"
         return 0
@@ -2129,10 +2206,10 @@ verify_routes() {
     echo ""
 
     # 3. VPN routes check
-    log_info "3. VPN routes via ppp0"
+    log_info "3. VPN routes via $VPN_IFACE"
     local vpn_route_count
     vpn_route_count=$(count_vpn_routes)
-    echo "   Routes for 10.x.x.x subnets via ppp0: $vpn_route_count"
+    echo "   Routes for 10.x.x.x subnets via $VPN_IFACE: $vpn_route_count"
 
     if [ "$vpn_route_count" -gt 0 ]; then
         list_vpn_routes 2>/dev/null | sed 's/^/     /' >&2
@@ -2150,22 +2227,22 @@ verify_routes() {
         local suspicious
         suspicious=$(echo "$non_10_routes" | grep -v "^link#" | grep -v "^169\.254" || true)
         if [ -n "$suspicious" ]; then
-            log_warn "   Non-internal routes going through ppp0:"
+            log_warn "   Non-internal routes going through $VPN_IFACE:"
             echo "$suspicious" | sed 's/^/     /' >&2
 
             # Check specifically for default route through ppp0
             if echo "$suspicious" | grep -qi "default\|0\.0\.0\.0"; then
-                log_error "   CRITICAL: Default route is going through ppp0!"
+                log_error "   CRITICAL: Default route is going through $VPN_IFACE!"
                 issues=$((issues + 1))
             else
                 log_warn "   These routes may indicate partial leakage"
                 issues=$((issues + 1))
             fi
         else
-            log_success "   No suspicious routes through ppp0"
+            log_success "   No suspicious routes through $VPN_IFACE"
         fi
     else
-        log_success "   No non-internal routes through ppp0"
+        log_success "   No non-internal routes through $VPN_IFACE"
     fi
     echo ""
 
@@ -2223,13 +2300,13 @@ add_vpn_routes() {
     actual_count=$(count_vpn_routes)
 
     log_success "Requested $routes_added routes, failed $routes_failed"
-    log_info "Routing table shows $actual_count routes via ppp0"
+    log_info "Routing table shows $actual_count routes via $VPN_IFACE"
 
     # Verify actual routes match what we tried to add
     if [ "$actual_count" -lt "$((routes_added / 2))" ]; then
         log_error "Route mismatch! Added $routes_added but only $actual_count exist"
         log_error "Something is removing routes (NetBird? Another VPN?)"
-        log_info "Showing current ppp0 routes:"
+        log_info "Showing current $VPN_IFACE routes:"
         list_vpn_routes 2>/dev/null | head -10 | sed 's/^/  /' >&2
         return 1
     fi
@@ -2249,11 +2326,12 @@ wait_for_vpn_interface() {
     local timeout=${1:-30}
     local count=0
 
-    log_progress "Waiting for VPN interface ppp0..."
+    local ifname="${OFV_TUN:+utun}"; ifname="${ifname:-ppp0}"
+    log_progress "Waiting for VPN interface ${ifname}..."
 
     while [ $count -lt $timeout ]; do
         if check_interface_up; then
-            log_progress_done "VPN interface ppp0 is up"
+            log_progress_done "VPN interface ${VPN_IFACE} is up"
             return 0
         fi
 
@@ -2281,7 +2359,7 @@ wait_for_vpn_interface() {
         # Show progress indicator
         local dots=$((count % 4))
         local progress_dots=$(printf '.%.0s' $(seq 1 $dots))
-        log_progress "Waiting for VPN interface ppp0${progress_dots} (${count}/${timeout}s)"
+        log_progress "Waiting for VPN interface ${ifname}${progress_dots} (${count}/${timeout}s)"
     done
 
     echo "" >&2  # Clear progress line
@@ -2485,7 +2563,7 @@ monitor_vpn_connection() {
 
         # Check interface is still up
         if ! check_interface_up; then
-            log_warn "ppp0 interface disappeared but VPN process still running"
+            log_warn "$VPN_IFACE interface disappeared but VPN process still running"
         fi
 
         # Connectivity health check — verify internal hosts reachable through VPN.
@@ -2781,7 +2859,7 @@ connect_vpn() {
     echo -e "${GREEN}╚════════════════════════════════════════════════╝${NC}" >&2
     echo ""
     log_info "VPN Host: $VPN_HOST:$VPN_PORT"
-    log_info "Interface: ppp0"
+    log_info "Interface: $VPN_IFACE"
     log_info "Split-tunnel: ENFORCED (only internal subnets via VPN)"
     log_info "Default gateway: $DEFAULT_GW via $DEFAULT_GW_IFACE (preserved)"
     echo ""

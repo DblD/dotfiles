@@ -3,30 +3,30 @@ local act = wezterm.action
 
 -- Sepia Latte — warm parchment variant of Catppuccin Latte
 local sepia_colors = {
-	background = '#f5ead0',
+	background = '#eadcb8',
 	foreground = '#5c4a32',
 	cursor_bg = '#8a6d4b',
-	cursor_fg = '#f5ead0',
-	selection_bg = '#e0d1b0',
+	cursor_fg = '#eadcb8',
+	selection_bg = '#d4c4a0',
 	selection_fg = '#5c4a32',
 	ansi = {
-		'#ede3d0', -- black (warm parchment — code block bg)
+		'#e2d6b8', -- black (warm parchment — code block bg)
 		'#d9b0a0', -- red (warm blush parchment — diff removed bg)
 		'#c5d4b0', -- green (warm sage parchment — diff added bg)
-		'#9e7a2a', -- yellow (amber)
-		'#62728a', -- blue (dusty)
-		'#876080', -- magenta (muted)
-		'#5f8a78', -- cyan (sage)
+		'#8a6a18', -- yellow (deeper amber)
+		'#506890', -- blue (richer)
+		'#7a5075', -- magenta (richer)
+		'#487868', -- cyan (deeper sage)
 		'#5c4a32', -- white (warm dark)
 	},
 	brights = {
-		'#c8b898', -- bright black (warm tan — diff context bg)
-		'#b86060', -- bright red
-		'#6f8e60', -- bright green
-		'#b08a30', -- bright yellow
-		'#7282a0', -- bright blue
-		'#9a7093', -- bright magenta
-		'#70a090', -- bright cyan
+		'#c0b088', -- bright black (warm tan — diff context bg)
+		'#b85050', -- bright red (deeper)
+		'#4d8030', -- bright green (richer, less washed)
+		'#a07820', -- bright yellow (deeper amber)
+		'#5570a0', -- bright blue (deeper)
+		'#8a5880', -- bright magenta (richer)
+		'#408878', -- bright cyan (deeper teal)
 		'#4a3a24', -- bright white
 	},
 }
