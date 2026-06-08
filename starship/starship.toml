@@ -1,41 +1,115 @@
-add_newline = false
-# A minimal left prompt
-format = """$directory$character"""
+add_newline = true
 palette = "catppuccin_mocha"
-# move the rest of the prompt to the right
-right_format = """$all"""
 command_timeout = 1000
 
+# Line 1: context | directory | git | languages/tools | jobs | duration
+# Line 2: ➜  clean typing line — full width, autocomplete never breaks
+format = """
+$username$hostname$directory$git_branch$git_status$git_state$fill$nodejs$golang$rust$python$php$ruby$java$kotlin$swift$terraform$kubernetes$aws$gcloud$package$jobs$cmd_duration
+$character"""
+
+# No right prompt — everything on line 1, no collision
+right_format = ""
+
+[fill]
+symbol = ' '
+
+[time]
+disabled = true
+
 [character]
-vicmd_symbol = "[N] >>>"
+vicmd_symbol = '[N](bold yellow) '
 success_symbol = '[➜](bold green)'
+error_symbol = '[➜](bold red)'
+
+[directory]
+format = '[$path]($style) '
+style = 'bold sapphire'
+truncation_length = 3
+truncate_to_repo = false
+home_symbol = '~'
 
 [directory.substitutions]
 '~/tests/starship-custom' = 'work-project'
 
 [git_branch]
-format =  '[$symbol$branch(:$remote_branch)]($style)'
+format = '[$symbol$branch]($style) '
+style = 'bold mauve'
 
-[aws]
-format = '[$symbol(profile: "$profile" )(\(region: $region\) )]($style)'
-disabled = false
-style = 'bold blue'
-symbol = " "
+[git_status]
+format = '([$all_status$ahead_behind]($style) )'
+style = 'bold peach'
+conflicted = '✖'
+ahead = '⇡${count}'
+behind = '⇣${count}'
+diverged = '⇕⇡${ahead_count}⇣${behind_count}'
+untracked = '?'
+stashed = 'S'
+modified = '!'
+staged = '+'
+renamed = '»'
+deleted = '✘'
+
+[nodejs]
+format = '[$symbol$version]($style) '
+style = 'bold green'
+detect_files = ['package.json', '.nvmrc']
 
 [golang]
-format = '[ ](bold cyan)'
+format = '[$symbol$version]($style) '
+style = 'bold cyan'
+
+[rust]
+format = '[$symbol$version]($style) '
+style = 'bold peach'
+
+[python]
+format = '[$symbol$version]($style) '
+style = 'bold yellow'
+
+[username]
+format = '[$user]($style) '
+style_user = 'bold text'
+style_root = 'bold red'
+show_always = false  # only shows when relevant (SSH, root, etc.)
+
+[hostname]
+format = '[@$hostname]($style) '
+style = 'bold overlay1'
+ssh_only = true  # only shows when in SSH session
+
+[aws]
+format = '[$symbol$profile]($style) '
+style = 'bold peach'
+disabled = false
 
 [kubernetes]
-symbol = '☸ '
-disabled = true
-detect_files = ['Dockerfile']
-format = '[$symbol$context( \($namespace\))]($style) '
-contexts = [
-  { context_pattern = "arn:aws:eks:us-west-2:577926974532:cluster/zd-pvc-omer", style = "green", context_alias = "omerxx", symbol = " " },
-]
+format = '[$symbol$context]($style) '
+style = 'bold sky'
+disabled = false
+detect_files = ['Dockerfile', 'docker-compose.yml', 'k8s', 'helm']
 
 [docker_context]
 disabled = true
+
+[package]
+format = '[$symbol$version]($style) '
+style = 'bold overlay2'
+
+[cmd_duration]
+format = 'took [$duration]($style) '
+style = 'bold yellow'
+min_time = 2000
+
+[gcloud]
+format = '[$symbol$account(@$domain)]($style) '
+style = 'bold sky'
+disabled = false
+
+[jobs]
+format = '[$symbol$number]($style) '
+style = 'bold blue'
+number_threshold = 1
 
 [palettes.catppuccin_mocha]
 rosewater = "#f5e0dc"

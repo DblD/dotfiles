@@ -1,0 +1,9 @@
+# Claude Code agent teams — thin shim for tmuxinator list visibility
+# Actual launch handled by: claude-team --pick
+name: teams
+root: ~/.config/claude-teams
+
+windows:
+  - picker:
+      panes:
+        - claude-team --pick

@@ -1,0 +1,15 @@
+name: vpn-sanitize-and-publish
+project: /Users/dbld/.code/dotfiles
+worktrees: false
+base_branch: tmux/overhaul
+branch_prefix: agent
+
+agents:
+  - name: lead
+    role: lead
+  - name: sanitizer
+    prompt: .claude-team/prompts/sanitizer.md
+    mode: interactive
+  - name: repo-creator
+    prompt: .claude-team/prompts/repo-creator.md
+    mode: interactive
