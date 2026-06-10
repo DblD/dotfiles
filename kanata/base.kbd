@@ -22,13 +22,34 @@
 (defcfg
   process-unmapped-keys yes)
 
+;; Full home-row mods (GACS): a/; = Cmd, s/l = Option, d/k = Ctrl, f/j = Shift.
+;; Same opposite-hand rule on every key: same-hand keys (or space) force an
+;; immediate TAP, so rolls type letters; only opposite-hand chords yield the mod.
+;; Physical modifier keys all still work — escape hatch while building habit.
 (defalias
   cap (tap-hold 200 200 esc lalt)
+  ha  (tap-hold-release-keys 200 200 a lmet (q w e r t s d f g z x c v b spc))
+  hs  (tap-hold-release-keys 200 200 s lalt (q w e r t a d f g z x c v b spc))
   hd  (tap-hold-release-keys 200 200 d lctl (q w e r t a s f g z x c v b spc))
-  hk  (tap-hold-release-keys 200 200 k lctl (y u i o p h j l ; n m , . / spc)))
+  hf  (tap-hold-release-keys 200 200 f lsft (q w e r t a s d g z x c v b spc))
+  hj  (tap-hold-release-keys 200 200 j lsft (y u i o p h k l ; n m , . / spc))
+  hk  (tap-hold-release-keys 200 200 k lctl (y u i o p h j l ; n m , . / spc))
+  hl  (tap-hold-release-keys 200 200 l lalt (y u i o p h j k ; n m , . / spc))
+  hsemi (tap-hold-release-keys 200 200 ; lmet (y u i o p h j k l n m , . / spc))
+  fnl (layer-while-held fnkeys))
 
+;; F-row: process-unmapped-keys yes means kanata re-emits F-keys through the
+;; Karabiner virtual keyboard, which has NO Apple fn-layer — the stock media
+;; functions (volume/brightness/play) silently die. So replicate Apple's
+;; default F-row here, and give fn+F-key the real F1-F12 (also stock behavior).
+;; F3-F6 (Mission Control / Spotlight / Dictation / DND) have no kanata output
+;; action — they pass through as plain F-keys; rebind in System Settings ->
+;; Keyboard -> Shortcuts if missed.
 (defsrc
-  caps d k)
+  caps a s d f j k l ; fn f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 f12)
 
 (deflayer base
-  @cap @hd @hk)
+  @cap @ha @hs @hd @hf @hj @hk @hl @hsemi @fnl brdn brup f3 f4 f5 f6 prev pp next mute vold volu)
+
+(deflayer fnkeys
+  _ _ _ _ _ _ _ _ _ _ f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 f12)
