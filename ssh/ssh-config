@@ -6,6 +6,14 @@ Host *
   AddressFamily inet
   ServerAliveInterval 15
   ConnectTimeout 20
+  # Bare single-label names (no dots) get netbird.cloud appended when that resolves,
+  # so `ssh ome-nas-1` / `ssh mw-ws-hq01` work with zero per-host entries — including
+  # fleet hosts added later. Names with dots and IPs (all HostName values below) are
+  # left alone; unresolvable names fall back to normal lookup (LAN, /etc/hosts).
+  CanonicalizeHostname yes
+  CanonicalDomains netbird.cloud
+  CanonicalizeMaxDots 0
+  CanonicalizeFallbackLocal yes
 
 Host gitlab.mwlab.dev
     HostName mw-lab-gitlab.netbird.cloud
@@ -57,3 +65,18 @@ Host ome-*
     StrictHostKeyChecking accept-new
 # ome-garage (10.226.90.31, user ubuntu) is admin'd via the key in
 # k8s-platform secrets/garage-vms.enc.yaml (sops) — not added here (key isn't a file).
+
+# ===== NixOS fleet via netbird overlay =====
+# Defaults for every overlay peer; combined with CanonicalizeHostname above, any
+# fleet host (current or future) is reachable as `ssh <hostname>` from anywhere.
+Host *.netbird.cloud
+    User dbld
+    IdentityFile ~/.ssh/id_ed25519
+    IdentitiesOnly yes
+    StrictHostKeyChecking accept-new
+# hq-backup is LAN-only (deliberately NOT a netbird peer) — pin it explicitly.
+Host hq-backup
+    HostName 10.41.41.20
+    User dbld
+    IdentityFile ~/.ssh/id_ed25519
+    IdentitiesOnly yes
