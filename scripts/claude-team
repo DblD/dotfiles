@@ -162,6 +162,40 @@ be_attach() { # $1=session
   esac
 }
 
+be_select_lead() { # $1=session — focus the lead window/tab
+  case "$BACKEND" in
+    tmux)  run_cmd tmux select-window -t "$1:lead" ;;
+    herdr)
+      if $DRY_RUN; then dim "[dry-run] $HERDR_BIN tab focus <tab:lead>"
+      else
+        local ws tab
+        ws=$(be_ws_id "$1") || return 0
+        tab=$("$HERDR_BIN" tab list --workspace "$ws" 2>/dev/null | yq -p json -r '.result.tabs[] | select(.label=="lead") | .tab_id' | head -1)
+        [[ -n "$tab" ]] && run_cmd "$HERDR_BIN" tab focus "$tab" >/dev/null
+      fi ;;
+  esac
+}
+
+be_cleanup_workers() { # $1=session — close every worker window/tab except lead; echoes count
+  local count=0
+  case "$BACKEND" in
+    tmux)
+      for window in $(tmux list-windows -t "$1" -F '#{window_name}' 2>/dev/null); do
+        [[ "$window" != "lead" ]] && { run_cmd tmux kill-window -t "$1:${window}" 2>/dev/null && count=$((count+1)) || true; }
+      done ;;
+    herdr)
+      if $DRY_RUN; then dim "[dry-run] $HERDR_BIN tab close <each non-lead tab>"
+      else
+        local ws tab
+        ws=$(be_ws_id "$1") || { echo 0; return; }
+        while IFS= read -r tab; do
+          [[ -n "$tab" ]] && { run_cmd "$HERDR_BIN" tab close "$tab" >/dev/null 2>&1 && count=$((count+1)) || true; }
+        done < <("$HERDR_BIN" tab list --workspace "$ws" 2>/dev/null | yq -p json -r '.result.tabs[] | select(.label!="lead") | .tab_id')
+      fi ;;
+  esac
+  echo "$count"
+}
+
 usage() {
   cat <<EOF
 claude-team v${VERSION} — tmux control room for Claude Code agent teams
@@ -180,7 +214,8 @@ Options:
   --yolo                               Skip all Claude permission prompts
   --dry-run                            Print commands without executing
   --verbose                            Show assembled prompts in dry-run
-  --session-name <name>                Override tmux session name
+  --session-name <name>                Override session name
+  --backend <tmux|herdr>               Pane/session backend (default: tmux)
 
 Config format (v2 — task + fragments):
   agents:
@@ -493,26 +528,21 @@ cmd_project() {
   green "Starting control room: $session"
   green "Project: $project_path"
 
-  # Create tmux session with lead window
-  run_cmd tmux new-session -d -s "$session" -n "lead" -c "$project_path"
+  # Create session with lead window
+  be_new_session "$session" "$project_path"
 
   # Start Claude with team lead system prompt via --append-system-prompt
   local lead_prompt="${TEMPLATES_DIR}/team-lead.md"
   if [[ -f "$lead_prompt" ]]; then
-    run_cmd tmux send-keys -t "${session}:lead" \
-      "$(claude_cmd) --append-system-prompt \"\$(cat '${lead_prompt}')\"" Enter
+    be_send_lead "$session" "$(claude_cmd) --append-system-prompt \"\$(cat '${lead_prompt}')\""
   else
     yellow "No team lead template found at $lead_prompt"
     yellow "Starting plain Claude Code session"
-    run_cmd tmux send-keys -t "${session}:lead" "$(claude_cmd)" Enter
+    be_send_lead "$session" "$(claude_cmd)"
   fi
 
   # Attach to the session
-  if [[ -z "${TMUX:-}" ]]; then
-    run_cmd tmux attach-session -t "$session"
-  else
-    run_cmd tmux switch-client -t "$session"
-  fi
+  be_attach "$session"
 }
 
 # --- Spawn workers from config ---
@@ -726,31 +756,23 @@ cmd_launch() {
   fi
 
   # Check if session already exists
-  if tmux has-session -t "$session" 2>/dev/null; then
+  if be_has_session "$session"; then
     yellow "Session '$session' already exists. Attaching..."
-    if [[ -z "${TMUX:-}" ]]; then
-      run_cmd tmux attach-session -t "$session"
-    else
-      run_cmd tmux switch-client -t "$session"
-    fi
+    be_attach "$session"
     return
   fi
 
   # Create session
-  run_cmd tmux new-session -d -s "$session" -n "lead" -c "$project_path"
+  be_new_session "$session" "$project_path"
 
   # Spawn all agents
   cmd_spawn "$1"
 
   # Attach
   # Select lead window
-  run_cmd tmux select-window -t "${session}:lead"
+  be_select_lead "$session"
 
-  if [[ -z "${TMUX:-}" ]]; then
-    run_cmd tmux attach-session -t "$session"
-  else
-    run_cmd tmux switch-client -t "$session"
-  fi
+  be_attach "$session"
 }
 
 # --- List saved configs ---
@@ -800,22 +822,23 @@ cmd_cleanup() {
   local session="${1:-}"
 
   if [[ -z "$session" ]]; then
-    # Try to find current team session
-    session=$(tmux display-message -p '#{session_name}' 2>/dev/null || true)
+    # Auto-detect only works from inside a tmux session
+    if [[ "$BACKEND" == "tmux" ]]; then
+      session=$(tmux display-message -p '#{session_name}' 2>/dev/null || true)
+    else
+      red "cleanup with --backend herdr requires a session name"
+      return 1
+    fi
   fi
 
-  if [[ -z "$session" ]] || ! tmux has-session -t "$session" 2>/dev/null; then
+  if [[ -z "$session" ]] || ! be_has_session "$session"; then
     red "No active team session found"
     return
   fi
 
-  local count=0
-  # Kill all windows except 'lead'
-  for window in $(tmux list-windows -t "$session" -F '#{window_name}' 2>/dev/null); do
-    if [[ "$window" != "lead" ]]; then
-      run_cmd tmux kill-window -t "${session}:${window}" 2>/dev/null && ((count++)) || true
-    fi
-  done
+  # Kill all windows/tabs except 'lead'
+  local count
+  count=$(be_cleanup_workers "$session")
 
   green "Cleaned up $count worker windows from $session"
 }
