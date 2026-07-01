@@ -27,6 +27,9 @@ check "workspace create (herdr) for derived session" "$OUT" "herdr workspace cre
 check "worker pane split (herdr)" "$OUT" "herdr pane split '<pane:lead>' --direction down"
 check "worker rename w1"           "$OUT" "herdr pane rename <pane:w1> 'w1'"
 check "lead is NOT split (root pane)" "$(echo "$OUT" | grep -c "pane rename <pane:lead>")" "0"
+# Task 3: send / injection
+check "worker cmd via pane run (herdr)"        "$OUT" "herdr pane run <pane:w1>"
+check "injected worker_cmd carries \$(cat prompt)" "$OUT" "$TMP/proj/.claude-team/agents/w1.md"
 
 echo "== pass=$pass fail=$fail =="
 [ "$fail" -eq 0 ]

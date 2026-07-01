@@ -95,6 +95,30 @@ be_wait_ready() { # $1=pane — ensure the pane shell is prompt-ready before inj
   "$HERDR_BIN" wait output "$1" --match '__READY__' --source recent --timeout 8000 >/dev/null 2>&1 || true
 }
 
+be_send() { # $1=session $2=name $3=cmd $4=mode  (cmd may contain -p "$(cat file)")
+  case "$BACKEND" in
+    tmux)
+      if [[ "$4" == "headless" ]]; then
+        run_cmd tmux set-option -t "$1:$2" remain-on-exit off 2>/dev/null
+        run_cmd tmux send-keys -t "$1:$2" "$3 ; exit" Enter
+      else
+        run_cmd tmux send-keys -t "$1:$2" "$3" Enter
+      fi ;;
+    herdr)
+      # pane run forwards $3 to the pane shell, which expands $(cat …) (spike-proven)
+      if $DRY_RUN; then dim "[dry-run] $HERDR_BIN pane run <pane:$2> \"$3\""
+      else run_cmd "$HERDR_BIN" pane run "${HERDR_PANE[$2]}" "$3"; fi ;;
+  esac
+}
+
+be_send_lead() { # $1=session $2=cmd
+  case "$BACKEND" in
+    tmux)  run_cmd tmux send-keys -t "$1:lead" "$2" Enter ;;
+    herdr) if $DRY_RUN; then dim "[dry-run] $HERDR_BIN pane run <pane:lead> \"$2\""
+           else run_cmd "$HERDR_BIN" pane run "${HERDR_PANE[lead]}" "$2"; fi ;;
+  esac
+}
+
 usage() {
   cat <<EOF
 claude-team v${VERSION} — tmux control room for Claude Code agent teams
@@ -596,15 +620,10 @@ cmd_spawn() {
       local worker_cmd
       worker_cmd=$(build_worker_cmd "$final_prompt_file" "$profile" "$project_path" "$mode")
 
-      if [[ "$mode" == "headless" ]]; then
-        run_cmd tmux set-option -t "${session}:${name}" remain-on-exit off 2>/dev/null
-        run_cmd tmux send-keys -t "${session}:${name}" "${worker_cmd} ; exit" Enter
-      else
-        run_cmd tmux send-keys -t "${session}:${name}" "${worker_cmd}" Enter
-      fi
+      be_send "$session" "$name" "$worker_cmd" "$mode"
     else
       # No prompt — plain claude
-      run_cmd tmux send-keys -t "${session}:${name}" "$(claude_cmd)" Enter
+      be_send "$session" "$name" "$(claude_cmd)" "$mode"
     fi
 
     # --- Initialize status file ---
