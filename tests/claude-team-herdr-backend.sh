@@ -22,6 +22,8 @@ worktrees: false
 agents:
   - { name: lead, role: lead }
   - { name: w1, role: worker, mode: interactive, prompt: .claude-team/agents/w1.md }
+  - { name: w2, role: worker, mode: interactive, runner: pi, model: rtx3090/Qwen3-14B-AWQ, prompt: .claude-team/agents/w1.md }
+  - { name: w3, role: worker, mode: interactive, runner: bogus, prompt: .claude-team/agents/w1.md }
 Y
 
 pass=0; fail=0
@@ -39,6 +41,16 @@ check "backend env propagated" "$OUT" "--env CLAUDE_TEAM_BACKEND=herdr"
 # Task 3: send / injection
 check "worker cmd via pane run (herdr)"        "$OUT" "herdr pane run <pane:w1>"
 check "injected worker_cmd carries \$(cat prompt)" "$OUT" "$TMP/proj/.claude-team/agents/w1.md"
+# runner: field — w1 stays claude (unchanged), w2 runs pi with model, w3 (unknown) skipped
+W1LINE=$(echo "$OUT" | grep -F "pane run <pane:w1>")
+check "w1 (claude) launch unchanged"     "$W1LINE" "unset CLAUDECODE && claude --allow-dangerously-skip-permissions"
+check "w1 (claude) prompt via --append-system-prompt" "$W1LINE" "--append-system-prompt \"\$(cat '$TMP/proj/.claude-team/agents/w1.md')\""
+W2LINE=$(echo "$OUT" | grep -F "pane run <pane:w2>")
+check "w2 (pi) uses pi with model"       "$W2LINE" "clear && pi --model rtx3090/Qwen3-14B-AWQ"
+check "w2 (pi) prompt via -p \$(cat)"    "$W2LINE" "-p \"\$(cat '$TMP/proj/.claude-team/agents/w1.md')\""
+check_eq "w2 (pi) carries no claude flags" "$(echo "$W2LINE" | grep -c 'dangerously-skip-permissions')" "0"
+check "w3 unknown runner errors"         "$OUT" "unknown runner: bogus (skipping)"
+check_eq "w3 not spawned"                "$(echo "$OUT" | grep -cF "<pane:w3>")" "0"
 # Task 4: stop (needs a live workspace to pass the has-session gate)
 if command -v herdr >/dev/null && herdr status server 2>/dev/null | grep running >/dev/null; then
   herdr workspace create --label 'team-cttest' --no-focus >/dev/null 2>&1

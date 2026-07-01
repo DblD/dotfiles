@@ -232,6 +232,8 @@ Config format (v2 — task + fragments):
       owns: "app/src/routes/api/"              # file ownership
       commit_style: per-task                   # per-task or single
       mode: interactive                        # interactive or headless
+      runner: claude                           # claude (default) or pi
+      model: rtx3090/Qwen3-14B-AWQ             # optional --model for the runner
 
 Config format (v1 — legacy monolithic prompt):
   agents:
@@ -505,6 +507,44 @@ build_worker_cmd() {
   echo "$cmd"
 }
 
+# --- Build per-agent command for the configured runner ---
+# runner=claude falls through to the existing claude_cmd/build_worker_cmd path.
+# runner=pi is a plain chat CLI: no claude flags, prompt via `pi -p "$(cat file)"`.
+
+build_runner_cmd() {
+  local runner="$1"
+  local model="$2"
+  local prompt_file="$3"
+  local profile="${4:-}"
+  local project_path="${5:-}"
+  local mode="${6:-interactive}"
+
+  local cmd
+  case "$runner" in
+    pi)
+      cmd="clear && pi"
+      if [[ -n "$model" && "$model" != "null" ]]; then
+        cmd+=" --model ${model}"
+      fi
+      if [[ -n "$prompt_file" ]]; then
+        cmd+=" -p \"\$(cat '${prompt_file}')\""
+      fi
+      ;;
+    *)  # claude (default)
+      if [[ -n "$prompt_file" ]]; then
+        cmd=$(build_worker_cmd "$prompt_file" "$profile" "$project_path" "$mode")
+      else
+        cmd=$(claude_cmd)
+      fi
+      if [[ -n "$model" && "$model" != "null" ]]; then
+        cmd+=" --model ${model}"
+      fi
+      ;;
+  esac
+
+  echo "$cmd"
+}
+
 # --- Project mode: start control room with team lead ---
 
 cmd_project() {
@@ -632,6 +672,14 @@ cmd_spawn() {
     commit_style=$(yq -r ".agents[$i].commit_style // \"\"" "$config_file")
     local agent_worktree
     agent_worktree=$(yq -r ".agents[$i].worktree // \"auto\"" "$config_file")
+    local runner model
+    runner=$(yq -r ".agents[$i].runner // \"claude\"" "$config_file")
+    model=$(yq -r ".agents[$i].model // \"\"" "$config_file")
+
+    case "$runner" in
+      claude|pi) ;;
+      *) red "  [$name] unknown runner: $runner (skipping)"; continue ;;
+    esac
 
     # Determine working directory
     local work_dir="$project_path"
@@ -692,16 +740,10 @@ cmd_spawn() {
     # --- Create worker pane/window ---
     be_new_worker "$session" "$name" "$work_dir"
 
-    # --- Build and send claude command ---
-    if [[ -n "$final_prompt_file" ]]; then
-      local worker_cmd
-      worker_cmd=$(build_worker_cmd "$final_prompt_file" "$profile" "$project_path" "$mode")
-
-      be_send "$session" "$name" "$worker_cmd" "$mode"
-    else
-      # No prompt — plain claude
-      be_send "$session" "$name" "$(claude_cmd)" "$mode"
-    fi
+    # --- Build and send runner command (claude default, pi supported) ---
+    local worker_cmd
+    worker_cmd=$(build_runner_cmd "$runner" "$model" "$final_prompt_file" "$profile" "$project_path" "$mode")
+    be_send "$session" "$name" "$worker_cmd" "$mode"
 
     # --- Initialize status file ---
     if [[ "$role" != "lead" ]]; then
