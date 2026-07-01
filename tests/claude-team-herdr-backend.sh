@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 # Dry-run tests for `claude-team --backend herdr`. No live herdr needed.
+#
+# Live smoke (needs the herdr service running) — verified manually:
+#   SM=~/.code/scratch/herdr-team-smoke; mkdir -p "$SM/.claude-team/agents"
+#   echo 'reply SMOKE-OK then stop.' > "$SM/.claude-team/agents/hello.md"
+#   printf 'name: smoke\nproject: %s\nworktrees: false\nagents:\n  - {name: lead, role: lead}\n  - {name: hello, role: worker, mode: interactive, prompt: .claude-team/agents/hello.md}\n' "$SM" > "$SM/smoke.yaml"
+#   claude-team spawn "$SM/smoke.yaml" --backend herdr    # -> workspace team-herdr-team-smoke, lead root + hello pane
+#   claude-team --stop herdr-team-smoke --backend herdr   # -> workspace close
 set -uo pipefail
 CT="$(cd "$(dirname "$0")/.." && pwd)/scripts/claude-team"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
