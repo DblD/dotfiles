@@ -23,8 +23,6 @@ YOLO=false
 VERBOSE=false
 BACKEND="${CLAUDE_TEAM_BACKEND:-tmux}"   # tmux | herdr
 HERDR_BIN="$(command -v herdr || echo /opt/homebrew/bin/herdr)"
-HERDR_WS=""
-declare -A HERDR_PANE
 
 # Build the claude launch command (accounts for nesting + permission mode)
 claude_cmd() {
@@ -46,10 +44,29 @@ run_cmd() {
 }
 
 # ---- pane/session backend dispatch (tmux default, herdr optional) ----
+# herdr addressing is STATELESS: every invocation resolves names via herdr labels,
+# exactly like tmux resolves session:window names.
+# Mapping: session = workspace label; tmux window ≈ herdr TAB;
+# lead = tab labelled 'lead' (renamed tab 1); worker <name> = tab labelled <name>.
+
+be_ws_id() { # $1=session label -> workspace id (herdr)
+  "$HERDR_BIN" workspace list 2>/dev/null | yq -p json -r ".result.workspaces[] | select(.label==\"$1\") | .workspace_id" | head -1
+}
+
+be_pane_for() { # $1=session $2=name -> pane id (herdr; stateless label lookup)
+  if $DRY_RUN; then echo "<pane:$2>"; return 0; fi
+  local ws tab
+  ws=$(be_ws_id "$1")
+  [[ -n "$ws" ]] || { red "herdr: workspace '$1' not found"; return 1; }
+  tab=$("$HERDR_BIN" tab list --workspace "$ws" 2>/dev/null | yq -p json -r ".result.tabs[] | select(.label==\"$2\") | .tab_id" | head -1)
+  [[ -n "$tab" ]] || { red "herdr: tab '$2' not found in $1"; return 1; }
+  "$HERDR_BIN" pane list --workspace "$ws" 2>/dev/null | yq -p json -r ".result.panes[] | select(.tab_id==\"$tab\") | .pane_id" | head -1
+}
+
 be_has_session() { # $1=session
   case "$BACKEND" in
     tmux)  tmux has-session -t "$1" 2>/dev/null ;;
-    herdr) "$HERDR_BIN" workspace list 2>/dev/null | grep -qF "\"label\":\"$1\"" ;;
+    herdr) [[ -n "$(be_ws_id "$1")" ]] ;;
   esac
 }
 
@@ -58,12 +75,14 @@ be_new_session() { # $1=session $2=project_path
     tmux) run_cmd tmux new-session -d -s "$1" -n "lead" -c "$2" ;;
     herdr)
       if $DRY_RUN; then
-        dim "[dry-run] $HERDR_BIN workspace create --cwd '$2' --label '$1' --no-focus"
-        HERDR_WS="<ws>"; HERDR_PANE[lead]="<pane:lead>"
+        dim "[dry-run] $HERDR_BIN workspace create --cwd '$2' --label '$1' --env CLAUDE_TEAM_BACKEND=herdr --no-focus"
+        dim "[dry-run] $HERDR_BIN tab rename <tab:1> 'lead'"
       else
-        local j; j=$("$HERDR_BIN" workspace create --cwd "$2" --label "$1" --no-focus)
-        HERDR_WS=$(echo "$j" | yq -p json -r '.result.workspace.workspace_id')
-        HERDR_PANE[lead]=$(echo "$j" | yq -p json -r '.result.root_pane.pane_id')
+        local j t1
+        j=$("$HERDR_BIN" workspace create --cwd "$2" --label "$1" --env CLAUDE_TEAM_BACKEND=herdr --no-focus)
+        t1=$(echo "$j" | yq -p json -r '.result.tab.tab_id')
+        "$HERDR_BIN" tab rename "$t1" "lead" >/dev/null
+        be_wait_ready "$(echo "$j" | yq -p json -r '.result.root_pane.pane_id')"
       fi ;;
     *) red "unknown backend: $BACKEND (use tmux|herdr)"; exit 1 ;;
   esac
@@ -74,54 +93,39 @@ be_new_worker() { # $1=session $2=name $3=work_dir  (worktrees already resolved 
     tmux) run_cmd tmux new-window -t "$1" -n "$2" -c "$3" ;;
     herdr)
       if $DRY_RUN; then
-        dim "[dry-run] $HERDR_BIN pane split '${HERDR_PANE[lead]}' --direction down --cwd '$3' --no-focus"
-        dim "[dry-run] $HERDR_BIN pane rename <pane:$2> '$2'"
-        HERDR_PANE[$2]="<pane:$2>"
+        dim "[dry-run] $HERDR_BIN tab create --workspace <ws:$1> --cwd '$3' --label '$2' --no-focus"
       else
-        local before after new
-        before=$("$HERDR_BIN" pane list --workspace "$HERDR_WS" | yq -p json -r '.result.panes[].pane_id' | sort)
-        "$HERDR_BIN" pane split "${HERDR_PANE[lead]}" --direction down --cwd "$3" --no-focus >/dev/null
-        after=$("$HERDR_BIN" pane list --workspace "$HERDR_WS" | yq -p json -r '.result.panes[].pane_id' | sort)
-        new=$(comm -13 <(echo "$before") <(echo "$after") | head -1)
-        "$HERDR_BIN" pane rename "$new" "$2" >/dev/null
-        HERDR_PANE[$2]="$new"
-        be_wait_ready "$new"
+        local ws j
+        ws=$(be_ws_id "$1")
+        [[ -n "$ws" ]] || { red "herdr: workspace '$1' not found"; return 1; }
+        j=$("$HERDR_BIN" tab create --workspace "$ws" --cwd "$3" --label "$2" --no-focus)
+        be_wait_ready "$(echo "$j" | yq -p json -r '.result.root_pane.pane_id')"
       fi ;;
   esac
 }
 
-be_wait_ready() { # $1=pane — ensure the pane shell is prompt-ready before injecting
-  "$HERDR_BIN" pane run "$1" 'echo __READY__' >/dev/null 2>&1
-  "$HERDR_BIN" wait output "$1" --match '__READY__' --source recent --timeout 8000 >/dev/null 2>&1 || true
+be_wait_ready() { # $1=pane — token built from parts so the typed command can't self-match
+  "$HERDR_BIN" pane run "$1" "printf 'REA%s\\n' 'DY_OK'" >/dev/null 2>&1
+  "$HERDR_BIN" wait output "$1" --match 'READY_OK' --source recent --timeout 8000 >/dev/null 2>&1 || true
 }
 
 be_send() { # $1=session $2=name $3=cmd $4=mode  (cmd may contain -p "$(cat file)")
+  local cmd="$3"
+  [[ "${4:-}" == "headless" ]] && cmd="$3 ; exit"
   case "$BACKEND" in
     tmux)
-      if [[ "$4" == "headless" ]]; then
-        run_cmd tmux set-option -t "$1:$2" remain-on-exit off 2>/dev/null
-        run_cmd tmux send-keys -t "$1:$2" "$3 ; exit" Enter
-      else
-        run_cmd tmux send-keys -t "$1:$2" "$3" Enter
-      fi ;;
+      [[ "${4:-}" == "headless" ]] && run_cmd tmux set-option -t "$1:$2" remain-on-exit off 2>/dev/null
+      run_cmd tmux send-keys -t "$1:$2" "$cmd" Enter ;;
     herdr)
-      # pane run forwards $3 to the pane shell, which expands $(cat …) (spike-proven)
-      if $DRY_RUN; then dim "[dry-run] $HERDR_BIN pane run <pane:$2> \"$3\""
-      else run_cmd "$HERDR_BIN" pane run "${HERDR_PANE[$2]}" "$3"; fi ;;
+      if $DRY_RUN; then dim "[dry-run] $HERDR_BIN pane run <pane:$2> \"$cmd\""
+      else
+        local p; p=$(be_pane_for "$1" "$2") || return 1
+        run_cmd "$HERDR_BIN" pane run "$p" "$cmd"
+      fi ;;
   esac
 }
 
-be_send_lead() { # $1=session $2=cmd
-  case "$BACKEND" in
-    tmux)  run_cmd tmux send-keys -t "$1:lead" "$2" Enter ;;
-    herdr) if $DRY_RUN; then dim "[dry-run] $HERDR_BIN pane run <pane:lead> \"$2\""
-           else run_cmd "$HERDR_BIN" pane run "${HERDR_PANE[lead]}" "$2"; fi ;;
-  esac
-}
-
-be_ws_id() { # $1=session label -> workspace id (herdr)
-  "$HERDR_BIN" workspace list 2>/dev/null | yq -p json -r ".result.workspaces[] | select(.label==\"$1\") | .workspace_id"
-}
+be_send_lead() { be_send "$1" "lead" "$2" "interactive"; }
 
 be_list_sessions() { # list running team-* sessions
   case "$BACKEND" in
@@ -133,16 +137,28 @@ be_list_sessions() { # list running team-* sessions
 be_stop() { # $1=session
   case "$BACKEND" in
     tmux)  run_cmd tmux kill-session -t "$1" ;;
-    herdr) if $DRY_RUN; then dim "[dry-run] $HERDR_BIN workspace close (label '$1')"
-           else run_cmd "$HERDR_BIN" workspace close "$(be_ws_id "$1")"; fi ;;
+    herdr)
+      if $DRY_RUN; then dim "[dry-run] $HERDR_BIN workspace close (label '$1')"
+      else
+        local ws
+        ws=$(be_ws_id "$1")
+        [[ -n "$ws" ]] || { red "herdr: workspace '$1' not found"; return 1; }
+        run_cmd "$HERDR_BIN" workspace close "$ws" >/dev/null
+      fi ;;
   esac
 }
 
 be_attach() { # $1=session
   case "$BACKEND" in
     tmux)  if [[ -z "${TMUX:-}" ]]; then run_cmd tmux attach-session -t "$1"; else run_cmd tmux switch-client -t "$1"; fi ;;
-    herdr) if $DRY_RUN; then dim "[dry-run] $HERDR_BIN workspace focus (label '$1')  # or run 'herdr' to attach"
-           else run_cmd "$HERDR_BIN" workspace focus "$(be_ws_id "$1")"; fi ;;
+    herdr)
+      if $DRY_RUN; then dim "[dry-run] $HERDR_BIN workspace focus (label '$1')  # or run 'herdr' to attach"
+      else
+        local ws
+        ws=$(be_ws_id "$1")
+        [[ -n "$ws" ]] || { red "herdr: workspace '$1' not found"; return 1; }
+        run_cmd "$HERDR_BIN" workspace focus "$ws"
+      fi ;;
   esac
 }
 

@@ -8,6 +8,7 @@
 #   claude-team spawn "$SM/smoke.yaml" --backend herdr    # -> workspace team-herdr-team-smoke, lead root + hello pane
 #   claude-team --stop herdr-team-smoke --backend herdr   # -> workspace close
 set -uo pipefail
+export PATH="/opt/homebrew/opt/herdr/bin:$PATH"
 CT="$(cd "$(dirname "$0")/.." && pwd)/scripts/claude-team"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/proj/.claude-team/agents"
@@ -24,21 +25,22 @@ agents:
 Y
 
 pass=0; fail=0
-check(){ if echo "$2" | grep -qF "$3"; then echo "  ok: $1"; pass=$((pass+1)); else echo "  FAIL: $1 (missing: $3)"; fail=$((fail+1)); fi }
+check(){ if echo "$2" | grep -qF -- "$3"; then echo "  ok: $1"; pass=$((pass+1)); else echo "  FAIL: $1 (missing: $3)"; fail=$((fail+1)); fi }
+check_eq(){ if [ "$2" = "$3" ]; then echo "  ok: $1"; pass=$((pass+1)); else echo "  FAIL: $1 (got: $2, want: $3)"; fail=$((fail+1)); fi }
 
 OUT=$("$CT" spawn "$TMP/team.yaml" --backend herdr --dry-run 2>&1)
 
 # session name is derived from the project basename: team-<basename> = team-proj
 check "workspace create (herdr) for derived session" "$OUT" "herdr workspace create --cwd '$TMP/proj' --label 'team-proj'"
-# Task 2: worker spawn
-check "worker pane split (herdr)" "$OUT" "herdr pane split '<pane:lead>' --direction down"
-check "worker rename w1"           "$OUT" "herdr pane rename <pane:w1> 'w1'"
-check "lead is NOT split (root pane)" "$(echo "$OUT" | grep -c "pane rename <pane:lead>")" "0"
+# Task 2: worker spawn (workers are tabs, stateless label addressing)
+check "worker tab create w1" "$OUT" "tab create --workspace <ws:team-proj> --cwd '$TMP/proj' --label 'w1'"
+check_eq "lead not spawned as tab" "$(echo "$OUT" | grep -cF -- "--label 'lead'")" "0"
+check "backend env propagated" "$OUT" "--env CLAUDE_TEAM_BACKEND=herdr"
 # Task 3: send / injection
 check "worker cmd via pane run (herdr)"        "$OUT" "herdr pane run <pane:w1>"
 check "injected worker_cmd carries \$(cat prompt)" "$OUT" "$TMP/proj/.claude-team/agents/w1.md"
 # Task 4: stop (needs a live workspace to pass the has-session gate)
-if command -v herdr >/dev/null && herdr status server 2>/dev/null | grep -q running; then
+if command -v herdr >/dev/null && herdr status server 2>/dev/null | grep running >/dev/null; then
   herdr workspace create --label 'team-cttest' --no-focus >/dev/null 2>&1
   SOUT=$("$CT" --stop cttest --backend herdr --dry-run 2>&1)
   check "stop emits workspace close" "$SOUT" "workspace close (label 'team-cttest')"
