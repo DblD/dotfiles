@@ -30,6 +30,16 @@ check "lead is NOT split (root pane)" "$(echo "$OUT" | grep -c "pane rename <pan
 # Task 3: send / injection
 check "worker cmd via pane run (herdr)"        "$OUT" "herdr pane run <pane:w1>"
 check "injected worker_cmd carries \$(cat prompt)" "$OUT" "$TMP/proj/.claude-team/agents/w1.md"
+# Task 4: stop (needs a live workspace to pass the has-session gate)
+if command -v herdr >/dev/null && herdr status server 2>/dev/null | grep -q running; then
+  herdr workspace create --label 'team-cttest' --no-focus >/dev/null 2>&1
+  SOUT=$("$CT" --stop cttest --backend herdr --dry-run 2>&1)
+  check "stop emits workspace close" "$SOUT" "workspace close (label 'team-cttest')"
+  WSID=$(herdr workspace list 2>/dev/null | yq -p json -r '.result.workspaces[] | select(.label=="team-cttest") | .workspace_id')
+  [ -n "$WSID" ] && herdr workspace close "$WSID" >/dev/null 2>&1
+else
+  echo "  skip: stop test (no herdr server)"
+fi
 
 echo "== pass=$pass fail=$fail =="
 [ "$fail" -eq 0 ]

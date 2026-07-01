@@ -119,6 +119,33 @@ be_send_lead() { # $1=session $2=cmd
   esac
 }
 
+be_ws_id() { # $1=session label -> workspace id (herdr)
+  "$HERDR_BIN" workspace list 2>/dev/null | yq -p json -r ".result.workspaces[] | select(.label==\"$1\") | .workspace_id"
+}
+
+be_list_sessions() { # list running team-* sessions
+  case "$BACKEND" in
+    tmux)  tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^team-' || true ;;
+    herdr) "$HERDR_BIN" workspace list 2>/dev/null | yq -p json -r '.result.workspaces[].label' | grep '^team-' || true ;;
+  esac
+}
+
+be_stop() { # $1=session
+  case "$BACKEND" in
+    tmux)  run_cmd tmux kill-session -t "$1" ;;
+    herdr) if $DRY_RUN; then dim "[dry-run] $HERDR_BIN workspace close (label '$1')"
+           else run_cmd "$HERDR_BIN" workspace close "$(be_ws_id "$1")"; fi ;;
+  esac
+}
+
+be_attach() { # $1=session
+  case "$BACKEND" in
+    tmux)  if [[ -z "${TMUX:-}" ]]; then run_cmd tmux attach-session -t "$1"; else run_cmd tmux switch-client -t "$1"; fi ;;
+    herdr) if $DRY_RUN; then dim "[dry-run] $HERDR_BIN workspace focus (label '$1')  # or run 'herdr' to attach"
+           else run_cmd "$HERDR_BIN" workspace focus "$(be_ws_id "$1")"; fi ;;
+  esac
+}
+
 usage() {
   cat <<EOF
 claude-team v${VERSION} — tmux control room for Claude Code agent teams
@@ -437,9 +464,9 @@ cmd_project() {
   fi
 
   # Check if session already exists
-  if tmux has-session -t "$session" 2>/dev/null; then
+  if be_has_session "$session"; then
     yellow "Session '$session' already exists. Attaching..."
-    run_cmd tmux attach-session -t "$session"
+    be_attach "$session"
     return
   fi
 
@@ -785,7 +812,7 @@ cmd_stop() {
   if [[ -z "$session" ]]; then
     # Pick from running team sessions
     local sessions
-    sessions=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^team-' || true)
+    sessions=$(be_list_sessions)
 
     if [[ -z "$sessions" ]]; then
       yellow "No team sessions running"
@@ -807,14 +834,14 @@ cmd_stop() {
     session="team-${session}"
   fi
 
-  if ! tmux has-session -t "$session" 2>/dev/null; then
+  if ! be_has_session "$session"; then
     red "Session not found: $session"
     exit 1
   fi
 
-  # Check for worktrees
-  local session_path
-  session_path=$(tmux display-message -t "$session" -p '#{pane_current_path}' 2>/dev/null || true)
+  # Check for worktrees (tmux only; herdr worktree cleanup is a follow-up)
+  local session_path=""
+  [[ "$BACKEND" == "tmux" ]] && session_path=$(tmux display-message -t "$session" -p '#{pane_current_path}' 2>/dev/null || true)
 
   if [[ -n "$session_path" && -d "${session_path}/.git" ]]; then
     local worktrees
@@ -835,7 +862,7 @@ cmd_stop() {
   fi
 
   green "Stopping session: $session"
-  run_cmd tmux kill-session -t "$session"
+  be_stop "$session"
 }
 
 # --- Main ---
