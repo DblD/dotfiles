@@ -50,5 +50,40 @@ else
   echo "  skip: stop test (no herdr server)"
 fi
 
+# --- watch supervisor ---
+
+# no server needed: watch with no args prints usage and exits nonzero
+WOUT=$("$CT" watch 2>&1); WRC=$?
+check "watch no-args prints usage" "$WOUT" "Usage:"
+check_eq "watch no-args exits nonzero" "$([ "$WRC" -ne 0 ] && echo yes || echo no)" "yes"
+
+# live watch: report-agent blocked must surface a "needs you" line within ~5s
+if command -v herdr >/dev/null && herdr status server 2>/dev/null | grep running >/dev/null; then
+  WJ=$(herdr workspace create --label 'team-watchtest' --no-focus 2>/dev/null)
+  WPANE=$(echo "$WJ" | yq -p json -r '.result.root_pane.pane_id')
+  if [ -n "$WPANE" ] && [ "$WPANE" != "null" ]; then
+    WLOG="$TMP/watch.log"
+    "$CT" watch watchtest > "$WLOG" 2>&1 &
+    WPID=$!
+    sleep 2  # let it subscribe
+    herdr pane report-agent "$WPANE" --source test --agent claude --state working --seq 1 >/dev/null 2>&1
+    sleep 1
+    herdr pane report-agent "$WPANE" --source test --agent claude --state blocked --seq 2 >/dev/null 2>&1
+    hit=no
+    for _ in $(seq 1 10); do
+      if grep -q "needs you" "$WLOG"; then hit=yes; break; fi
+      sleep 0.5
+    done
+    check_eq "watch reports blocked agent (needs you)" "$hit" "yes"
+    check "watch printed working transition" "$(cat "$WLOG")" "-> working"
+    kill "$WPID" 2>/dev/null; wait "$WPID" 2>/dev/null
+    herdr workspace close "${WPANE%%:*}" >/dev/null 2>&1
+  else
+    echo "  FAIL: watch live test (could not create team-watchtest workspace)"; fail=$((fail+1))
+  fi
+else
+  echo "  skip: watch live test (no herdr server)"
+fi
+
 echo "== pass=$pass fail=$fail =="
 [ "$fail" -eq 0 ]

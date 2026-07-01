@@ -21,6 +21,7 @@ bold()   { printf '\033[1m%s\033[0m\n' "$*"; }
 DRY_RUN=false
 YOLO=false
 VERBOSE=false
+JSON_OUT=false
 BACKEND="${CLAUDE_TEAM_BACKEND:-tmux}"   # tmux | herdr
 HERDR_BIN="$(command -v herdr || echo /opt/homebrew/bin/herdr)"
 
@@ -207,6 +208,8 @@ Usage:
   claude-team --pick                   fzf picker for saved configs
   claude-team --list                   List saved configs
   claude-team cleanup [session-name]   Kill completed worker windows
+  claude-team watch <session-name>     Supervise a team session (herdr): notify on
+                                       blocked agents, collect finished output
   claude-team --stop [session-name]    Stop a team session
   claude-team --help                   Show this help
 
@@ -216,6 +219,7 @@ Options:
   --verbose                            Show assembled prompts in dry-run
   --session-name <name>                Override session name
   --backend <tmux|herdr>               Pane/session backend (default: tmux)
+  --json                               watch: emit one JSON object per line
 
 Config format (v2 — task + fragments):
   agents:
@@ -843,6 +847,35 @@ cmd_cleanup() {
   green "Cleaned up $count worker windows from $session"
 }
 
+# --- Watch: exec the python supervisor (herdr events) ---
+
+cmd_watch() {
+  local session="${1:-}"
+  if [[ -z "$session" || "$session" == "-h" || "$session" == "--help" ]]; then
+    usage
+    exit 1
+  fi
+  if [[ "$session" != team-* ]]; then
+    session="team-${session}"
+  fi
+  local sock="${HERDR_SOCKET_PATH:-${HOME}/.config/herdr/herdr.sock}"
+  local self="${BASH_SOURCE[0]}"
+  if command -v realpath &>/dev/null; then
+    self="$(realpath "$self")"
+  fi
+  local watch_bin
+  watch_bin="$(cd "$(dirname "$self")" && pwd)/claude-team-watch"
+  if [[ ! -x "$watch_bin" ]]; then
+    red "watch helper not found: $watch_bin"
+    exit 1
+  fi
+  local extra=()
+  if $JSON_OUT; then
+    extra+=(--json)
+  fi
+  exec "$watch_bin" "$session" --socket "$sock" "${extra[@]}"
+}
+
 # --- Stop session ---
 
 cmd_stop() {
@@ -928,6 +961,7 @@ main() {
       --dry-run) DRY_RUN=true ;;
       --yolo) YOLO=true ;;
       --verbose) VERBOSE=true ;;
+      --json) JSON_OUT=true ;;
       --session-name) SESSION_NAME_OVERRIDE="$2"; shift ;;
       --backend) BACKEND="$2"; shift ;;
       *) args+=("$1") ;;
@@ -959,6 +993,9 @@ main() {
       ;;
     cleanup)
       cmd_cleanup "${2:-}"
+      ;;
+    watch)
+      cmd_watch "${2:-}"
       ;;
     --version|-v)
       echo "claude-team v${VERSION}"

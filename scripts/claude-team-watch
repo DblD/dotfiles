@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""claude-team-watch -- supervisor for a claude-team herdr session.
+
+Connects to the herdr unix socket, subscribes to agent-status / pane / tab
+events for the workspace whose label matches the given session, and:
+  * notifies (herdr notification show) when an agent goes blocked
+  * collects a finished agent's recent output into <project>/.claude-team/results/
+  * prints every state transition as a compact timestamped line (--json for JSONL)
+
+Stdlib only. Invoked by `claude-team watch <session>`.
+Protocol notes (verified against herdr 0.7.1 / protocol 14):
+  * RPC connections are one-shot: the server closes after one reply.
+  * events.subscribe holds its connection open and streams NDJSON events.
+  * Subscribing replays historical pane/tab created events, so re-subscribe
+    triggers are guarded by known pane/tab sets.
+"""
+
+import json
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+DEFAULT_SOCKET = os.path.expanduser("~/.config/herdr/herdr.sock")
+HERDR = os.environ.get("HERDR_BIN") or shutil.which("herdr") \
+    or "/opt/homebrew/opt/herdr/bin/herdr"
+USAGE = """usage: claude-team-watch <session> [--socket PATH] [--json]
+
+Supervise a claude-team herdr session (session = workspace label):
+print agent state transitions, notify when an agent blocks, and collect
+output into <project>/.claude-team/results/ when an agent finishes.
+"""
+
+
+class Watcher:
+    def __init__(self, session, sock_path, as_json):
+        self.session = session
+        self.sock_path = sock_path
+        self.as_json = as_json
+        self.ws = None            # workspace id once resolved
+        self.project = None       # workspace cwd (lead/root pane)
+        self.last_status = {}     # pane_id -> last agent_status
+        self.pane_tab = {}        # pane_id -> tab_id
+        self.tab_label = {}       # tab_id -> label
+
+    # ---- output -----------------------------------------------------------
+    def emit(self, event, message, **extra):
+        now = datetime.now()
+        if self.as_json:
+            rec = {"ts": now.isoformat(timespec="seconds"),
+                   "session": self.session, "event": event, "message": message}
+            rec.update(extra)
+            print(json.dumps(rec), flush=True)
+        else:
+            print("[%s] %s" % (now.strftime("%H:%M:%S"), message), flush=True)
+
+    # ---- herdr plumbing ----------------------------------------------------
+    def rpc(self, method, params):
+        """One request per connection -- herdr closes the socket after a reply."""
+        s = socket.socket(socket.AF_UNIX)
+        try:
+            s.connect(self.sock_path)
+            req = {"id": "ct-watch", "method": method, "params": params}
+            s.sendall((json.dumps(req) + "\n").encode())
+            buf = b""
+            while b"\n" not in buf:
+                d = s.recv(65536)
+                if not d:
+                    break
+                buf += d
+        finally:
+            s.close()
+        obj = json.loads(buf.split(b"\n", 1)[0]) if buf.strip() else {}
+        if "error" in obj:
+            raise RuntimeError(obj["error"].get("message", "rpc error"))
+        return obj.get("result", {})
+
+    def refresh(self):
+        """Resolve workspace + pane/tab maps; returns the pane list."""
+        workspaces = self.rpc("workspace.list", {}).get("workspaces", [])
+        ws = next((w["workspace_id"] for w in workspaces
+                   if w.get("label") == self.session), None)
+        if not ws:
+            if self.ws:  # was watching it and it went away
+                self.emit("closed", "workspace '%s' closed, exiting" % self.session)
+                sys.exit(0)
+            raise RuntimeError("no herdr workspace labelled '%s'" % self.session)
+        self.ws = ws
+        panes = self.rpc("pane.list", {"workspace_id": ws}).get("panes", [])
+        tabs = self.rpc("tab.list", {"workspace_id": ws}).get("tabs", [])
+        self.pane_tab = {p["pane_id"]: p.get("tab_id") for p in panes}
+        self.tab_label = {t["tab_id"]: (t.get("label") or t["tab_id"]) for t in tabs}
+        if self.project is None and panes:
+            lead = [p for p in panes if self.tab_label.get(p.get("tab_id")) == "lead"]
+            self.project = (lead or panes)[0].get("cwd")
+        return panes
+
+    def in_ws(self, item_id):  # pane/tab ids are "<ws>:pN" / "<ws>:tN"
+        return bool(item_id) and item_id.startswith(self.ws + ":")
+
+    def label_for(self, pane_id):
+        if pane_id not in self.pane_tab:
+            try:
+                self.refresh()
+            except (OSError, RuntimeError, json.JSONDecodeError):
+                pass
+        return self.tab_label.get(self.pane_tab.get(pane_id), pane_id)
+
+    # ---- event actions -----------------------------------------------------
+    def notify_blocked(self, label, pane_id):
+        title = "%s: %s needs you" % (self.session, label)
+        try:
+            subprocess.run([HERDR, "notification", "show", title,
+                            "--sound", "request"],
+                           capture_output=True, timeout=10, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        self.emit("blocked", "%s needs you (blocked)" % label,
+                  label=label, pane=pane_id)
+
+    def collect(self, label, pane_id):
+        out = ""
+        for source in ("recent-unwrapped", "visible"):
+            try:
+                p = subprocess.run(
+                    [HERDR, "pane", "read", pane_id, "--source", source,
+                     "--lines", "120"],
+                    capture_output=True, text=True, timeout=10, check=False)
+                out = p.stdout
+            except (OSError, subprocess.TimeoutExpired):
+                out = ""
+            if out.strip():
+                break
+        if not self.project:
+            self.emit("warn", "%s: no project dir known, output not saved" % label)
+            return
+        results = os.path.join(self.project, ".claude-team", "results")
+        os.makedirs(results, exist_ok=True)
+        path = os.path.join(results, "%s.md" % label.replace(os.sep, "-"))
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n## %s -- %s / %s\n\n```\n%s\n```\n"
+                    % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                       self.session, label, out.rstrip()))
+        self.emit("collected", "%s: output -> %s" % (label, path),
+                  label=label, pane=pane_id, path=path)
+
+    # ---- event dispatch ----------------------------------------------------
+    def handle(self, obj, subscribed_panes, known_tabs):
+        """Returns True when a re-subscribe (fresh connection) is needed."""
+        data = obj.get("data") or {}
+        ev = (obj.get("event") or data.get("type") or "").replace(".", "_")
+
+        # agent status change (agent panes only: events carrying agent/status)
+        if data.get("agent_status") and data.get("pane_id"):
+            pane, status = data["pane_id"], data["agent_status"]
+            if not self.in_ws(pane):
+                return False
+            prev = self.last_status.get(pane)
+            if status == prev:
+                return False
+            self.last_status[pane] = status
+            label = self.label_for(pane)
+            self.emit("status", "%s: %s -> %s" % (label, prev or "unknown", status),
+                      label=label, pane=pane, status=status, prev=prev)
+            if status == "blocked":
+                self.notify_blocked(label, pane)
+            elif status in ("idle", "done") and prev == "working":
+                self.emit("finished", "%s: finished" % label, label=label, pane=pane)
+                self.collect(label, pane)
+            return False
+
+        pane = data.get("pane_id") or (data.get("pane") or {}).get("pane_id")
+        tab = data.get("tab_id") or (data.get("tab") or {}).get("tab_id")
+        if ev in ("pane_exited", "pane_closed") and self.in_ws(pane):
+            label = self.label_for(pane)
+            what = "pane exited" if ev == "pane_exited" else "pane closed"
+            self.emit(ev, "%s: %s" % (label, what), label=label, pane=pane)
+            return False
+        # new pane/tab in our workspace -> re-subscribe so it gets status events
+        # (guarded: subscribing replays historical created events)
+        if ev == "pane_created" and self.in_ws(pane) and pane not in subscribed_panes:
+            self.emit("resubscribe", "new pane %s, re-subscribing" % pane, pane=pane)
+            return True
+        if ev == "tab_created" and self.in_ws(tab) and tab not in known_tabs:
+            self.emit("resubscribe", "new tab %s, re-subscribing" % tab, tab=tab)
+            return True
+        if ev == "tab_closed" and self.in_ws(tab):
+            self.emit(ev, "%s: tab closed" % self.tab_label.get(tab, tab), tab=tab)
+        return False
+
+    # ---- main loops ----------------------------------------------------------
+    def watch_once(self):
+        """One subscribe connection; returns when a re-subscribe is needed."""
+        panes = self.refresh()
+        subscribed = set(self.pane_tab)
+        known_tabs = set(self.tab_label)
+        subs = [{"type": "pane.agent_status_changed", "pane_id": p["pane_id"]}
+                for p in panes]
+        subs += [{"type": t} for t in ("pane.created", "pane.closed", "pane.exited",
+                                       "tab.created", "tab.closed")]
+        s = socket.socket(socket.AF_UNIX)
+        try:
+            s.connect(self.sock_path)
+            s.sendall((json.dumps({"id": "watch", "method": "events.subscribe",
+                                   "params": {"subscriptions": subs}}) + "\n").encode())
+            self.emit("watching", "watching %s (%s): %d pane(s)"
+                      % (self.session, self.ws, len(panes)),
+                      workspace=self.ws, panes=sorted(subscribed))
+            buf = b""
+            while True:  # raw recv loop (makefile buffering drops events)
+                d = s.recv(65536)
+                if not d:
+                    raise ConnectionError("event socket closed")
+                buf += d
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    if not line.strip():
+                        continue
+                    obj = json.loads(line)
+                    if "result" in obj:  # subscription_started ack
+                        continue
+                    if self.handle(obj, subscribed, known_tabs):
+                        return
+        finally:
+            s.close()
+
+    def run(self):
+        first = True
+        while True:
+            try:
+                # watch_once refreshes state itself; it exits 0 if the
+                # workspace disappears after we started watching it.
+                self.watch_once()   # returned -> re-subscribe immediately
+            except (OSError, ConnectionError, RuntimeError,
+                    json.JSONDecodeError) as e:
+                if first:
+                    print("claude-team-watch: %s" % e, file=sys.stderr)
+                    sys.exit(1)
+                self.emit("reconnect", "connection lost (%s); retrying in 2s" % e)
+                time.sleep(2)
+            first = False
+
+
+def main(argv):
+    session, as_json = None, False
+    sock = os.environ.get("HERDR_SOCKET_PATH", DEFAULT_SOCKET)
+    args = iter(argv)
+    for a in args:
+        if a in ("-h", "--help"):
+            sys.stderr.write(USAGE)
+            return 2
+        if a == "--socket":
+            sock = next(args, "") or sock
+        elif a == "--json":
+            as_json = True
+        elif a.startswith("-"):
+            sys.stderr.write("unknown option: %s\n%s" % (a, USAGE))
+            return 2
+        elif session is None:
+            session = a
+    if not session:
+        sys.stderr.write(USAGE)
+        return 2
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    try:
+        Watcher(session, sock, as_json).run()
+    except KeyboardInterrupt:
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
