@@ -23,6 +23,10 @@ OUT=$("$CT" spawn "$TMP/team.yaml" --backend herdr --dry-run 2>&1)
 
 # session name is derived from the project basename: team-<basename> = team-proj
 check "workspace create (herdr) for derived session" "$OUT" "herdr workspace create --cwd '$TMP/proj' --label 'team-proj'"
+# Task 2: worker spawn
+check "worker pane split (herdr)" "$OUT" "herdr pane split '<pane:lead>' --direction down"
+check "worker rename w1"           "$OUT" "herdr pane rename <pane:w1> 'w1'"
+check "lead is NOT split (root pane)" "$(echo "$OUT" | grep -c "pane rename <pane:lead>")" "0"
 
 echo "== pass=$pass fail=$fail =="
 [ "$fail" -eq 0 ]

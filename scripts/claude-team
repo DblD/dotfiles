@@ -69,6 +69,32 @@ be_new_session() { # $1=session $2=project_path
   esac
 }
 
+be_new_worker() { # $1=session $2=name $3=work_dir  (worktrees already resolved into work_dir)
+  case "$BACKEND" in
+    tmux) run_cmd tmux new-window -t "$1" -n "$2" -c "$3" ;;
+    herdr)
+      if $DRY_RUN; then
+        dim "[dry-run] $HERDR_BIN pane split '${HERDR_PANE[lead]}' --direction down --cwd '$3' --no-focus"
+        dim "[dry-run] $HERDR_BIN pane rename <pane:$2> '$2'"
+        HERDR_PANE[$2]="<pane:$2>"
+      else
+        local before after new
+        before=$("$HERDR_BIN" pane list --workspace "$HERDR_WS" | yq -p json -r '.result.panes[].pane_id' | sort)
+        "$HERDR_BIN" pane split "${HERDR_PANE[lead]}" --direction down --cwd "$3" --no-focus >/dev/null
+        after=$("$HERDR_BIN" pane list --workspace "$HERDR_WS" | yq -p json -r '.result.panes[].pane_id' | sort)
+        new=$(comm -13 <(echo "$before") <(echo "$after") | head -1)
+        "$HERDR_BIN" pane rename "$new" "$2" >/dev/null
+        HERDR_PANE[$2]="$new"
+        be_wait_ready "$new"
+      fi ;;
+  esac
+}
+
+be_wait_ready() { # $1=pane — ensure the pane shell is prompt-ready before injecting
+  "$HERDR_BIN" pane run "$1" 'echo __READY__' >/dev/null 2>&1
+  "$HERDR_BIN" wait output "$1" --match '__READY__' --source recent --timeout 8000 >/dev/null 2>&1 || true
+}
+
 usage() {
   cat <<EOF
 claude-team v${VERSION} — tmux control room for Claude Code agent teams
@@ -482,9 +508,12 @@ cmd_spawn() {
     role=$(yq -r ".agents[$i].role // \"worker\"" "$config_file")
     mode=$(yq -r ".agents[$i].mode // \"interactive\"" "$config_file")
 
-    # Skip lead if it already exists as a window
+    # Skip lead if it already exists (tmux: lead window; herdr: workspace root pane)
     if [[ "$role" == "lead" ]]; then
-      if tmux list-windows -t "$session" -F '#{window_name}' 2>/dev/null | grep -q "^lead$"; then
+      if [[ "$BACKEND" == "herdr" ]]; then
+        dim "  Lead = workspace root pane, skipping"
+        continue
+      elif tmux list-windows -t "$session" -F '#{window_name}' 2>/dev/null | grep -q "^lead$"; then
         dim "  Lead window exists, skipping"
         continue
       fi
@@ -559,8 +588,8 @@ cmd_spawn() {
       echo ""
     fi
 
-    # --- Create tmux window ---
-    run_cmd tmux new-window -t "$session" -n "$name" -c "$work_dir"
+    # --- Create worker pane/window ---
+    be_new_worker "$session" "$name" "$work_dir"
 
     # --- Build and send claude command ---
     if [[ -n "$final_prompt_file" ]]; then
