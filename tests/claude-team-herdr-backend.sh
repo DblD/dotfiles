@@ -253,10 +253,18 @@ J
   # typed nudge text reliably.
   check "nudge text is teaching" "$(herdr pane read "$NPANE" --source visible)" "ct-nudge-flag"
   check "manifest nudges=1" "$(cat "$NP/.claude-team/manifest/team-nudgetest.json")" '"nudges": 1'
-  touch /tmp/ct-nudge-flag
-  herdr pane report-agent "$NPANE" --source cttest --agent claude --state working --seq 3 >/dev/null 2>&1
+  # second unmet cycle: nudge #1's text (containing the literal sentinel phrase)
+  # now sits in the pane scrollback — the sentinel must NOT mistake it for a
+  # worker-declared BLOCKED; this must nudge again, not escalate.
+  herdr pane report-agent "$NPANE" --source cttest --agent claude --state working --seq 21 >/dev/null 2>&1
   sleep 1
-  herdr pane report-agent "$NPANE" --source cttest --agent claude --state idle --seq 4 >/dev/null 2>&1
+  herdr pane report-agent "$NPANE" --source cttest --agent claude --state idle --seq 22 >/dev/null 2>&1
+  sleep 4
+  check "second nudge (own nudge not mistaken for BLOCKED)" "$(cat "$NP/.claude-team/manifest/team-nudgetest.json")" '"nudges": 2'
+  touch /tmp/ct-nudge-flag
+  herdr pane report-agent "$NPANE" --source cttest --agent claude --state working --seq 31 >/dev/null 2>&1
+  sleep 1
+  herdr pane report-agent "$NPANE" --source cttest --agent claude --state idle --seq 32 >/dev/null 2>&1
   sleep 4
   check "complete after flag" "$(cat "$NP/.claude-team/manifest/team-nudgetest.json")" '"state": "complete"'
   kill "$WPID" 2>/dev/null; wait "$WPID" 2>/dev/null; rm -f /tmp/ct-nudge-flag
