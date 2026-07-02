@@ -62,6 +62,24 @@ else
   echo "  skip: stop test (no herdr server)"
 fi
 
+# --- tell: guaranteed-submission instruction delivery ---
+
+# herdr dry-run: send-text then send-keys enter (bare session name normalizes to team-proj)
+TOUT=$("$CT" tell proj w1 "do the thing" --backend herdr --dry-run 2>&1)
+check "tell (herdr) sends text to pane"   "$TOUT" "pane send-text <pane:w1>"
+check "tell (herdr) carries the message"  "$TOUT" 'do the thing'
+check "tell (herdr) presses enter"        "$TOUT" "send-keys <pane:w1> enter"
+check "tell (herdr) confirms delivery"    "$TOUT" "told w1: do the thing"
+
+# tmux dry-run: send-keys with message + Enter
+TT=$("$CT" tell proj w1 "do the thing" --backend tmux --dry-run 2>&1)
+check "tell (tmux) uses send-keys"        "$TT" "tmux send-keys"
+check "tell (tmux) carries message+Enter" "$TT" "do the thing Enter"
+
+# --wait on tmux is a no-op with a warning
+TW=$("$CT" tell proj w1 "go" --wait --backend tmux --dry-run 2>&1)
+check "tell (tmux) --wait unsupported"    "$TW" "not supported on tmux backend"
+
 # --- watch supervisor ---
 
 # no server needed: watch with no args prints usage and exits nonzero

@@ -208,6 +208,12 @@ Usage:
   claude-team --pick                   fzf picker for saved configs
   claude-team --list                   List saved configs
   claude-team cleanup [session-name]   Kill completed worker windows
+  claude-team tell <session> <agent> "<message>" [--wait[=SECONDS]]
+                                       Deliver an instruction to a running agent
+                                       pane and guarantee submission (text + Enter).
+                                       --wait: confirm the agent starts working
+                                       (herdr only); --wait=N: wait up to N seconds
+                                       for it to finish (idle)
   claude-team watch <session-name>     Supervise a team session (herdr): notify on
                                        blocked agents, collect finished output
   claude-team --stop [session-name]    Stop a team session
@@ -889,6 +895,88 @@ cmd_cleanup() {
   green "Cleaned up $count worker windows from $session"
 }
 
+# --- Tell: deliver an instruction to a running agent, guarantee submission ---
+# Motivated by the "typed but never pressed Enter" incident: a message sat
+# unsubmitted at a worker's prompt for an hour. tell always sends text + Enter.
+
+cmd_tell() {
+  local session="" agent="" message="" wait_mode="" wait_secs=""
+  local positional=()
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --wait) wait_mode="ack" ;;
+      --wait=*)
+        wait_mode="complete"
+        wait_secs="${arg#--wait=}"
+        if ! [[ "$wait_secs" =~ ^[0-9]+$ ]]; then
+          red "tell: --wait=SECONDS must be a number (got '$wait_secs')"
+          exit 1
+        fi ;;
+      *) positional+=("$arg") ;;
+    esac
+  done
+  session="${positional[0]:-}"
+  agent="${positional[1]:-}"
+  message="${positional[2]:-}"
+
+  if [[ -z "$session" || -z "$agent" || -z "$message" ]]; then
+    red "Usage: claude-team tell <session> <agent> \"<message>\" [--wait[=SECONDS]]"
+    exit 1
+  fi
+
+  # Add team- prefix if not present (same normalization as stop)
+  if [[ "$session" != team-* ]]; then
+    session="team-${session}"
+  fi
+
+  case "$BACKEND" in
+    tmux)
+      run_cmd tmux send-keys -t "${session}:${agent}" "$message" Enter
+      green "told ${agent}: ${message}"
+      if [[ -n "$wait_mode" ]]; then
+        yellow "--wait not supported on tmux backend"
+      fi
+      ;;
+    herdr)
+      local pane
+      pane=$(be_pane_for "$session" "$agent") || exit 1
+      # TUI agent prompt: pane run is for shell commands; a running agent
+      # needs literal text followed by an explicit Enter keypress.
+      if $DRY_RUN; then
+        dim "[dry-run] $HERDR_BIN pane send-text $pane \"$message\""
+        dim "[dry-run] $HERDR_BIN pane send-keys $pane enter"
+      else
+        "$HERDR_BIN" pane send-text "$pane" "$message" >/dev/null
+        "$HERDR_BIN" pane send-keys "$pane" enter >/dev/null
+      fi
+      green "told ${agent}: ${message}"
+      if [[ -n "$wait_mode" ]]; then
+        if $DRY_RUN; then
+          dim "[dry-run] $HERDR_BIN wait agent-status $pane --status working --timeout 15000"
+          [[ "$wait_mode" == "complete" ]] && \
+            dim "[dry-run] $HERDR_BIN wait agent-status $pane --status idle --timeout $((wait_secs * 1000))"
+        elif [[ "$wait_mode" == "ack" ]]; then
+          if "$HERDR_BIN" wait agent-status "$pane" --status working --timeout 15000 >/dev/null 2>&1; then
+            green "acknowledged (working)"
+          else
+            yellow "no state change seen — check the pane"
+          fi
+        else
+          # completion wait: confirm pickup first, then wait for idle
+          "$HERDR_BIN" wait agent-status "$pane" --status working --timeout 15000 >/dev/null 2>&1 || true
+          if "$HERDR_BIN" wait agent-status "$pane" --status idle --timeout $((wait_secs * 1000)) >/dev/null 2>&1; then
+            green "completed (idle)"
+          else
+            yellow "not idle after ${wait_secs}s — check the pane"
+          fi
+        fi
+      fi
+      ;;
+    *) red "unknown backend: $BACKEND (use tmux|herdr)"; exit 1 ;;
+  esac
+}
+
 # --- Watch: exec the python supervisor (herdr events) ---
 
 cmd_watch() {
@@ -1035,6 +1123,10 @@ main() {
       ;;
     cleanup)
       cmd_cleanup "${2:-}"
+      ;;
+    tell)
+      shift
+      cmd_tell "$@"
       ;;
     watch)
       cmd_watch "${2:-}"
