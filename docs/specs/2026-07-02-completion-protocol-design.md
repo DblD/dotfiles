@@ -4,7 +4,7 @@
 
 ## Problem
 
-Workers report their own completion (status files, final messages) and nothing verifies it. Observed failures: a worker's "done" summary while its branch was never pushed (human instruction "push it" then sat unsubmitted in the pane for an hour); status files stuck at "Starting" after real work finished. "Task completed" must become a machine-checked fact, not a vibe.
+Workers report their own completion (status files, final messages) and nothing verifies it. Observed failures: a worker's "done" summary while its branch was never pushed (human instruction "push it" then sat unsubmitted in the pane for an hour); status files stuck at "Starting" after real work finished. Lineage: the 2026-04-03 BCC sprint incident (brainlayer `manual-d9ef19ca79a24f49`) — a qa agent claimed "23/23 tests passing" three times while tests failed, and the Validation Lead had no tools to verify independently. That incident produced the "verification as a composable trait" idea this protocol now implements mechanically. "Task completed" must become a machine-checked fact, not a vibe.
 
 ## Decisions (locked with Dario)
 
@@ -29,9 +29,9 @@ agents:
 
 Either or both sub-keys may be present. `spawn` appends to the assembled/v1 prompt:
 
-> DELIVERABLE CONTRACT: your task is complete only when (1) branch `agent/fix-build` is pushed to origin, (2) `npx tsc --noEmit` exits clean in your working directory. When all hold, state `DELIVERABLE MET`. If you cannot meet the contract, state `DELIVERABLE BLOCKED:` followed by the reason.
+> DELIVERABLE CONTRACT: your task is complete only when (1) branch `agent/fix-build` is pushed to origin, (2) `npx tsc --noEmit` exits clean in your working directory. When all hold, state `DELIVERABLE MET`. If you cannot meet the contract, state `DELIVERABLE BLOCKED:` followed by the reason. Any claim about execution results (tests, builds, migrations) must include the raw command output — summaries don't count; a claim contradicted by output is void.
 
-The `BLOCKED` sentinel lets the nudge loop distinguish "forgot" from "genuinely stuck".
+The `BLOCKED` sentinel lets the nudge loop distinguish "forgot" from "genuinely stuck". The raw-output sentence is the `verified-output` trait from the 2026-04-03 incident, encoded into every contract.
 
 At spawn, the session's resolved config path is recorded in the manifest header so `verify` and `watch` can re-read deliverables later without re-passing arguments.
 
@@ -104,6 +104,21 @@ Two new columns, manifest-sourced: `DELIVERABLE` (met / unmet / `-` when none de
 3. **End-to-end (manual smoke):** real worker with a deliberately unmeetable `branch_pushed`, confirm 2 nudges then toast + INCOMPLETE.
 4. Existing 33 checks stay green; shellcheck/py_compile clean.
 
+## Reserved v2 seam: the `review:` deliverable (agent-as-verifier)
+
+Design source: the **Pi Verifier Agent** system at `~/.code/learning/tac/MEA/the-verifier-agent-system/` (two-agent observer: interactive Builder + input-locked read-only Verifier; on every builder stop the verifier re-checks the work via allowlisted deterministic scripts, prompts corrective feedback back, max 3 loops, then escalates to human). Our v1 is that system's mechanical skeleton on herdr primitives — watch=verifier harness, `verify`=domain script, `tell`=`verifier_prompt`, nudge cap=max_loops, toast=escalation.
+
+The schema **reserves** a third deliverable key, not implemented in v1:
+
+```yaml
+deliverable:
+  review:
+    persona: .claude-team/verifiers/code-review.md   # read-only reviewer role card
+    runner: pi                                       # runner-aware — local model or codex for diversity
+```
+
+v2 semantics (from the MEA design, adapted to herdr): watch spawns the reviewer in its own tab; the reviewer reads the worker's transcript — the herdr Claude integration already reports `agent_session_path`, which is exactly the session JSONL the MEA verifier consumes; it atomizes claims from the worker's original prompt + contract, runs read-only checks, and emits a `VERDICT:` line with a **CONFIDENCE grade** (PERFECT / VERIFIED / PARTIAL / FEEDBACK / FAILED) that watch treats as one more check (PARTIAL and below = unmet). Reviewer is read-only by architecture (persona tool allowlist + check-command-only bash), un-promptable by hand — gaps are fixed by editing the persona/scripts, so verification engineering compounds. Corrections flow through the same `tell` nudge path as v1.
+
 ## Out of scope (v1)
 
-Session-level "all complete" gate on `stop`; deliverable types beyond the two; cross-machine manifests; retro-fitting deliverables into running sessions.
+The `review:` deliverable above (reserved, v2); session-level "all complete" gate on `stop`; deliverable types beyond the two; cross-machine manifests; retro-fitting deliverables into running sessions.
