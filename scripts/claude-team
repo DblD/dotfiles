@@ -23,6 +23,7 @@ YOLO=false
 VERBOSE=false
 JSON_OUT=false
 REAP=false
+VERIFY_STATUS=false
 BACKEND="${CLAUDE_TEAM_BACKEND:-tmux}"   # tmux | herdr
 HERDR_BIN="$(command -v herdr || echo /opt/homebrew/bin/herdr)"
 
@@ -215,8 +216,20 @@ Usage:
                                        --wait: confirm the agent starts working
                                        (herdr only); --wait=N: wait up to N seconds
                                        for it to finish (idle)
-  claude-team status [session]         One-glance table of agents, states, and
-                                       status files (all team sessions, or one)
+  claude-team status [session] [--verify]
+                                       One-glance table of agents, states, and
+                                       status files (all team sessions, or one).
+                                       Adds DELIVERABLE (met/unmet/- from the
+                                       manifest's last verification) and
+                                       PROTOCOL (manifest state, or
+                                       "nudged xN" while working) columns from
+                                       the session manifest. If no live
+                                       session exists but a manifest does,
+                                       prints a manifest-only row per agent
+                                       (STATE "-"). --verify: live-check each
+                                       agent's deliverable (claude-team verify
+                                       --json) instead of using the manifest's
+                                       last recorded verification.
   claude-team verify <session> [agent]  Check declared deliverables (pure, read-only)
   claude-team watch <session-name> [--reap]
                                        Supervise a team session (herdr): notify on
@@ -1090,10 +1103,86 @@ results_field() { # $1=project $2=agent -> "yes" if results/<name>.md exists, el
   if [[ -n "${1:-}" && -f "$f" ]]; then echo "yes"; else echo "-"; fi
 }
 
+# Manifest lookup for a session (same convention as cmd_verify): project-local
+# first, then one directory up. Echoes the path, or nothing (rc=1) if absent.
+manifest_path_for() { # $1=session
+  local session="$1" d
+  for d in "$PWD" "$PWD/.."; do
+    if [[ -f "$d/${TEAM_DIR}/manifest/${session}.json" ]]; then
+      echo "$d/${TEAM_DIR}/manifest/${session}.json"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# $1=manifest_path -> "<agent>\t<deliverable>\t<protocol>" per line.
+# deliverable: met/unmet from the LAST entry of verifications, "-" if none.
+# protocol: manifest state; "nudged xN" when state=="working" and nudges>0; "-" if absent.
+manifest_columns() {
+  local man="$1"
+  [[ -f "$man" ]] || return 0
+  MCOL_MAN="$man" python3 - <<'PYEOF'
+import json, os
+doc = json.load(open(os.environ["MCOL_MAN"]))
+for name, a in doc.get("agents", {}).items():
+    verifications = a.get("verifications") or []
+    if verifications:
+        deliverable = "met" if verifications[-1].get("met") else "unmet"
+    else:
+        deliverable = "-"
+    state = a.get("state") or ""
+    nudges = a.get("nudges") or 0
+    if state == "working" and nudges > 0:
+        protocol = "nudged x%d" % nudges
+    elif state:
+        protocol = state
+    else:
+        protocol = "-"
+    print("%s\t%s\t%s" % (name, deliverable, protocol))
+PYEOF
+}
+
+# $1=JSONL from `cmd_verify <session> --json` -> "<agent>\t<met|unmet>" per line.
+verify_columns() {
+  local jsonl="$1"
+  [[ -n "$jsonl" ]] || return 0
+  VCOL_JSONL="$jsonl" python3 - <<'PYEOF'
+import json, os
+for line in os.environ["VCOL_JSONL"].splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        obj = json.loads(line)
+    except ValueError:
+        continue
+    print("%s\t%s" % (obj.get("agent", ""), "met" if obj.get("met") else "unmet"))
+PYEOF
+}
+
+# $1=tsv-lines (from manifest_columns/verify_columns) $2=agent $3=colnum -> field value, or "-"
+# bash-3.2-safe lookup (no associative arrays): one awk pass per call.
+mc_field() {
+  local lines="$1" agent="$2" col="$3"
+  [[ -n "$lines" ]] || { echo "-"; return; }
+  printf '%s\n' "$lines" | awk -F'\t' -v a="$agent" -v c="$col" '
+    $1==a { print $c; found=1; exit }
+    END { if (!found) print "-" }'
+}
+
 status_one_session() { # $1=session — print the agent table for one session
   local session="$1"
-  local fmt='  %-16s %-10s %-14s %-24s %s\n'
+  local fmt='  %-16s %-10s %-14s %-24s %-8s %-12s %s\n'
   bold "$session"
+  local man mc_lines="" vc_lines=""
+  man=$(manifest_path_for "$session") || true
+  [[ -n "$man" ]] && mc_lines=$(manifest_columns "$man")
+  if $VERIFY_STATUS && [[ -n "$man" ]]; then
+    local verify_json
+    verify_json=$(cmd_verify "$session" --json 2>/dev/null) || true
+    vc_lines=$(verify_columns "$verify_json")
+  fi
   case "$BACKEND" in
     herdr)
       local ws panes project
@@ -1103,8 +1192,8 @@ status_one_session() { # $1=session — print the agent table for one session
       # project = cwd of the workspace root pane (first pane in list)
       project=$(echo "$panes" | yq -p json -r '.result.panes[0].cwd // ""')
       # shellcheck disable=SC2059
-      printf "$fmt" "AGENT" "STATE" "PANE" "STATUS-FILE" "RESULTS"
-      local tab_id label pane state
+      printf "$fmt" "AGENT" "STATE" "PANE" "STATUS-FILE" "RESULTS" "DELIVERABLE" "PROTOCOL"
+      local tab_id label pane state deliverable protocol
       while IFS=$'\t' read -r tab_id label; do
         [[ -n "$tab_id" ]] || continue
         pane=$(echo "$panes" | yq -p json -r ".result.panes[] | select(.tab_id==\"$tab_id\") | .pane_id" | head -1)
@@ -1113,27 +1202,79 @@ status_one_session() { # $1=session — print the agent table for one session
           state=$("$HERDR_BIN" pane get "$pane" 2>/dev/null | yq -p json -r '.result.pane.agent_status // "-"')
           [[ -z "$state" || "$state" == "null" ]] && state="-"
         fi
+        if $VERIFY_STATUS && [[ -n "$vc_lines" ]]; then
+          deliverable=$(mc_field "$vc_lines" "$label" 2)
+        else
+          deliverable=$(mc_field "$mc_lines" "$label" 2)
+        fi
+        protocol=$(mc_field "$mc_lines" "$label" 3)
         # shellcheck disable=SC2059
         printf "$fmt" "$label" "$state" "${pane:--}" \
-          "$(status_file_field "$project" "$label")" "$(results_field "$project" "$label")"
+          "$(status_file_field "$project" "$label")" "$(results_field "$project" "$label")" \
+          "$deliverable" "$protocol"
       done < <("$HERDR_BIN" tab list --workspace "$ws" 2>/dev/null \
                  | yq -p json -r '.result.tabs[] | [.tab_id, (.label // .tab_id)] | @tsv')
       ;;
     tmux)
       tmux has-session -t "$session" 2>/dev/null || { yellow "  session not found: $session"; return 0; }
-      local project window
+      local project window deliverable protocol
       project=$(tmux display-message -p -t "$session" '#{pane_current_path}' 2>/dev/null || true)
       # shellcheck disable=SC2059
-      printf "$fmt" "AGENT" "STATE" "PANE" "STATUS-FILE" "RESULTS"
+      printf "$fmt" "AGENT" "STATE" "PANE" "STATUS-FILE" "RESULTS" "DELIVERABLE" "PROTOCOL"
       while IFS= read -r window; do
         [[ -n "$window" ]] || continue
+        if $VERIFY_STATUS && [[ -n "$vc_lines" ]]; then
+          deliverable=$(mc_field "$vc_lines" "$window" 2)
+        else
+          deliverable=$(mc_field "$mc_lines" "$window" 2)
+        fi
+        protocol=$(mc_field "$mc_lines" "$window" 3)
         # shellcheck disable=SC2059
         printf "$fmt" "$window" "-" "${session}:${window}" \
-          "$(status_file_field "$project" "$window")" "$(results_field "$project" "$window")"
+          "$(status_file_field "$project" "$window")" "$(results_field "$project" "$window")" \
+          "$deliverable" "$protocol"
       done < <(tmux list-windows -t "$session" -F '#{window_name}' 2>/dev/null)
       ;;
     *) red "unknown backend: $BACKEND (use tmux|herdr)"; exit 1 ;;
   esac
+  echo ""
+}
+
+# Manifest-only fallback: no live workspace/tmux session for $1, but a manifest
+# exists at $2. Prints the session header + one row per manifest agent with
+# STATE "-" (there is no live pane/window to read a state from).
+status_manifest_only() { # $1=session $2=manifest_path
+  local session="$1" man="$2"
+  local project
+  project=$(SM_MAN="$man" python3 - <<'PYEOF'
+import json, os
+print(json.load(open(os.environ["SM_MAN"])).get("project", ""))
+PYEOF
+)
+  local fmt='  %-16s %-10s %-14s %-24s %-8s %-12s %s\n'
+  bold "$session"
+  # shellcheck disable=SC2059
+  printf "$fmt" "AGENT" "STATE" "PANE" "STATUS-FILE" "RESULTS" "DELIVERABLE" "PROTOCOL"
+  local mc_lines vc_lines="" name deliverable protocol
+  mc_lines=$(manifest_columns "$man")
+  if $VERIFY_STATUS; then
+    local verify_json
+    verify_json=$(cmd_verify "$session" --json 2>/dev/null) || true
+    vc_lines=$(verify_columns "$verify_json")
+  fi
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    if $VERIFY_STATUS && [[ -n "$vc_lines" ]]; then
+      deliverable=$(mc_field "$vc_lines" "$name" 2)
+    else
+      deliverable=$(mc_field "$mc_lines" "$name" 2)
+    fi
+    protocol=$(mc_field "$mc_lines" "$name" 3)
+    # shellcheck disable=SC2059
+    printf "$fmt" "$name" "-" "-" \
+      "$(status_file_field "$project" "$name")" "$(results_field "$project" "$name")" \
+      "$deliverable" "$protocol"
+  done < <(printf '%s\n' "$mc_lines" | awk -F'\t' 'NF{print $1}')
   echo ""
 }
 
@@ -1146,6 +1287,12 @@ cmd_status() {
       session="team-${session}"
     fi
     if ! be_has_session "$session"; then
+      local man
+      man=$(manifest_path_for "$session") || true
+      if [[ -n "$man" ]]; then
+        status_manifest_only "$session" "$man"
+        return 0
+      fi
       yellow "no team sessions running"
       return 0
     fi
@@ -1369,6 +1516,7 @@ main() {
       --verbose) VERBOSE=true ;;
       --json) JSON_OUT=true ;;
       --reap) REAP=true ;;
+      --verify) VERIFY_STATUS=true ;;
       --session-name) SESSION_NAME_OVERRIDE="$2"; shift ;;
       --backend) BACKEND="$2"; shift ;;
       *) args+=("$1") ;;

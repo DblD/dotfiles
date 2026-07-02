@@ -102,6 +102,14 @@ VJALL=$(cd "$VP" && "$CT" verify vproj --json)
 echo "$VJALL" | python3 -c 'import json,sys; [json.loads(l) for l in sys.stdin if l.strip()]'
 check_eq "verify: --json lines all parse" "$?" "0"
 
+# --- status: manifest-only fallback (no live herdr workspace/tmux session, just a manifest) ---
+SOUT=$(cd "$VP" && "$CT" status vproj 2>&1 || true)
+check "status shows PROTOCOL column" "$SOUT" "PROTOCOL"
+check "status shows pending state"   "$SOUT" "pending"
+
+SVOUT=$(cd "$VP" && "$CT" status vproj --verify 2>&1 || true)
+check "status --verify live-checks deliverable" "$SVOUT" "met"
+
 # Task 4: stop (needs a live workspace to pass the has-session gate)
 if command -v herdr >/dev/null && herdr status server 2>/dev/null | grep running >/dev/null; then
   # Task 2: manifest seeding at spawn — lead + unknown-runner worker so NOTHING
