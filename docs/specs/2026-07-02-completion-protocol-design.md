@@ -91,6 +91,8 @@ verify(agent)
 
 The manifest header is seeded by `spawn` (session, config_path, spawned_at, agents=pending); watch owns all subsequent writes. Watch restart re-reads the manifest — nudge counts and states survive.
 
+**Trust boundary (v1, recorded during implementation):** deliverable checks are DENORMALIZED into the manifest at seed time (`agents.<name>.checks`), and `verify` executes them from the manifest without re-reading the config. Anything that can write the manifest therefore controls what `bash -c` runs and what "met" means — and with `worktrees: false`, workers run in the directory containing it. Accepted for v1 (watch is sole post-seed writer by design; the check command comes from the user's own team config, same trust domain as the repo). A worker tampering with its own manifest entry is inside the v2 threat model (the MEA-style reviewer verifies from the transcript + config, not the manifest).
+
 ## 4 · `status` changes
 
 Two new columns, manifest-sourced: `DELIVERABLE` (met / unmet / `-` when none declared) and `PROTOCOL` (pending / nudged×N / complete / incomplete / blocked). `status --verify` additionally runs a live verify per agent instead of trusting the last manifest entry. Sessions without a manifest render exactly as today.
