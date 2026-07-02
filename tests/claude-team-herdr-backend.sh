@@ -21,7 +21,8 @@ project: $TMP/proj
 worktrees: false
 agents:
   - { name: lead, role: lead }
-  - { name: w1, role: worker, mode: interactive, prompt: .claude-team/agents/w1.md }
+  - { name: w1, role: worker, mode: interactive, prompt: .claude-team/agents/w1.md,
+      deliverable: { branch_pushed: agent/w1, check: "true" } }
   - { name: w2, role: worker, mode: interactive, runner: pi, model: rtx3090/Qwen3-14B-AWQ, prompt: .claude-team/agents/w1.md }
   - { name: w3, role: worker, mode: interactive, runner: bogus, prompt: .claude-team/agents/w1.md }
 Y
@@ -44,13 +45,29 @@ check "injected worker_cmd carries \$(cat prompt)" "$OUT" "$TMP/proj/.claude-tea
 # runner: field — w1 stays claude (unchanged), w2 runs pi with model, w3 (unknown) skipped
 W1LINE=$(echo "$OUT" | grep -F "pane run <pane:w1>")
 check "w1 (claude) launch unchanged"     "$W1LINE" "unset CLAUDECODE && claude --allow-dangerously-skip-permissions"
-check "w1 (claude) prompt via --append-system-prompt" "$W1LINE" "--append-system-prompt \"\$(cat '$TMP/proj/.claude-team/agents/w1.md')\""
+# w1 now carries a deliverable (see below), so --append-system-prompt points at
+# the contract-injected temp copy rather than the original file — match the flag
+# syntax path-agnostically here, and verify the actual file content further down.
+check "w1 (claude) prompt via --append-system-prompt" "$W1LINE" "--append-system-prompt \"\$(cat '"
 W2LINE=$(echo "$OUT" | grep -F "pane run <pane:w2>")
 check "w2 (pi) uses pi with model"       "$W2LINE" "clear && pi --model rtx3090/Qwen3-14B-AWQ"
 check "w2 (pi) prompt via -p \$(cat)"    "$W2LINE" "-p \"\$(cat '$TMP/proj/.claude-team/agents/w1.md')\""
 check_eq "w2 (pi) carries no claude flags" "$(echo "$W2LINE" | grep -c 'dangerously-skip-permissions')" "0"
 check "w3 unknown runner errors"         "$OUT" "unknown runner: bogus (skipping)"
 check_eq "w3 not spawned"                "$(echo "$OUT" | grep -cF "<pane:w3>")" "0"
+# Task 1: deliverable parsing + contract injection at spawn
+check "contract injected note"    "$OUT" "deliverable contract injected for w1"
+check "contract file is a temp copy (original untouched)" \
+  "$(cat "$TMP/proj/.claude-team/agents/w1.md")" "you are worker one. reply OK."
+check_eq "original prompt has no contract" \
+  "$(grep -c 'DELIVERABLE CONTRACT' "$TMP/proj/.claude-team/agents/w1.md")" "0"
+# w1's --append-system-prompt now targets the injected temp copy; confirm the
+# actual file claude reads carries both the original text and the contract.
+W1_PROMPT_PATH=$(echo "$W1LINE" | sed -n "s/.*--append-system-prompt \"\$(cat '\([^']*\)').*/\1/p")
+check "w1 injected prompt carries original content" \
+  "$(cat "$W1_PROMPT_PATH" 2>/dev/null)" "you are worker one. reply OK."
+check "w1 injected prompt carries the deliverable contract" \
+  "$(cat "$W1_PROMPT_PATH" 2>/dev/null)" "DELIVERABLE CONTRACT"
 # Task 4: stop (needs a live workspace to pass the has-session gate)
 if command -v herdr >/dev/null && herdr status server 2>/dev/null | grep running >/dev/null; then
   herdr workspace create --label 'team-cttest' --no-focus >/dev/null 2>&1

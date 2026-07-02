@@ -329,6 +329,30 @@ resolve_prompt() {
   yellow "Warning: prompt not found: $relative (falling back to interactive)"
 }
 
+# Append the deliverable contract to a COPY of the prompt file (never in place).
+# Echoes the path to use (the copy, or the original when no deliverable).
+inject_contract() { # $1=prompt_file $2=agent $3=branch_pushed $4=check
+  local f="$1" name="$2" branch="$3" chk="$4"
+  [[ -z "$branch" && -z "$chk" ]] && { echo "$f"; return; }
+  # NOTE: trailing X's only — BSD/macOS mktemp (unlike GNU) does not expand
+  # a template that has a suffix (e.g. ".md") after the X run.
+  local out
+  out=$(mktemp "${TMPDIR:-/tmp}/ct-contract-${name}.XXXXXX") || { echo "$f"; return; }
+  [[ -n "$f" && -f "$f" ]] && cat "$f" > "$out"
+  {
+    echo ""
+    echo "DELIVERABLE CONTRACT: your task is complete only when:"
+    [[ -n "$branch" ]] && echo "- branch \`$branch\` is pushed to origin"
+    [[ -n "$chk" ]] && echo "- \`$chk\` exits clean (0) in your working directory"
+    echo "When all hold, state DELIVERABLE MET. If you cannot meet the contract,"
+    echo "state DELIVERABLE BLOCKED: followed by the reason. Any claim about"
+    echo "execution results (tests, builds, migrations) must include the raw"
+    echo "command output - summaries don't count; a claim contradicted by its"
+    echo "output is void."
+  } >> "$out"
+  echo "$out"
+}
+
 # --- Session naming ---
 
 session_name_from_path() {
@@ -689,6 +713,9 @@ cmd_spawn() {
     local runner model
     runner=$(yq -r ".agents[$i].runner // \"claude\"" "$config_file")
     model=$(yq -r ".agents[$i].model // \"\"" "$config_file")
+    local d_branch d_check
+    d_branch=$(yq -r ".agents[$i].deliverable.branch_pushed // \"\"" "$config_file")
+    d_check=$(yq -r ".agents[$i].deliverable.check // \"\"" "$config_file")
 
     case "$runner" in
       claude|pi) ;;
@@ -735,6 +762,12 @@ cmd_spawn() {
     else
       # No prompt — plain interactive
       dim "  [$name] no prompt (interactive)"
+    fi
+
+    if [[ -n "$d_branch" || -n "$d_check" ]]; then
+      final_prompt_file=$(inject_contract "$final_prompt_file" "$name" "$d_branch" "$d_check")
+      temp_files+=("$final_prompt_file")
+      dim "  deliverable contract injected for $name"
     fi
 
     # --- Show assembled prompt in verbose dry-run (v2 only — v1 prompts are already readable files) ---
