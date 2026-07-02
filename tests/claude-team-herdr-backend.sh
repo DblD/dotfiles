@@ -83,6 +83,9 @@ agents:
   - { name: mw, role: worker, runner: nosuchrunner, prompt: .claude-team/agents/mw.md,
       deliverable: { branch_pushed: agent/mw, check: "true" } }
 Y
+  WSID=$(herdr workspace list | yq -p json -r '.result.workspaces[] | select(.label=="team-mproj") | .workspace_id')
+  [ -n "$WSID" ] && herdr workspace close "$WSID" >/dev/null 2>&1
+
   "$CT" spawn "$TMP/mteam.yaml" --backend herdr >/dev/null 2>&1 || true
   Man="$MPROJ/.claude-team/manifest/team-mproj.json"
   check "manifest seeded"        "$(ls "$Man" 2>/dev/null)" "$Man"

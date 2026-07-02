@@ -360,24 +360,29 @@ manifest_seed() { # $1=session $2=project_path $3=config_file
   local dir="$2/${TEAM_DIR}/manifest"
   mkdir -p "$dir"
   MS_SESSION="$1" MS_PROJECT="$2" MS_CONFIG="$3" MS_OUT="$dir/$1.json" python3 - <<'PYEOF'
-import json, os, subprocess, tempfile
+import datetime, json, os, subprocess, tempfile
 cfg = os.environ["MS_CONFIG"]
-def yq(expr):
-    return subprocess.run(["yq", "-r", expr, cfg], capture_output=True, text=True).stdout.strip()
-n = int(yq(".agents | length") or 0)
+raw = subprocess.run(["yq", "-o=json", ".agents", cfg],
+                     capture_output=True, text=True, check=True)
+agent_list = json.loads(raw.stdout)
+if not agent_list:
+    raise SystemExit("manifest_seed: no agents parsed from config")
 agents = {}
-for i in range(n):
-    name = yq(f".agents[{i}].name")
-    if yq(f'.agents[{i}].role // "worker"') == "lead":
+for a in agent_list:
+    if a.get("role", "worker") == "lead":
         continue
-    branch = yq(f'.agents[{i}].deliverable.branch_pushed // ""')
-    check = yq(f'.agents[{i}].deliverable.check // ""')
+    name = a.get("name")
+    if not name:
+        raise SystemExit("manifest_seed: agent entry missing 'name' in config")
+    deliverable = a.get("deliverable") or {}
+    branch = deliverable.get("branch_pushed") or ""
+    check = deliverable.get("check") or ""
     agents[name] = {"state": "pending", "nudges": 0, "verifications": [],
                     "collected": False, "reaped": False, "work_dir": "",
                     "checks": {"branch_pushed": branch, "check": check}}
 doc = {"session": os.environ["MS_SESSION"], "config_path": os.path.abspath(cfg),
        "project": os.environ["MS_PROJECT"],
-       "spawned_at": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
+       "spawned_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
        "agents": agents}
 out = os.environ["MS_OUT"]
 fd, tmp = tempfile.mkstemp(dir=os.path.dirname(out))
