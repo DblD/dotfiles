@@ -68,6 +68,31 @@ check "w1 injected prompt carries original content" \
   "$(cat "$W1_PROMPT_PATH" 2>/dev/null)" "you are worker one. reply OK."
 check "w1 injected prompt carries the deliverable contract" \
   "$(cat "$W1_PROMPT_PATH" 2>/dev/null)" "DELIVERABLE CONTRACT"
+
+# --- verify: pure fixture (no herdr) ---
+VP="$TMP/vproj"; mkdir -p "$VP/.claude-team/manifest" "$TMP/bare.git"
+git init -q --bare "$TMP/bare.git"
+git init -q "$VP"; git -C "$VP" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+git -C "$VP" remote add origin "$TMP/bare.git"
+git -C "$VP" branch -q agent/ok && git -C "$VP" push -q origin agent/ok
+cat > "$VP/.claude-team/manifest/team-vproj.json" <<J
+{"session":"team-vproj","config_path":"none","project":"$VP","spawned_at":"t",
+ "agents":{
+  "good":{"state":"pending","nudges":0,"verifications":[],"collected":false,"reaped":false,
+          "work_dir":"$VP","checks":{"branch_pushed":"agent/ok","check":"true"}},
+  "bad": {"state":"pending","nudges":0,"verifications":[],"collected":false,"reaped":false,
+          "work_dir":"$VP","checks":{"branch_pushed":"agent/missing","check":"false"}}}}
+J
+VOUT=$(cd "$VP" && "$CT" verify vproj 2>&1); VRC=$?
+check "verify: good agent PASS"   "$VOUT" "good: PASS"
+check "verify: bad agent FAIL"    "$VOUT" "bad: FAIL"
+check "verify: teaching detail"   "$VOUT" "not found on origin"
+check_eq "verify: exit 1 on any unmet" "$VRC" "1"
+VJ=$(cd "$VP" && "$CT" verify vproj good --json 2>&1); VJRC=$?
+check "verify --json met"          "$VJ" '"met": true'
+check_eq "verify: exit 0 all met"  "$VJRC" "0"
+"$CT" verify nosuchsession >/dev/null 2>&1; check_eq "verify: exit 2 no manifest" "$?" "2"
+
 # Task 4: stop (needs a live workspace to pass the has-session gate)
 if command -v herdr >/dev/null && herdr status server 2>/dev/null | grep running >/dev/null; then
   # Task 2: manifest seeding at spawn — lead + unknown-runner worker so NOTHING

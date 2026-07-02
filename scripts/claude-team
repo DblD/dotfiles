@@ -217,6 +217,7 @@ Usage:
                                        for it to finish (idle)
   claude-team status [session]         One-glance table of agents, states, and
                                        status files (all team sessions, or one)
+  claude-team verify <session> [agent]  Check declared deliverables (pure, read-only)
   claude-team watch <session-name> [--reap]
                                        Supervise a team session (herdr): notify on
                                        blocked agents, collect finished output;
@@ -999,6 +1000,72 @@ cmd_cleanup() {
   green "Cleaned up $count worker windows from $session"
 }
 
+# --- Verify deliverables (pure: reads manifest, writes nothing) ---
+cmd_verify() {
+  local session="${1:-}" only_agent="${2:-}" as_json=false
+  [[ "${2:-}" == "--json" ]] && { as_json=true; only_agent=""; }
+  [[ "${3:-}" == "--json" ]] && as_json=true
+  # --json is a global flag: main()'s pre-dispatch parser strips it out of the
+  # positional args wherever it appears, so it never actually reaches here as
+  # $2/$3 in normal CLI use — fall back to the already-parsed global.
+  $JSON_OUT && as_json=true
+  [[ -z "$session" ]] && { red "usage: claude-team verify <session> [agent] [--json]"; exit 2; }
+  [[ "$session" != team-* ]] && session="team-${session}"
+  local man=""
+  for d in "$PWD" "$PWD/.."; do
+    [[ -f "$d/${TEAM_DIR}/manifest/${session}.json" ]] && { man="$d/${TEAM_DIR}/manifest/${session}.json"; break; }
+  done
+  [[ -z "$man" ]] && { red "no manifest for $session (looked in ./${TEAM_DIR}/manifest/)"; exit 2; }
+  CV_MAN="$man" CV_AGENT="$only_agent" CV_JSON="$as_json" python3 - <<'PYEOF'
+import json, os, subprocess, sys
+man = json.load(open(os.environ["CV_MAN"]))
+only, as_json = os.environ["CV_AGENT"], os.environ["CV_JSON"] == "true"
+worst = 0
+for name, a in man["agents"].items():
+    if only and name != only:
+        continue
+    checks, results, met = a.get("checks", {}), [], True
+    wd = a.get("work_dir") or man.get("project") or "."
+    b = checks.get("branch_pushed") or ""
+    if b:
+        try:
+            r = subprocess.run(["git", "-C", wd, "ls-remote", "origin", b],
+                               capture_output=True, text=True, timeout=60)
+            ok = bool(r.stdout.strip())
+            detail = ("branch %s is on origin" % b) if ok else \
+                     ("branch %s not found on origin - push it (git push -u origin %s)" % (b, b))
+        except subprocess.TimeoutExpired:
+            ok, detail = False, "git ls-remote timed out after 60s - is origin reachable?"
+        results.append({"type": "branch_pushed", "target": b, "ok": ok, "detail": detail})
+        met &= ok
+    c = checks.get("check") or ""
+    if c:
+        try:
+            r = subprocess.run(["bash", "-c", c], cwd=wd, capture_output=True,
+                               text=True, timeout=120)
+            ok = r.returncode == 0
+            tail = (r.stdout + r.stderr).strip().splitlines()[-1:] or [""]
+            detail = ("`%s` exited 0" % c) if ok else \
+                     ("`%s` exited %d in %s - last output: %s ; fix until it exits 0"
+                      % (c, r.returncode, wd, tail[0][:160]))
+        except subprocess.TimeoutExpired:
+            ok, detail = False, "`%s` timed out after 120s - make it faster or fix the hang" % c
+        results.append({"type": "check", "target": c, "ok": ok, "detail": detail})
+        met &= ok
+    if not checks.get("branch_pushed") and not checks.get("check"):
+        met = True  # no deliverable declared -> vacuously met, protocol inert
+    if as_json:
+        print(json.dumps({"agent": name, "met": met, "checks": results}))
+    else:
+        print("%s: %s" % (name, "PASS" if met else "FAIL"))
+        for r in results:
+            print("  [%s] %s" % ("ok" if r["ok"] else "XX", r["detail"]))
+    if not met:
+        worst = 1
+sys.exit(worst)
+PYEOF
+}
+
 # --- Status: one-glance table of agents and their states ---
 
 status_file_field() { # $1=project $2=agent -> **Status:** value from agents/<name>.md, or "-"
@@ -1324,6 +1391,9 @@ main() {
     tell)
       shift
       cmd_tell "$@"
+      ;;
+    verify)
+      cmd_verify "${2:-}" "${3:-}" "${4:-}"
       ;;
     status)
       cmd_status "${2:-}"
