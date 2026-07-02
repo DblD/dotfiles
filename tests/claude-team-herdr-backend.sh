@@ -261,12 +261,22 @@ J
   herdr pane report-agent "$NPANE" --source cttest --agent claude --state idle --seq 22 >/dev/null 2>&1
   sleep 4
   check "second nudge (own nudge not mistaken for BLOCKED)" "$(cat "$NP/.claude-team/manifest/team-nudgetest.json")" '"nudges": 2'
-  touch /tmp/ct-nudge-flag
-  herdr pane report-agent "$NPANE" --source cttest --agent claude --state working --seq 31 >/dev/null 2>&1
+  # third unmet cycle: nudges exhausted -> escalate to incomplete, never reap
+  herdr pane report-agent "$NPANE" --source cttest --agent claude --state working --seq 41 >/dev/null 2>&1
   sleep 1
-  herdr pane report-agent "$NPANE" --source cttest --agent claude --state idle --seq 32 >/dev/null 2>&1
+  herdr pane report-agent "$NPANE" --source cttest --agent claude --state idle --seq 42 >/dev/null 2>&1
   sleep 4
-  check "complete after flag" "$(cat "$NP/.claude-team/manifest/team-nudgetest.json")" '"state": "complete"'
+  check "escalated to incomplete" "$(cat "$NP/.claude-team/manifest/team-nudgetest.json")" '"state": "incomplete"'
+  check "escalation logged" "$(cat "$WOUT")" "escalated"
+  check "unmet worker not reaped" "$(herdr tab list --workspace "$NWS" | yq -p json -r '.result.tabs[].label')" "wnudge"
+  # met-beats-count recovery: verify runs BEFORE the nudge-count check, so a
+  # post-escalation cycle with the deliverable met must still reach complete.
+  touch /tmp/ct-nudge-flag
+  herdr pane report-agent "$NPANE" --source cttest --agent claude --state working --seq 51 >/dev/null 2>&1
+  sleep 1
+  herdr pane report-agent "$NPANE" --source cttest --agent claude --state idle --seq 52 >/dev/null 2>&1
+  sleep 4
+  check "complete after flag (post-escalation)" "$(cat "$NP/.claude-team/manifest/team-nudgetest.json")" '"state": "complete"'
   kill "$WPID" 2>/dev/null; wait "$WPID" 2>/dev/null; rm -f /tmp/ct-nudge-flag
   herdr workspace close "$NWS" >/dev/null 2>&1
 else

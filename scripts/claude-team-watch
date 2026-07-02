@@ -242,11 +242,11 @@ class Watcher:
     def nudge(self, pane_id, text):
         """Guaranteed-submitted instruction to the worker (send-text + enter)."""
         try:
-            subprocess.run([HERDR, "pane", "send-text", pane_id, text],
-                           capture_output=True, timeout=10, check=False)
-            subprocess.run([HERDR, "pane", "send-keys", pane_id, "enter"],
-                           capture_output=True, timeout=10, check=False)
-            return True
+            p1 = subprocess.run([HERDR, "pane", "send-text", pane_id, text],
+                                capture_output=True, timeout=10, check=False)
+            p2 = subprocess.run([HERDR, "pane", "send-keys", pane_id, "enter"],
+                                capture_output=True, timeout=10, check=False)
+            return p1.returncode == 0 and p2.returncode == 0
         except (OSError, subprocess.TimeoutExpired):
             return False
 
@@ -259,10 +259,13 @@ class Watcher:
             return False
         for line in p.stdout.splitlines():
             s = line.strip()
-            # ignore our own instructions echoed in the pane
+            # ignore our own instructions echoed in the pane (the only other
+            # lines carrying the phrase)
             if "DELIVERABLE UNMET" in s or "escalated to human" in s:
                 continue
-            if s.startswith("DELIVERABLE BLOCKED"):
+            # containment, not startswith: real agent output is prefixed
+            # (e.g. Claude Code's "⏺ ")
+            if "DELIVERABLE BLOCKED:" in s:
                 return True
         return False
 
@@ -276,9 +279,12 @@ class Watcher:
         self.sidebar(pane_id, "verifying…")
         v = self.run_verify(label)
         met = bool(v and v.get("met"))
+        detail = ("verify failed to run (infra/timeout) - not the worker's fault"
+                  if v is None else
+                  "; ".join(c["detail"] for c in v.get("checks", [])))
         agent.setdefault("verifications", []).append(
-            {"ts": datetime.now().astimezone().isoformat(timespec="seconds"), "met": met,
-             "detail": "; ".join(c["detail"] for c in (v or {}).get("checks", []))})
+            {"ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+             "met": met, "detail": detail})
         if met:
             agent["state"] = "complete"
             self.manifest_write(doc)
@@ -291,18 +297,29 @@ class Watcher:
             self.manifest_write(doc)
             self.sidebar(pane_id, "✗ %s — needs you" % agent["state"])
             self.notify_blocked(label, pane_id)
-            self.nudge(pane_id, "deliverable unmet after %d nudge(s) - escalated "
-                       "to human; stand by" % agent.get("nudges", 0))
-            self.emit("escalated", "%s: %s - needs you" % (label, agent["state"]),
+            if not self.nudge(pane_id, "deliverable unmet after %d nudge(s) - "
+                              "escalated to human; stand by"
+                              % agent.get("nudges", 0)):
+                self.emit("warn", "%s: nudge delivery failed - check the pane"
+                          % label, label=label)
+            self.emit("escalated",
+                      "%s: %s - escalated to human" % (label, agent["state"]),
                       label=label, state=agent["state"])
             return False  # never reap
         agent["nudges"] = agent.get("nudges", 0) + 1
         agent["state"] = "working"
         self.manifest_write(doc)
-        failing = "; ".join(c["detail"] for c in (v or {}).get("checks", [])
-                            if not c.get("ok")) or "deliverable checks failed"
-        self.nudge(pane_id, "DELIVERABLE UNMET: %s - finish the deliverable or "
-                   "state DELIVERABLE BLOCKED: <reason>" % failing)
+        if v is None:
+            failing = "deliverable verification could not run - retrying next idle"
+            nudge_text = failing
+        else:
+            failing = "; ".join(c["detail"] for c in v.get("checks", [])
+                                if not c.get("ok")) or "deliverable checks failed"
+            nudge_text = ("DELIVERABLE UNMET: %s - finish the deliverable or "
+                          "state DELIVERABLE BLOCKED: <reason>" % failing)
+        if not self.nudge(pane_id, nudge_text):
+            self.emit("warn", "%s: nudge delivery failed - check the pane"
+                      % label, label=label)
         self.sidebar(pane_id, "nudged ×%d" % agent["nudges"])
         self.emit("nudged", "%s: nudged (%d/%d): %s"
                   % (label, agent["nudges"], self.MAX_NUDGES, failing),
