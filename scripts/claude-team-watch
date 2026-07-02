@@ -297,6 +297,26 @@ class Watcher:
         checks = (agent or {}).get("checks", {})
         if not agent or not (checks.get("branch_pushed") or checks.get("check")):
             return True  # no deliverable declared -> protocol inert
+        if agent.get("state") in ("blocked", "incomplete"):
+            # ABSORBING terminal states: the escalation nudge provokes a worker
+            # reply, whose idle would otherwise re-escalate -> infinite loop of
+            # toasts/chimes (observed live 2026-07-02). Verify quietly so a met
+            # deliverable can still recover to complete; otherwise stay silent.
+            v = self.run_verify(label)
+            if v and v.get("met"):
+                agent["state"] = "complete"
+                agent.setdefault("verifications", []).append(
+                    {"ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+                     "met": True,
+                     "detail": "; ".join(c["detail"] for c in v.get("checks", []))})
+                self.manifest_write(doc)
+                self.sidebar(pane_id, "✓ complete")
+                self.emit("verified", "%s: deliverable met (recovered after "
+                          "escalation)" % label, label=label)
+                return True
+            self.emit("absorbed", "%s: still %s - staying quiet (escalated "
+                      "already)" % (label, agent["state"]), label=label)
+            return False
         self.sidebar(pane_id, "verifying…")
         v = self.run_verify(label)
         met = bool(v and v.get("met"))

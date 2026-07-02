@@ -376,8 +376,19 @@ J
   check "escalated to incomplete" "$(cat "$NP/.claude-team/manifest/team-nudgetest.json")" '"state": "incomplete"'
   check "escalation logged" "$(cat "$WOUT")" "escalated"
   check "unmet worker not reaped" "$(herdr tab list --workspace "$NWS" | yq -p json -r '.result.tabs[].label')" "wnudge"
+  # ABSORBING escalation: another unmet idle must NOT re-escalate (the
+  # escalation nudge provokes a worker reply -> without absorption this loops
+  # forever with toasts/chimes; observed live 2026-07-02).
+  herdr pane report-agent "$NPANE" --source cttest --agent claude --state working --seq 45 >/dev/null 2>&1
+  sleep 1
+  herdr pane report-agent "$NPANE" --source cttest --agent claude --state idle --seq 46 >/dev/null 2>&1
+  sleep 4
+  check_eq "escalation fired exactly once (absorbing)" \
+    "$(grep -c 'escalated to human' "$WOUT")" "1"
+  check "absorbed cycle logged" "$(cat "$WOUT")" "staying quiet"
   # met-beats-count recovery: verify runs BEFORE the nudge-count check, so a
-  # post-escalation cycle with the deliverable met must still reach complete.
+  # post-escalation cycle with the deliverable met must still reach complete
+  # (recovery now flows through the absorbing branch).
   touch /tmp/ct-nudge-flag
   herdr pane report-agent "$NPANE" --source cttest --agent claude --state working --seq 51 >/dev/null 2>&1
   sleep 1
