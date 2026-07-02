@@ -10,6 +10,9 @@ readonly TEMPLATES_DIR="${CONFIG_DIR}/_templates"
 readonly GLOBAL_FRAGMENTS_DIR="${CONFIG_DIR}/_fragments"
 readonly GLOBAL_PROFILES_DIR="${CONFIG_DIR}/_profiles"
 readonly TEAM_DIR=".claude-team"
+# Stable, purgeable home for inject_contract's temp prompt copies (never
+# cleaned up automatically — see the comment on inject_contract).
+readonly CONTRACT_TMPDIR="${TMPDIR:-/tmp}/claude-team-contracts"
 
 # Colors
 red()    { printf '\033[0;31m%s\033[0m\n' "$*"; }
@@ -345,13 +348,20 @@ resolve_prompt() {
 
 # Append the deliverable contract to a COPY of the prompt file (never in place).
 # Echoes the path to use (the copy, or the original when no deliverable).
+# These temp files are deliberately NOT deleted (see the temp_files note in
+# cmd_spawn: the worker `cat`s them after the launch command is sent, so a
+# cleanup-on-exit trap here would race that read). They're created under
+# CONTRACT_TMPDIR instead of loose in $TMPDIR so they're findable
+# (`ls "$CONTRACT_TMPDIR"`) and safe to `rm -rf` in bulk.
 inject_contract() { # $1=prompt_file $2=agent $3=branch_pushed $4=check
   local f="$1" name="$2" branch="$3" chk="$4"
   [[ -z "$branch" && -z "$chk" ]] && { echo "$f"; return; }
+  local dir="$CONTRACT_TMPDIR"
+  mkdir -p "$dir" 2>/dev/null || dir="${TMPDIR:-/tmp}"
   # NOTE: trailing X's only — BSD/macOS mktemp (unlike GNU) does not expand
   # a template that has a suffix (e.g. ".md") after the X run.
   local out
-  out=$(mktemp "${TMPDIR:-/tmp}/ct-contract-${name}.XXXXXX") || { echo "$f"; return; }
+  out=$(mktemp "${dir}/ct-contract-${name}.XXXXXX") || { echo "$f"; return; }
   [[ -n "$f" && -f "$f" ]] && cat "$f" > "$out"
   {
     echo ""
@@ -894,9 +904,11 @@ STATUSEOF
 
   # Note: temp files are intentionally NOT cleaned up here.
   # Claude reads them via $(cat ...) after tmux sends the command.
-  # They live in /tmp and will be cleaned up by the OS.
+  # Contract-injected copies live under "$CONTRACT_TMPDIR" (purge with
+  # `rm -rf "$CONTRACT_TMPDIR"` once every worker has picked up its prompt);
+  # everything else lives loose in $TMPDIR and is cleaned up by the OS.
   if [[ ${#temp_files[@]} -gt 0 ]]; then
-    dim "Temp prompt files (auto-cleaned by OS):"
+    dim "Temp prompt files (auto-cleaned by OS; contract copies under $CONTRACT_TMPDIR):"
     for tf in "${temp_files[@]}"; do
       dim "  $tf"
     done

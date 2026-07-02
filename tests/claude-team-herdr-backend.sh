@@ -25,6 +25,8 @@ agents:
       deliverable: { branch_pushed: agent/w1, check: "true" } }
   - { name: w2, role: worker, mode: interactive, runner: pi, model: rtx3090/Qwen3-14B-AWQ, prompt: .claude-team/agents/w1.md }
   - { name: w3, role: worker, mode: interactive, runner: bogus, prompt: .claude-team/agents/w1.md }
+  - { name: w4, role: worker, mode: interactive,
+      deliverable: { branch_pushed: agent/w4, check: "true" } }
 Y
 
 pass=0; fail=0
@@ -68,6 +70,17 @@ check "w1 injected prompt carries original content" \
   "$(cat "$W1_PROMPT_PATH" 2>/dev/null)" "you are worker one. reply OK."
 check "w1 injected prompt carries the deliverable contract" \
   "$(cat "$W1_PROMPT_PATH" 2>/dev/null)" "DELIVERABLE CONTRACT"
+# Contract-only agent: w4 declares a deliverable but has no prompt/task at
+# all — inject_contract must still produce a temp file (contract text only)
+# and the emitted command must carry it via --append-system-prompt, so a
+# promptless deliverable agent isn't launched with no contract at all.
+check "contract injected note for promptless w4" "$OUT" "deliverable contract injected for w4"
+W4LINE=$(echo "$OUT" | grep -F "pane run <pane:w4>")
+check "w4 (promptless) gets --append-system-prompt" "$W4LINE" "--append-system-prompt \"\$(cat '"
+W4_PROMPT_PATH=$(echo "$W4LINE" | sed -n "s/.*--append-system-prompt \"\$(cat '\([^']*\)').*/\1/p")
+check "w4 contract-only file exists" "$([ -f "$W4_PROMPT_PATH" ] && echo yes)" "yes"
+check "w4 contract-only file carries the deliverable contract" \
+  "$(cat "$W4_PROMPT_PATH" 2>/dev/null)" "DELIVERABLE CONTRACT"
 
 # --- verify: pure fixture (no herdr) ---
 VP="$TMP/vproj"; mkdir -p "$VP/.claude-team/manifest" "$TMP/bare.git"
