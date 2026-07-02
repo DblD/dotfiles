@@ -1,0 +1,504 @@
+#!/usr/bin/env python3
+"""claude-team-watch -- supervisor for a claude-team herdr session.
+
+Connects to the herdr unix socket, subscribes to agent-status / pane / tab
+events for the workspace whose label matches the given session, and:
+  * notifies (herdr notification show) when an agent goes blocked
+  * collects a finished agent's recent output into <project>/.claude-team/results/
+  * prints every state transition as a compact timestamped line (--json for JSONL)
+  * completion protocol: when an agent with a declared deliverable (manifest
+    checks) finishes, runs `claude-team verify` first; unmet -> nudge the agent
+    back to work (max 2), then escalate to the human. Collect/reap only after
+    the deliverable verifies. Watch owns all manifest writes after seeding.
+
+Stdlib only. Invoked by `claude-team watch <session>` (which exports
+CLAUDE_TEAM_BIN so verify can be shelled out to).
+v1 constraint: run_verify() is called synchronously from the single event
+loop (handle() -> protocol_on_finished()), so a slow deliverable check
+(subprocess timeout up to 120s, plus the branch_pushed ls-remote) blocks
+delivery of every other event for up to ~3 minutes worst case. Fine for a
+handful of agents; would need a worker pool for larger teams.
+Protocol notes (verified against herdr 0.7.1 / protocol 14):
+  * RPC connections are one-shot: the server closes after one reply.
+  * events.subscribe holds its connection open and streams NDJSON events.
+  * Subscribing replays historical pane/tab created events, so re-subscribe
+    triggers are guarded by known pane/tab sets.
+"""
+
+import json
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+DEFAULT_SOCKET = os.path.expanduser("~/.config/herdr/herdr.sock")
+HERDR = os.environ.get("HERDR_BIN") or shutil.which("herdr") \
+    or "/opt/homebrew/opt/herdr/bin/herdr"
+USAGE = """usage: claude-team-watch <session> [--socket PATH] [--json] [--reap]
+
+Supervise a claude-team herdr session (session = workspace label):
+print agent state transitions, notify when an agent blocks, and collect
+output into <project>/.claude-team/results/ when an agent finishes.
+Agents with a declared deliverable are verify-gated: unmet deliverables
+get nudged (max 2) then escalated; collection waits for verification.
+
+--reap: after a finished agent's output is collected, close its tab
+(never the tab labelled 'lead'). Default off.
+"""
+
+
+class Watcher:
+    def __init__(self, session, sock_path, as_json, reap=False):
+        self.session = session
+        self.sock_path = sock_path
+        self.as_json = as_json
+        self.reap = reap          # close a worker's tab once output collected
+        self.ws = None            # workspace id once resolved
+        self.project = None       # workspace cwd (lead/root pane)
+        self.last_status = {}     # pane_id -> last agent_status
+        self.pane_tab = {}        # pane_id -> tab_id
+        self.tab_label = {}       # tab_id -> label
+
+    # ---- output -----------------------------------------------------------
+    def emit(self, event, message, **extra):
+        now = datetime.now()
+        if self.as_json:
+            rec = {"ts": now.isoformat(timespec="seconds"),
+                   "session": self.session, "event": event, "message": message}
+            rec.update(extra)
+            print(json.dumps(rec), flush=True)
+        else:
+            print("[%s] %s" % (now.strftime("%H:%M:%S"), message), flush=True)
+
+    # ---- herdr plumbing ----------------------------------------------------
+    def rpc(self, method, params):
+        """One request per connection -- herdr closes the socket after a reply."""
+        s = socket.socket(socket.AF_UNIX)
+        try:
+            s.connect(self.sock_path)
+            req = {"id": "ct-watch", "method": method, "params": params}
+            s.sendall((json.dumps(req) + "\n").encode())
+            buf = b""
+            while b"\n" not in buf:
+                d = s.recv(65536)
+                if not d:
+                    break
+                buf += d
+        finally:
+            s.close()
+        obj = json.loads(buf.split(b"\n", 1)[0]) if buf.strip() else {}
+        if "error" in obj:
+            raise RuntimeError(obj["error"].get("message", "rpc error"))
+        return obj.get("result", {})
+
+    def refresh(self):
+        """Resolve workspace + pane/tab maps; returns the pane list."""
+        workspaces = self.rpc("workspace.list", {}).get("workspaces", [])
+        ws = next((w["workspace_id"] for w in workspaces
+                   if w.get("label") == self.session), None)
+        if not ws:
+            if self.ws:  # was watching it and it went away
+                self.emit("closed", "workspace '%s' closed, exiting" % self.session)
+                sys.exit(0)
+            raise RuntimeError("no herdr workspace labelled '%s'" % self.session)
+        self.ws = ws
+        panes = self.rpc("pane.list", {"workspace_id": ws}).get("panes", [])
+        tabs = self.rpc("tab.list", {"workspace_id": ws}).get("tabs", [])
+        self.pane_tab = {p["pane_id"]: p.get("tab_id") for p in panes}
+        self.tab_label = {t["tab_id"]: (t.get("label") or t["tab_id"]) for t in tabs}
+        if self.project is None and panes:
+            lead = [p for p in panes if self.tab_label.get(p.get("tab_id")) == "lead"]
+            self.project = (lead or panes)[0].get("cwd")
+        return panes
+
+    def in_ws(self, item_id):  # pane/tab ids are "<ws>:pN" / "<ws>:tN"
+        return bool(item_id) and item_id.startswith(self.ws + ":")
+
+    def label_for(self, pane_id):
+        if pane_id not in self.pane_tab:
+            try:
+                self.refresh()
+            except (OSError, RuntimeError, json.JSONDecodeError):
+                pass
+        return self.tab_label.get(self.pane_tab.get(pane_id), pane_id)
+
+    # ---- event actions -----------------------------------------------------
+    def notify_blocked(self, label, pane_id):
+        title = "%s: %s needs you" % (self.session, label)
+        try:
+            subprocess.run([HERDR, "notification", "show", title,
+                            "--sound", "request"],
+                           capture_output=True, timeout=10, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        self.emit("blocked", "%s needs you (blocked)" % label,
+                  label=label, pane=pane_id)
+
+    def collect(self, label, pane_id):
+        """Save the pane's recent output to results/; True on success."""
+        out = ""
+        for source in ("recent-unwrapped", "visible"):
+            try:
+                p = subprocess.run(
+                    [HERDR, "pane", "read", pane_id, "--source", source,
+                     "--lines", "120"],
+                    capture_output=True, text=True, timeout=10, check=False)
+                out = p.stdout
+            except (OSError, subprocess.TimeoutExpired):
+                out = ""
+            if out.strip():
+                break
+        if not self.project:
+            self.emit("warn", "%s: no project dir known, output not saved" % label)
+            return False
+        results = os.path.join(self.project, ".claude-team", "results")
+        try:
+            os.makedirs(results, exist_ok=True)
+            path = os.path.join(results, "%s.md" % label.replace(os.sep, "-"))
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("\n## %s -- %s / %s\n\n```\n%s\n```\n"
+                        % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                           self.session, label, out.rstrip()))
+        except OSError as e:
+            self.emit("warn", "%s: could not save output (%s)" % (label, e))
+            return False
+        self.emit("collected", "%s: output -> %s" % (label, path),
+                  label=label, pane=pane_id, path=path)
+        return True
+
+    def reap_tab(self, label, pane_id):
+        """Close a finished worker's tab (--reap). Never the lead tab.
+        Returns True when the tab was closed."""
+        tab = self.pane_tab.get(pane_id)
+        if not tab:
+            return False
+        if label == "lead" or self.tab_label.get(tab) == "lead":
+            return False
+        try:
+            subprocess.run([HERDR, "tab", "close", tab],
+                           capture_output=True, timeout=10, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        self.emit("reaped", "%s: reaped" % label,
+                  label=label, pane=pane_id, tab=tab)
+        return True
+
+    # ---- completion protocol ------------------------------------------------
+    MAX_NUDGES = 2
+
+    def manifest_path(self):
+        if not self.project:
+            return None
+        return os.path.join(self.project, ".claude-team", "manifest",
+                            "%s.json" % self.session)
+
+    def manifest(self):
+        p = self.manifest_path()
+        if not p or not os.path.exists(p):
+            return None
+        try:
+            return json.load(open(p))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def manifest_write(self, doc):
+        p = self.manifest_path()
+        if not p:
+            return
+        import tempfile
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p))
+        with os.fdopen(fd, "w") as f:
+            json.dump(doc, f, indent=2)
+        os.replace(tmp, p)
+
+    def manifest_mark(self, label, field):
+        """Best-effort: set agents[label][field] = True (collected/reaped).
+        Skips silently when there is no manifest or no entry for the agent
+        (no-deliverable agents may have none); never breaks the event loop."""
+        try:
+            doc = self.manifest()
+            agent = (doc or {}).get("agents", {}).get(label)
+            if not isinstance(agent, dict):
+                return
+            agent[field] = True
+            self.manifest_write(doc)
+        except (OSError, ValueError, TypeError):
+            pass
+
+    def run_verify(self, label):
+        """`claude-team verify <session> <label> --json` in the project dir.
+        rc==2 means manifest/agent not found (stdout is human text, NOT json)."""
+        ct = os.environ.get("CLAUDE_TEAM_BIN", "claude-team")
+        try:
+            p = subprocess.run([ct, "verify", self.session, label, "--json"],
+                               cwd=self.project, capture_output=True, text=True,
+                               timeout=180)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if p.returncode == 2:
+            return None
+        for line in p.stdout.splitlines():
+            try:
+                obj = json.loads(line)
+                if obj.get("agent") == label:
+                    return obj
+            except json.JSONDecodeError:
+                continue
+        return None
+
+    def sidebar(self, pane_id, text):
+        """Best-effort protocol status on the worker's pane (never raises)."""
+        try:
+            subprocess.run([HERDR, "pane", "report-metadata", pane_id,
+                            "--source", "claude-team-watch",
+                            "--custom-status", text],
+                           capture_output=True, timeout=10, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    def nudge(self, pane_id, text):
+        """Guaranteed-submitted instruction to the worker (send-text + enter)."""
+        try:
+            p1 = subprocess.run([HERDR, "pane", "send-text", pane_id, text],
+                                capture_output=True, timeout=10, check=False)
+            p2 = subprocess.run([HERDR, "pane", "send-keys", pane_id, "enter"],
+                                capture_output=True, timeout=10, check=False)
+            return p1.returncode == 0 and p2.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+
+    def pane_blocked_sentinel(self, pane_id):
+        try:
+            p = subprocess.run([HERDR, "pane", "read", pane_id, "--source",
+                                "recent-unwrapped", "--lines", "60"],
+                               capture_output=True, text=True, timeout=10, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        for line in p.stdout.splitlines():
+            s = line.strip()
+            # ignore our own instructions echoed in the pane (the only other
+            # lines carrying the phrase)
+            if "DELIVERABLE UNMET" in s or "escalated to human" in s:
+                continue
+            # containment, not startswith: real agent output is prefixed
+            # (e.g. Claude Code's "⏺ ")
+            if "DELIVERABLE BLOCKED:" in s:
+                return True
+        return False
+
+    def protocol_on_finished(self, label, pane_id):
+        """Verify-gated completion. Returns True when collect/reap may proceed."""
+        doc = self.manifest()
+        agent = (doc or {}).get("agents", {}).get(label)
+        checks = (agent or {}).get("checks", {})
+        if not agent or not (checks.get("branch_pushed") or checks.get("check")):
+            return True  # no deliverable declared -> protocol inert
+        if agent.get("state") in ("blocked", "incomplete"):
+            # ABSORBING terminal states: the escalation nudge provokes a worker
+            # reply, whose idle would otherwise re-escalate -> infinite loop of
+            # toasts/chimes (observed live 2026-07-02). Verify quietly so a met
+            # deliverable can still recover to complete; otherwise stay silent.
+            v = self.run_verify(label)
+            if v and v.get("met"):
+                agent["state"] = "complete"
+                agent.setdefault("verifications", []).append(
+                    {"ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+                     "met": True,
+                     "detail": "; ".join(c["detail"] for c in v.get("checks", []))})
+                self.manifest_write(doc)
+                self.sidebar(pane_id, "✓ complete")
+                self.emit("verified", "%s: deliverable met (recovered after "
+                          "escalation)" % label, label=label)
+                return True
+            self.emit("absorbed", "%s: still %s - staying quiet (escalated "
+                      "already)" % (label, agent["state"]), label=label)
+            return False
+        self.sidebar(pane_id, "verifying…")
+        v = self.run_verify(label)
+        met = bool(v and v.get("met"))
+        detail = ("verify failed to run (infra/timeout) - not the worker's fault"
+                  if v is None else
+                  "; ".join(c["detail"] for c in v.get("checks", [])))
+        agent.setdefault("verifications", []).append(
+            {"ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+             "met": met, "detail": detail})
+        if met:
+            agent["state"] = "complete"
+            self.manifest_write(doc)
+            self.sidebar(pane_id, "✓ complete")
+            self.emit("verified", "%s: deliverable met" % label, label=label)
+            return True
+        blocked = self.pane_blocked_sentinel(pane_id)
+        if blocked or agent.get("nudges", 0) >= self.MAX_NUDGES:
+            agent["state"] = "blocked" if blocked else "incomplete"
+            self.manifest_write(doc)
+            self.sidebar(pane_id, "✗ %s — needs you" % agent["state"])
+            self.notify_blocked(label, pane_id)
+            if not self.nudge(pane_id, "deliverable unmet after %d nudge(s) - "
+                              "escalated to human; stand by"
+                              % agent.get("nudges", 0)):
+                self.emit("warn", "%s: nudge delivery failed - check the pane"
+                          % label, label=label)
+            self.emit("escalated",
+                      "%s: %s - escalated to human" % (label, agent["state"]),
+                      label=label, state=agent["state"])
+            return False  # never reap
+        agent["nudges"] = agent.get("nudges", 0) + 1
+        agent["state"] = "working"
+        self.manifest_write(doc)
+        if v is None:
+            failing = "deliverable verification could not run - retrying next idle"
+            nudge_text = failing
+        else:
+            failing = "; ".join(c["detail"] for c in v.get("checks", [])
+                                if not c.get("ok")) or "deliverable checks failed"
+            nudge_text = ("DELIVERABLE UNMET: %s - finish the deliverable or "
+                          "state DELIVERABLE BLOCKED: <reason>" % failing)
+        if not self.nudge(pane_id, nudge_text):
+            self.emit("warn", "%s: nudge delivery failed - check the pane"
+                      % label, label=label)
+        self.sidebar(pane_id, "nudged ×%d" % agent["nudges"])
+        self.emit("nudged", "%s: nudged (%d/%d): %s"
+                  % (label, agent["nudges"], self.MAX_NUDGES, failing),
+                  label=label, nudges=agent["nudges"])
+        return False  # not complete yet; await next idle
+
+    # ---- event dispatch ----------------------------------------------------
+    def handle(self, obj, subscribed_panes, known_tabs):
+        """Returns True when a re-subscribe (fresh connection) is needed."""
+        data = obj.get("data") or {}
+        ev = (obj.get("event") or data.get("type") or "").replace(".", "_")
+
+        # agent status change (agent panes only: events carrying agent/status)
+        if data.get("agent_status") and data.get("pane_id"):
+            pane, status = data["pane_id"], data["agent_status"]
+            if not self.in_ws(pane):
+                return False
+            prev = self.last_status.get(pane)
+            if status == prev:
+                return False
+            self.last_status[pane] = status
+            label = self.label_for(pane)
+            self.emit("status", "%s: %s -> %s" % (label, prev or "unknown", status),
+                      label=label, pane=pane, status=status, prev=prev)
+            if status == "blocked":
+                self.notify_blocked(label, pane)
+            elif status in ("idle", "done") and prev == "working":
+                self.emit("finished", "%s: finished" % label, label=label, pane=pane)
+                if self.protocol_on_finished(label, pane):
+                    collected = self.collect(label, pane)
+                    if collected:
+                        self.manifest_mark(label, "collected")
+                    if self.reap and collected:
+                        if self.reap_tab(label, pane):
+                            self.manifest_mark(label, "reaped")
+            return False
+
+        pane = data.get("pane_id") or (data.get("pane") or {}).get("pane_id")
+        tab = data.get("tab_id") or (data.get("tab") or {}).get("tab_id")
+        if ev in ("pane_exited", "pane_closed") and self.in_ws(pane):
+            label = self.label_for(pane)
+            what = "pane exited" if ev == "pane_exited" else "pane closed"
+            self.emit(ev, "%s: %s" % (label, what), label=label, pane=pane)
+            return False
+        # new pane/tab in our workspace -> re-subscribe so it gets status events
+        # (guarded: subscribing replays historical created events)
+        if ev == "pane_created" and self.in_ws(pane) and pane not in subscribed_panes:
+            self.emit("resubscribe", "new pane %s, re-subscribing" % pane, pane=pane)
+            return True
+        if ev == "tab_created" and self.in_ws(tab) and tab not in known_tabs:
+            self.emit("resubscribe", "new tab %s, re-subscribing" % tab, tab=tab)
+            return True
+        if ev == "tab_closed" and self.in_ws(tab):
+            self.emit(ev, "%s: tab closed" % self.tab_label.get(tab, tab), tab=tab)
+        return False
+
+    # ---- main loops ----------------------------------------------------------
+    def watch_once(self):
+        """One subscribe connection; returns when a re-subscribe is needed."""
+        panes = self.refresh()
+        subscribed = set(self.pane_tab)
+        known_tabs = set(self.tab_label)
+        subs = [{"type": "pane.agent_status_changed", "pane_id": p["pane_id"]}
+                for p in panes]
+        subs += [{"type": t} for t in ("pane.created", "pane.closed", "pane.exited",
+                                       "tab.created", "tab.closed")]
+        s = socket.socket(socket.AF_UNIX)
+        try:
+            s.connect(self.sock_path)
+            s.sendall((json.dumps({"id": "watch", "method": "events.subscribe",
+                                   "params": {"subscriptions": subs}}) + "\n").encode())
+            self.emit("watching", "watching %s (%s): %d pane(s)"
+                      % (self.session, self.ws, len(panes)),
+                      workspace=self.ws, panes=sorted(subscribed))
+            buf = b""
+            while True:  # raw recv loop (makefile buffering drops events)
+                d = s.recv(65536)
+                if not d:
+                    raise ConnectionError("event socket closed")
+                buf += d
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    if not line.strip():
+                        continue
+                    obj = json.loads(line)
+                    if "result" in obj:  # subscription_started ack
+                        continue
+                    if self.handle(obj, subscribed, known_tabs):
+                        return
+        finally:
+            s.close()
+
+    def run(self):
+        first = True
+        while True:
+            try:
+                # watch_once refreshes state itself; it exits 0 if the
+                # workspace disappears after we started watching it.
+                self.watch_once()   # returned -> re-subscribe immediately
+            except (OSError, ConnectionError, RuntimeError,
+                    json.JSONDecodeError) as e:
+                if first:
+                    print("claude-team-watch: %s" % e, file=sys.stderr)
+                    sys.exit(1)
+                self.emit("reconnect", "connection lost (%s); retrying in 2s" % e)
+                time.sleep(2)
+            first = False
+
+
+def main(argv):
+    session, as_json, reap = None, False, False
+    sock = os.environ.get("HERDR_SOCKET_PATH", DEFAULT_SOCKET)
+    args = iter(argv)
+    for a in args:
+        if a in ("-h", "--help"):
+            sys.stderr.write(USAGE)
+            return 2
+        if a == "--socket":
+            sock = next(args, "") or sock
+        elif a == "--json":
+            as_json = True
+        elif a == "--reap":
+            reap = True
+        elif a.startswith("-"):
+            sys.stderr.write("unknown option: %s\n%s" % (a, USAGE))
+            return 2
+        elif session is None:
+            session = a
+    if not session:
+        sys.stderr.write(USAGE)
+        return 2
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    try:
+        Watcher(session, sock, as_json, reap).run()
+    except KeyboardInterrupt:
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
