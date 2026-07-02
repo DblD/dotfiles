@@ -1028,9 +1028,7 @@ cmd_verify() {
   [[ -z "$session" ]] && { red "usage: claude-team verify <session> [agent] [--json]"; exit 2; }
   [[ "$session" != team-* ]] && session="team-${session}"
   local man=""
-  for d in "$PWD" "$PWD/.."; do
-    [[ -f "$d/${TEAM_DIR}/manifest/${session}.json" ]] && { man="$d/${TEAM_DIR}/manifest/${session}.json"; break; }
-  done
+  man=$(manifest_path_for "$session") || true
   [[ -z "$man" ]] && { red "no manifest for $session (looked in ./${TEAM_DIR}/manifest/)"; exit 2; }
   CV_MAN="$man" CV_AGENT="$only_agent" CV_JSON="$as_json" CV_SESSION="$session" python3 - <<'PYEOF'
 import json, os, subprocess, sys
@@ -1104,10 +1102,13 @@ results_field() { # $1=project $2=agent -> "yes" if results/<name>.md exists, el
 }
 
 # Manifest lookup for a session (same convention as cmd_verify): project-local
-# first, then one directory up. Echoes the path, or nothing (rc=1) if absent.
-manifest_path_for() { # $1=session
-  local session="$1" d
-  for d in "$PWD" "$PWD/.."; do
+# first, then one directory up, then an optional caller-supplied extra dir
+# (e.g. a project path already resolved from the workspace/pane cwd, used to
+# retry when $PWD isn't the project root). Echoes the path, or nothing
+# (rc=1) if absent.
+manifest_path_for() { # $1=session $2=extra_dir (optional)
+  local session="$1" extra="${2:-}" d
+  for d in "$PWD" "$PWD/.." ${extra:+"$extra"}; do
     if [[ -f "$d/${TEAM_DIR}/manifest/${session}.json" ]]; then
       echo "$d/${TEAM_DIR}/manifest/${session}.json"
       return 0
@@ -1119,12 +1120,18 @@ manifest_path_for() { # $1=session
 # $1=manifest_path -> "<agent>\t<deliverable>\t<protocol>" per line.
 # deliverable: met/unmet from the LAST entry of verifications, "-" if none.
 # protocol: manifest state; "nudged xN" when state=="working" and nudges>0; "-" if absent.
+# Resilient to a corrupt/truncated manifest: prints nothing and exits nonzero
+# (caller degrades to "-" columns + a warning) rather than letting an
+# unhandled json.load exception kill the whole script under set -euo pipefail.
 manifest_columns() {
   local man="$1"
   [[ -f "$man" ]] || return 0
   MCOL_MAN="$man" python3 - <<'PYEOF'
-import json, os
-doc = json.load(open(os.environ["MCOL_MAN"]))
+import json, os, sys
+try:
+    doc = json.load(open(os.environ["MCOL_MAN"]))
+except (OSError, ValueError):
+    sys.exit(1)
 for name, a in doc.get("agents", {}).items():
     verifications = a.get("verifications") or []
     if verifications:
@@ -1175,14 +1182,6 @@ status_one_session() { # $1=session — print the agent table for one session
   local session="$1"
   local fmt='  %-16s %-10s %-14s %-24s %-8s %-12s %s\n'
   bold "$session"
-  local man mc_lines="" vc_lines=""
-  man=$(manifest_path_for "$session") || true
-  [[ -n "$man" ]] && mc_lines=$(manifest_columns "$man")
-  if $VERIFY_STATUS && [[ -n "$man" ]]; then
-    local verify_json
-    verify_json=$(cmd_verify "$session" --json 2>/dev/null) || true
-    vc_lines=$(verify_columns "$verify_json")
-  fi
   case "$BACKEND" in
     herdr)
       local ws panes project
@@ -1191,6 +1190,19 @@ status_one_session() { # $1=session — print the agent table for one session
       panes=$("$HERDR_BIN" pane list --workspace "$ws" 2>/dev/null)
       # project = cwd of the workspace root pane (first pane in list)
       project=$(echo "$panes" | yq -p json -r '.result.panes[0].cwd // ""')
+      # Manifest lookup: $PWD first (via manifest_path_for's own convention),
+      # then retry against the workspace root pane's cwd — covers the common
+      # case where status is invoked from outside the project directory.
+      local man mc_lines="" vc_lines=""
+      man=$(manifest_path_for "$session" "$project") || true
+      if [[ -n "$man" ]]; then
+        mc_lines=$(manifest_columns "$man") || { yellow "warning: unreadable manifest for $session"; mc_lines=""; }
+      fi
+      if $VERIFY_STATUS && [[ -n "$man" ]]; then
+        local verify_json
+        verify_json=$(cmd_verify "$session" --json 2>/dev/null) || true
+        vc_lines=$(verify_columns "$verify_json")
+      fi
       # shellcheck disable=SC2059
       printf "$fmt" "AGENT" "STATE" "PANE" "STATUS-FILE" "RESULTS" "DELIVERABLE" "PROTOCOL"
       local tab_id label pane state deliverable protocol
@@ -1219,6 +1231,18 @@ status_one_session() { # $1=session — print the agent table for one session
       tmux has-session -t "$session" 2>/dev/null || { yellow "  session not found: $session"; return 0; }
       local project window deliverable protocol
       project=$(tmux display-message -p -t "$session" '#{pane_current_path}' 2>/dev/null || true)
+      # Manifest lookup: $PWD first, then retry against the session's pane
+      # cwd — covers status invoked from outside the project directory.
+      local man mc_lines="" vc_lines=""
+      man=$(manifest_path_for "$session" "$project") || true
+      if [[ -n "$man" ]]; then
+        mc_lines=$(manifest_columns "$man") || { yellow "warning: unreadable manifest for $session"; mc_lines=""; }
+      fi
+      if $VERIFY_STATUS && [[ -n "$man" ]]; then
+        local verify_json
+        verify_json=$(cmd_verify "$session" --json 2>/dev/null) || true
+        vc_lines=$(verify_columns "$verify_json")
+      fi
       # shellcheck disable=SC2059
       printf "$fmt" "AGENT" "STATE" "PANE" "STATUS-FILE" "RESULTS" "DELIVERABLE" "PROTOCOL"
       while IFS= read -r window; do
@@ -1242,21 +1266,32 @@ status_one_session() { # $1=session — print the agent table for one session
 
 # Manifest-only fallback: no live workspace/tmux session for $1, but a manifest
 # exists at $2. Prints the session header + one row per manifest agent with
-# STATE "-" (there is no live pane/window to read a state from).
+# STATE "-" (there is no live pane/window to read a state from). Resilient to
+# a corrupt/truncated manifest: degrades to a warning + header-only table
+# (rc 0) instead of dying under set -euo pipefail.
 status_manifest_only() { # $1=session $2=manifest_path
   local session="$1" man="$2"
-  local project
+  local project rc=0
   project=$(SM_MAN="$man" python3 - <<'PYEOF'
-import json, os
-print(json.load(open(os.environ["SM_MAN"])).get("project", ""))
+import json, os, sys
+try:
+    doc = json.load(open(os.environ["SM_MAN"]))
+except (OSError, ValueError):
+    sys.exit(1)
+print(doc.get("project", ""))
 PYEOF
-)
+) || rc=$?
   local fmt='  %-16s %-10s %-14s %-24s %-8s %-12s %s\n'
   bold "$session"
+  [[ $rc -ne 0 ]] && yellow "warning: unreadable manifest for $session"
   # shellcheck disable=SC2059
   printf "$fmt" "AGENT" "STATE" "PANE" "STATUS-FILE" "RESULTS" "DELIVERABLE" "PROTOCOL"
+  if [[ $rc -ne 0 ]]; then
+    echo ""
+    return 0
+  fi
   local mc_lines vc_lines="" name deliverable protocol
-  mc_lines=$(manifest_columns "$man")
+  mc_lines=$(manifest_columns "$man") || mc_lines=""
   if $VERIFY_STATUS; then
     local verify_json
     verify_json=$(cmd_verify "$session" --json 2>/dev/null) || true

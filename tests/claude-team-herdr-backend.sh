@@ -107,8 +107,34 @@ SOUT=$(cd "$VP" && "$CT" status vproj 2>&1 || true)
 check "status shows PROTOCOL column" "$SOUT" "PROTOCOL"
 check "status shows pending state"   "$SOUT" "pending"
 
+# Row-anchored: "met" is a substring of "unmet", so pin each row individually
+# rather than grepping the whole table for "met" (that would pass even if
+# every row showed "unmet").
 SVOUT=$(cd "$VP" && "$CT" status vproj --verify 2>&1 || true)
-check "status --verify live-checks deliverable" "$SVOUT" "met"
+check "status --verify good row met"   "$(echo "$SVOUT" | grep -E '^\s*good\b')" " met"
+check "status --verify bad row unmet"  "$(echo "$SVOUT" | grep -E '^\s*bad\b')" "unmet"
+
+# --- rendering pins: nudged xN + manifest-recorded "met" on the same agent ---
+# Separate small fixture (not mixed into vproj's good/bad/vac set, which
+# `verify` iterates and whose exit-code invariants shouldn't shift).
+cat > "$VP/.claude-team/manifest/team-vproj2.json" <<J
+{"session":"team-vproj2","config_path":"none","project":"$VP","spawned_at":"t",
+ "agents":{
+  "nud": {"state":"working","nudges":2,
+          "verifications":[{"ts":"t1","met":false,"detail":"first"},{"ts":"t2","met":true,"detail":"second"}],
+          "collected":false,"reaped":false,"work_dir":"$VP","checks":{"branch_pushed":"","check":""}}}}
+J
+NSOUT=$(cd "$VP" && "$CT" status vproj2 2>&1 || true)
+check "status renders nudged xN (working+nudges)" "$(echo "$NSOUT" | grep -E '^\s*nud\b')" "nudged x2"
+check "status renders met from manifest's last verification" "$(echo "$NSOUT" | grep -E '^\s*nud\b')" " met"
+
+# --- corrupt-manifest resilience: status must degrade, never die under -euo pipefail ---
+CP="$TMP/corruptproj"; mkdir -p "$CP/.claude-team/manifest"
+printf '{"session":"team-corrupt","config_path":"none","proje' > "$CP/.claude-team/manifest/team-corrupt.json"
+COUT=$(cd "$CP" && "$CT" status corrupt 2>&1); CRC=$?
+check_eq "status on truncated manifest exits 0" "$CRC" "0"
+check "status on truncated manifest prints session table" "$COUT" "team-corrupt"
+check "status on truncated manifest warns"        "$COUT" "warning: unreadable manifest for team-corrupt"
 
 # Task 4: stop (needs a live workspace to pass the has-session gate)
 if command -v herdr >/dev/null && herdr status server 2>/dev/null | grep running >/dev/null; then
@@ -180,6 +206,51 @@ if command -v herdr >/dev/null && herdr status server 2>/dev/null | grep running
   fi
 else
   echo "  skip: status live test (no herdr server)"
+fi
+
+# --- status: manifest project-path retry (live session, $PWD lookup deliberately misses) ---
+if command -v herdr >/dev/null && herdr status server 2>/dev/null | grep running >/dev/null; then
+  RTP="$TMP/retryproj"; mkdir -p "$RTP/.claude-team/manifest"
+  cat > "$RTP/.claude-team/manifest/team-retrytest.json" <<J
+{"session":"team-retrytest","config_path":"none","project":"$RTP","spawned_at":"t",
+ "agents":{"w1":{"state":"pending","nudges":0,"verifications":[],"collected":false,"reaped":false,
+  "work_dir":"$RTP","checks":{"branch_pushed":"","check":""}}}}
+J
+  RJ=$(herdr workspace create --cwd "$RTP" --label 'team-retrytest' --no-focus 2>/dev/null)
+  RWS=$(echo "$RJ" | yq -p json -r '.result.workspace.workspace_id')
+  if [ -n "$RWS" ] && [ "$RWS" != "null" ]; then
+    herdr tab create --workspace "$RWS" --cwd "$RTP" --label w1 --no-focus >/dev/null 2>&1
+    # run from $TMP (not $RTP, not $RTP/..) so the plain $PWD lookup misses and
+    # the retry against the workspace root pane's cwd is what finds the manifest
+    ROUT=$(cd "$TMP" && "$CT" status retrytest --backend herdr 2>&1)
+    check "status manifest retry via project cwd finds w1's PROTOCOL" \
+      "$(echo "$ROUT" | grep -E '^\s*w1\b')" "pending"
+    herdr workspace close "$RWS" >/dev/null 2>&1
+  else
+    echo "  FAIL: status manifest retry test (could not create team-retrytest workspace)"; fail=$((fail+1))
+  fi
+else
+  echo "  skip: status manifest retry test (no herdr server)"
+fi
+
+# --- status: corrupt manifest degrades gracefully with a live session too ---
+if command -v herdr >/dev/null && herdr status server 2>/dev/null | grep running >/dev/null; then
+  CP2="$TMP/corruptproj2"; mkdir -p "$CP2/.claude-team/manifest"
+  printf '{"session":"team-corrupt2","broken' > "$CP2/.claude-team/manifest/team-corrupt2.json"
+  CJ=$(herdr workspace create --cwd "$CP2" --label 'team-corrupt2' --no-focus 2>/dev/null)
+  CWS=$(echo "$CJ" | yq -p json -r '.result.workspace.workspace_id')
+  if [ -n "$CWS" ] && [ "$CWS" != "null" ]; then
+    herdr tab create --workspace "$CWS" --cwd "$CP2" --label w1 --no-focus >/dev/null 2>&1
+    C2OUT=$(cd "$TMP" && "$CT" status corrupt2 --backend herdr 2>&1); C2RC=$?
+    check_eq "status (live) on truncated manifest exits 0" "$C2RC" "0"
+    check "status (live) on truncated manifest warns" "$C2OUT" "warning: unreadable manifest for team-corrupt2"
+    check "status (live) on truncated manifest still lists w1" "$C2OUT" "w1"
+    herdr workspace close "$CWS" >/dev/null 2>&1
+  else
+    echo "  FAIL: status live corrupt-manifest test (could not create team-corrupt2 workspace)"; fail=$((fail+1))
+  fi
+else
+  echo "  skip: status live corrupt-manifest test (no herdr server)"
 fi
 
 # status with no matching sessions exits 0 (tmux backend, bogus name)
