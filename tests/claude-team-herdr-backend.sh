@@ -111,6 +111,12 @@ WOUT=$("$CT" watch 2>&1); WRC=$?
 check "watch no-args prints usage" "$WOUT" "Usage:"
 check_eq "watch no-args exits nonzero" "$([ "$WRC" -ne 0 ] && echo yes || echo no)" "yes"
 
+# --reap: watcher compiles and advertises the flag in usage (both files)
+CTW="$(dirname "$CT")/claude-team-watch"
+check_eq "watch helper py_compile" "$(python3 -m py_compile "$CTW" 2>&1 && echo ok)" "ok"
+check "watch helper usage mentions --reap" "$(python3 "$CTW" --help 2>&1)" "--reap"
+check "orchestrator usage mentions --reap" "$("$CT" --help 2>&1)" "--reap"
+
 # live watch: report-agent blocked must surface a "needs you" line within ~5s
 if command -v herdr >/dev/null && herdr status server 2>/dev/null | grep running >/dev/null; then
   WJ=$(herdr workspace create --label 'team-watchtest' --no-focus 2>/dev/null)

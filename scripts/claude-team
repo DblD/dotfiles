@@ -22,6 +22,7 @@ DRY_RUN=false
 YOLO=false
 VERBOSE=false
 JSON_OUT=false
+REAP=false
 BACKEND="${CLAUDE_TEAM_BACKEND:-tmux}"   # tmux | herdr
 HERDR_BIN="$(command -v herdr || echo /opt/homebrew/bin/herdr)"
 
@@ -216,8 +217,11 @@ Usage:
                                        for it to finish (idle)
   claude-team status [session]         One-glance table of agents, states, and
                                        status files (all team sessions, or one)
-  claude-team watch <session-name>     Supervise a team session (herdr): notify on
-                                       blocked agents, collect finished output
+  claude-team watch <session-name> [--reap]
+                                       Supervise a team session (herdr): notify on
+                                       blocked agents, collect finished output;
+                                       --reap closes a worker's tab once its
+                                       output is collected (never lead)
   claude-team --stop [session-name]    Stop a team session
   claude-team --help                   Show this help
 
@@ -228,6 +232,8 @@ Options:
   --session-name <name>                Override session name
   --backend <tmux|herdr>               Pane/session backend (default: tmux)
   --json                               watch: emit one JSON object per line
+  --reap                               watch: close a worker's tab after its
+                                       output is collected (default off)
 
 Config format (v2 — task + fragments):
   agents:
@@ -1094,6 +1100,9 @@ cmd_watch() {
   if $JSON_OUT; then
     extra+=(--json)
   fi
+  if $REAP; then
+    extra+=(--reap)
+  fi
   exec "$watch_bin" "$session" --socket "$sock" "${extra[@]}"
 }
 
@@ -1183,6 +1192,7 @@ main() {
       --yolo) YOLO=true ;;
       --verbose) VERBOSE=true ;;
       --json) JSON_OUT=true ;;
+      --reap) REAP=true ;;
       --session-name) SESSION_NAME_OVERRIDE="$2"; shift ;;
       --backend) BACKEND="$2"; shift ;;
       *) args+=("$1") ;;

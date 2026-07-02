@@ -28,19 +28,23 @@ from datetime import datetime
 DEFAULT_SOCKET = os.path.expanduser("~/.config/herdr/herdr.sock")
 HERDR = os.environ.get("HERDR_BIN") or shutil.which("herdr") \
     or "/opt/homebrew/opt/herdr/bin/herdr"
-USAGE = """usage: claude-team-watch <session> [--socket PATH] [--json]
+USAGE = """usage: claude-team-watch <session> [--socket PATH] [--json] [--reap]
 
 Supervise a claude-team herdr session (session = workspace label):
 print agent state transitions, notify when an agent blocks, and collect
 output into <project>/.claude-team/results/ when an agent finishes.
+
+--reap: after a finished agent's output is collected, close its tab
+(never the tab labelled 'lead'). Default off.
 """
 
 
 class Watcher:
-    def __init__(self, session, sock_path, as_json):
+    def __init__(self, session, sock_path, as_json, reap=False):
         self.session = session
         self.sock_path = sock_path
         self.as_json = as_json
+        self.reap = reap          # close a worker's tab once output collected
         self.ws = None            # workspace id once resolved
         self.project = None       # workspace cwd (lead/root pane)
         self.last_status = {}     # pane_id -> last agent_status
@@ -123,6 +127,7 @@ class Watcher:
                   label=label, pane=pane_id)
 
     def collect(self, label, pane_id):
+        """Save the pane's recent output to results/; True on success."""
         out = ""
         for source in ("recent-unwrapped", "visible"):
             try:
@@ -137,16 +142,36 @@ class Watcher:
                 break
         if not self.project:
             self.emit("warn", "%s: no project dir known, output not saved" % label)
-            return
+            return False
         results = os.path.join(self.project, ".claude-team", "results")
-        os.makedirs(results, exist_ok=True)
-        path = os.path.join(results, "%s.md" % label.replace(os.sep, "-"))
-        with open(path, "a", encoding="utf-8") as f:
-            f.write("\n## %s -- %s / %s\n\n```\n%s\n```\n"
-                    % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                       self.session, label, out.rstrip()))
+        try:
+            os.makedirs(results, exist_ok=True)
+            path = os.path.join(results, "%s.md" % label.replace(os.sep, "-"))
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("\n## %s -- %s / %s\n\n```\n%s\n```\n"
+                        % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                           self.session, label, out.rstrip()))
+        except OSError as e:
+            self.emit("warn", "%s: could not save output (%s)" % (label, e))
+            return False
         self.emit("collected", "%s: output -> %s" % (label, path),
                   label=label, pane=pane_id, path=path)
+        return True
+
+    def reap_tab(self, label, pane_id):
+        """Close a finished worker's tab (--reap). Never the lead tab."""
+        tab = self.pane_tab.get(pane_id)
+        if not tab:
+            return
+        if label == "lead" or self.tab_label.get(tab) == "lead":
+            return
+        try:
+            subprocess.run([HERDR, "tab", "close", tab],
+                           capture_output=True, timeout=10, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            return
+        self.emit("reaped", "%s: reaped" % label,
+                  label=label, pane=pane_id, tab=tab)
 
     # ---- event dispatch ----------------------------------------------------
     def handle(self, obj, subscribed_panes, known_tabs):
@@ -170,7 +195,9 @@ class Watcher:
                 self.notify_blocked(label, pane)
             elif status in ("idle", "done") and prev == "working":
                 self.emit("finished", "%s: finished" % label, label=label, pane=pane)
-                self.collect(label, pane)
+                collected = self.collect(label, pane)
+                if self.reap and collected:
+                    self.reap_tab(label, pane)
             return False
 
         pane = data.get("pane_id") or (data.get("pane") or {}).get("pane_id")
@@ -246,7 +273,7 @@ class Watcher:
 
 
 def main(argv):
-    session, as_json = None, False
+    session, as_json, reap = None, False, False
     sock = os.environ.get("HERDR_SOCKET_PATH", DEFAULT_SOCKET)
     args = iter(argv)
     for a in args:
@@ -257,6 +284,8 @@ def main(argv):
             sock = next(args, "") or sock
         elif a == "--json":
             as_json = True
+        elif a == "--reap":
+            reap = True
         elif a.startswith("-"):
             sys.stderr.write("unknown option: %s\n%s" % (a, USAGE))
             return 2
@@ -267,7 +296,7 @@ def main(argv):
         return 2
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     try:
-        Watcher(session, sock, as_json).run()
+        Watcher(session, sock, as_json, reap).run()
     except KeyboardInterrupt:
         return 0
     return 0
