@@ -1275,6 +1275,10 @@ cmd_watch() {
   if $REAP; then
     extra+=(--reap)
   fi
+  # Hand watch our own path so it can shell out to `claude-team verify`.
+  local ct_bin
+  ct_bin="$(cd "$(dirname "$self")" && pwd)/$(basename "$self")"
+  export CLAUDE_TEAM_BIN="$ct_bin"
   exec "$watch_bin" "$session" --socket "$sock" "${extra[@]}"
 }
 

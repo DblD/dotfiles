@@ -220,5 +220,50 @@ else
   echo "  skip: watch live test (no herdr server)"
 fi
 
+# --- completion protocol: nudge loop (live) ---
+# Drive the full unmet->nudge->met->complete cycle with report-agent only (no
+# real agent). The nudge types into the pane's SHELL — harmless; the pane-read
+# assertion sees the typed text.
+if command -v herdr >/dev/null && herdr status server 2>/dev/null | grep running >/dev/null; then
+  NP="$TMP/nproj"; mkdir -p "$NP/.claude-team/manifest"
+  rm -f /tmp/ct-nudge-flag
+  # self-heal stale workspace first (same pattern as team-mproj)
+  NWS=$(herdr workspace list | yq -p json -r '.result.workspaces[] | select(.label=="team-nudgetest") | .workspace_id')
+  [ -n "$NWS" ] && herdr workspace close "$NWS" >/dev/null 2>&1
+  herdr workspace create --cwd "$NP" --label team-nudgetest --no-focus >/dev/null 2>&1
+  NWS=$(herdr workspace list | yq -p json -r '.result.workspaces[] | select(.label=="team-nudgetest") | .workspace_id')
+  NT1=$(herdr tab list --workspace "$NWS" | yq -p json -r '.result.tabs[0].tab_id')
+  herdr tab rename "$NT1" lead >/dev/null 2>&1
+  NPANE=$(herdr tab create --workspace "$NWS" --cwd "$NP" --label wnudge --no-focus | yq -p json -r '.result.root_pane.pane_id')
+  cat > "$NP/.claude-team/manifest/team-nudgetest.json" <<J
+{"session":"team-nudgetest","config_path":"none","project":"$NP","spawned_at":"t",
+ "agents":{"wnudge":{"state":"pending","nudges":0,"verifications":[],"collected":false,
+  "reaped":false,"work_dir":"$NP","checks":{"branch_pushed":"","check":"test -f /tmp/ct-nudge-flag"}}}}
+J
+  WOUT="$TMP/nwatch.out"
+  "$CT" watch nudgetest --backend herdr > "$WOUT" 2>&1 &
+  WPID=$!
+  sleep 2
+  herdr pane report-agent "$NPANE" --source cttest --agent claude --state working --seq 1 >/dev/null 2>&1
+  sleep 1
+  herdr pane report-agent "$NPANE" --source cttest --agent claude --state idle --seq 2 >/dev/null 2>&1
+  sleep 4
+  check "nudge sent on unmet"  "$(cat "$WOUT")" "nudged"
+  # NB: --source recent returns empty for a plain shell pane; visible sees the
+  # typed nudge text reliably.
+  check "nudge text is teaching" "$(herdr pane read "$NPANE" --source visible)" "ct-nudge-flag"
+  check "manifest nudges=1" "$(cat "$NP/.claude-team/manifest/team-nudgetest.json")" '"nudges": 1'
+  touch /tmp/ct-nudge-flag
+  herdr pane report-agent "$NPANE" --source cttest --agent claude --state working --seq 3 >/dev/null 2>&1
+  sleep 1
+  herdr pane report-agent "$NPANE" --source cttest --agent claude --state idle --seq 4 >/dev/null 2>&1
+  sleep 4
+  check "complete after flag" "$(cat "$NP/.claude-team/manifest/team-nudgetest.json")" '"state": "complete"'
+  kill "$WPID" 2>/dev/null; wait "$WPID" 2>/dev/null; rm -f /tmp/ct-nudge-flag
+  herdr workspace close "$NWS" >/dev/null 2>&1
+else
+  echo "  skip: nudge loop live test (no herdr server)"
+fi
+
 echo "== pass=$pass fail=$fail =="
 [ "$fail" -eq 0 ]
