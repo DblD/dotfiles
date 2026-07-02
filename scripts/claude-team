@@ -363,8 +363,11 @@ manifest_seed() { # $1=session $2=project_path $3=config_file
   MS_SESSION="$1" MS_PROJECT="$2" MS_CONFIG="$3" MS_OUT="$dir/$1.json" python3 - <<'PYEOF'
 import datetime, json, os, subprocess, tempfile
 cfg = os.environ["MS_CONFIG"]
-raw = subprocess.run(["yq", "-o=json", ".agents", cfg],
-                     capture_output=True, text=True, check=True)
+try:
+    raw = subprocess.run(["yq", "-o=json", ".agents", cfg],
+                         capture_output=True, text=True, check=True)
+except subprocess.CalledProcessError as e:
+    raise SystemExit("manifest_seed: yq failed: " + (e.stderr or "").strip())
 agent_list = json.loads(raw.stdout)
 if not agent_list:
     raise SystemExit("manifest_seed: no agents parsed from config")
@@ -1016,14 +1019,16 @@ cmd_verify() {
     [[ -f "$d/${TEAM_DIR}/manifest/${session}.json" ]] && { man="$d/${TEAM_DIR}/manifest/${session}.json"; break; }
   done
   [[ -z "$man" ]] && { red "no manifest for $session (looked in ./${TEAM_DIR}/manifest/)"; exit 2; }
-  CV_MAN="$man" CV_AGENT="$only_agent" CV_JSON="$as_json" python3 - <<'PYEOF'
+  CV_MAN="$man" CV_AGENT="$only_agent" CV_JSON="$as_json" CV_SESSION="$session" python3 - <<'PYEOF'
 import json, os, subprocess, sys
 man = json.load(open(os.environ["CV_MAN"]))
 only, as_json = os.environ["CV_AGENT"], os.environ["CV_JSON"] == "true"
 worst = 0
+matched = False
 for name, a in man["agents"].items():
     if only and name != only:
         continue
+    matched = True
     checks, results, met = a.get("checks", {}), [], True
     wd = a.get("work_dir") or man.get("project") or "."
     b = checks.get("branch_pushed") or ""
@@ -1062,6 +1067,10 @@ for name, a in man["agents"].items():
             print("  [%s] %s" % ("ok" if r["ok"] else "XX", r["detail"]))
     if not met:
         worst = 1
+if only and not matched:
+    print("no agent '%s' in manifest for %s"
+          % (only, os.environ["CV_SESSION"]))
+    sys.exit(2)
 sys.exit(worst)
 PYEOF
 }

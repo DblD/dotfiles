@@ -81,17 +81,26 @@ cat > "$VP/.claude-team/manifest/team-vproj.json" <<J
   "good":{"state":"pending","nudges":0,"verifications":[],"collected":false,"reaped":false,
           "work_dir":"$VP","checks":{"branch_pushed":"agent/ok","check":"true"}},
   "bad": {"state":"pending","nudges":0,"verifications":[],"collected":false,"reaped":false,
-          "work_dir":"$VP","checks":{"branch_pushed":"agent/missing","check":"false"}}}}
+          "work_dir":"$VP","checks":{"branch_pushed":"agent/missing","check":"false"}},
+  "vac": {"state":"pending","nudges":0,"verifications":[],"collected":false,"reaped":false,
+          "work_dir":"$VP","checks":{"branch_pushed":"","check":""}}}}
 J
 VOUT=$(cd "$VP" && "$CT" verify vproj 2>&1); VRC=$?
 check "verify: good agent PASS"   "$VOUT" "good: PASS"
 check "verify: bad agent FAIL"    "$VOUT" "bad: FAIL"
+check "verify: vacuous PASS"      "$VOUT" "vac: PASS"
 check "verify: teaching detail"   "$VOUT" "not found on origin"
 check_eq "verify: exit 1 on any unmet" "$VRC" "1"
 VJ=$(cd "$VP" && "$CT" verify vproj good --json 2>&1); VJRC=$?
 check "verify --json met"          "$VJ" '"met": true'
 check_eq "verify: exit 0 all met"  "$VJRC" "0"
 "$CT" verify nosuchsession >/dev/null 2>&1; check_eq "verify: exit 2 no manifest" "$?" "2"
+(cd "$VP" && "$CT" verify vproj nosuchagent >/dev/null 2>&1)
+check_eq "verify: exit 2 unknown agent" "$?" "2"
+# --json output must be strict JSONL: every line parses (round-trip pin)
+VJALL=$(cd "$VP" && "$CT" verify vproj --json)
+echo "$VJALL" | python3 -c 'import json,sys; [json.loads(l) for l in sys.stdin if l.strip()]'
+check_eq "verify: --json lines all parse" "$?" "0"
 
 # Task 4: stop (needs a live workspace to pass the has-session gate)
 if command -v herdr >/dev/null && herdr status server 2>/dev/null | grep running >/dev/null; then
