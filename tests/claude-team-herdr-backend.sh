@@ -70,6 +70,27 @@ check "w1 injected prompt carries the deliverable contract" \
   "$(cat "$W1_PROMPT_PATH" 2>/dev/null)" "DELIVERABLE CONTRACT"
 # Task 4: stop (needs a live workspace to pass the has-session gate)
 if command -v herdr >/dev/null && herdr status server 2>/dev/null | grep running >/dev/null; then
+  # Task 2: manifest seeding at spawn — lead + unknown-runner worker so NOTHING
+  # launches, but the workspace + manifest are real.
+  MPROJ="$TMP/mproj"; mkdir -p "$MPROJ/.claude-team/agents"
+  echo "x" > "$MPROJ/.claude-team/agents/mw.md"
+  cat > "$TMP/mteam.yaml" <<Y
+name: mtest
+project: $MPROJ
+worktrees: false
+agents:
+  - { name: lead, role: lead }
+  - { name: mw, role: worker, runner: nosuchrunner, prompt: .claude-team/agents/mw.md,
+      deliverable: { branch_pushed: agent/mw, check: "true" } }
+Y
+  "$CT" spawn "$TMP/mteam.yaml" --backend herdr >/dev/null 2>&1 || true
+  Man="$MPROJ/.claude-team/manifest/team-mproj.json"
+  check "manifest seeded"        "$(ls "$Man" 2>/dev/null)" "$Man"
+  check "manifest has mw checks" "$(cat "$Man" 2>/dev/null)" '"branch_pushed": "agent/mw"'
+  check "manifest agent pending" "$(cat "$Man" 2>/dev/null)" '"state": "pending"'
+  WSID=$(herdr workspace list | yq -p json -r '.result.workspaces[] | select(.label=="team-mproj") | .workspace_id')
+  [ -n "$WSID" ] && herdr workspace close "$WSID" >/dev/null 2>&1
+
   herdr workspace create --label 'team-cttest' --no-focus >/dev/null 2>&1
   SOUT=$("$CT" --stop cttest --backend herdr --dry-run 2>&1)
   check "stop emits workspace close" "$SOUT" "workspace close (label 'team-cttest')"
