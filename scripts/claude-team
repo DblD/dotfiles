@@ -396,6 +396,12 @@ inject_contract() { # $1=prompt_file $2=agent $3=branch_pushed $4=check
 
 # Seed .claude-team/manifest/<session>.json (atomic; python3 for correct JSON).
 # Watch owns all writes AFTER seeding. Called once per spawn, live mode only.
+# Re-spawn into an existing session MERGE-PRESERVES the manifest: existing
+# agents keep their protocol state (state/nudges/verifications/collected/
+# reaped/work_dir) with only their checks refreshed from the new config;
+# agents absent from the new config are never dropped (watch must not
+# collect/reap them unverified); only genuinely new agents get fresh
+# pending entries. Header keeps the original spawned_at.
 manifest_seed() { # $1=session $2=project_path $3=config_file
   $DRY_RUN && return 0
   local dir="$2/${TEAM_DIR}/manifest"
@@ -411,7 +417,15 @@ except subprocess.CalledProcessError as e:
 agent_list = json.loads(raw.stdout)
 if not agent_list:
     raise SystemExit("manifest_seed: no agents parsed from config")
-agents = {}
+out = os.environ["MS_OUT"]
+old = None
+if os.path.exists(out):
+    try:
+        old = json.load(open(out))
+    except (OSError, ValueError):
+        old = None  # corrupt previous manifest: re-seed from scratch
+# start from the old agents so entries absent from the new config are KEPT
+agents = dict((old or {}).get("agents") or {})
 for a in agent_list:
     if a.get("role", "worker") == "lead":
         continue
@@ -419,16 +433,20 @@ for a in agent_list:
     if not name:
         raise SystemExit("manifest_seed: agent entry missing 'name' in config")
     deliverable = a.get("deliverable") or {}
-    branch = deliverable.get("branch_pushed") or ""
-    check = deliverable.get("check") or ""
-    agents[name] = {"state": "pending", "nudges": 0, "verifications": [],
-                    "collected": False, "reaped": False, "work_dir": "",
-                    "checks": {"branch_pushed": branch, "check": check}}
+    checks = {"branch_pushed": deliverable.get("branch_pushed") or "",
+              "check": deliverable.get("check") or ""}
+    if name in agents and isinstance(agents[name], dict):
+        # existing agent: preserve protocol state, refresh checks only
+        agents[name]["checks"] = checks
+    else:
+        agents[name] = {"state": "pending", "nudges": 0, "verifications": [],
+                        "collected": False, "reaped": False, "work_dir": "",
+                        "checks": checks}
 doc = {"session": os.environ["MS_SESSION"], "config_path": os.path.abspath(cfg),
        "project": os.environ["MS_PROJECT"],
-       "spawned_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+       "spawned_at": (old or {}).get("spawned_at")
+           or datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
        "agents": agents}
-out = os.environ["MS_OUT"]
 fd, tmp = tempfile.mkstemp(dir=os.path.dirname(out))
 with os.fdopen(fd, "w") as f:
     json.dump(doc, f, indent=2)

@@ -172,6 +172,21 @@ Y
   check "manifest seeded"        "$(ls "$Man" 2>/dev/null)" "$Man"
   check "manifest has mw checks" "$(cat "$Man" 2>/dev/null)" '"branch_pushed": "agent/mw"'
   check "manifest agent pending" "$(cat "$Man" 2>/dev/null)" '"state": "pending"'
+  # re-spawn into the existing session must MERGE-PRESERVE protocol state,
+  # not wipe it: simulate watch-owned progress (nudges/state), spawn again
+  # with the SAME config, and assert the progress survived with checks intact.
+  python3 - "$Man" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["agents"]["mw"]["nudges"] = 1
+d["agents"]["mw"]["state"] = "working"
+json.dump(d, open(p, "w"), indent=2)
+PY
+  "$CT" spawn "$TMP/mteam.yaml" --backend herdr >/dev/null 2>&1 || true
+  check "respawn preserves nudges" "$(cat "$Man" 2>/dev/null)" '"nudges": 1'
+  check "respawn preserves state"  "$(cat "$Man" 2>/dev/null)" '"state": "working"'
+  check "respawn keeps mw checks"  "$(cat "$Man" 2>/dev/null)" '"branch_pushed": "agent/mw"'
   WSID=$(herdr workspace list | yq -p json -r '.result.workspaces[] | select(.label=="team-mproj") | .workspace_id')
   [ -n "$WSID" ] && herdr workspace close "$WSID" >/dev/null 2>&1
 
@@ -369,6 +384,9 @@ J
   herdr pane report-agent "$NPANE" --source cttest --agent claude --state idle --seq 52 >/dev/null 2>&1
   sleep 4
   check "complete after flag (post-escalation)" "$(cat "$NP/.claude-team/manifest/team-nudgetest.json")" '"state": "complete"'
+  # collect() ran on the complete path, so the manifest must record it
+  # (collected/reaped are live fields, not dead schema)
+  check "collected recorded in manifest" "$(cat "$NP/.claude-team/manifest/team-nudgetest.json")" '"collected": true'
   kill "$WPID" 2>/dev/null; wait "$WPID" 2>/dev/null; rm -f /tmp/ct-nudge-flag
   herdr workspace close "$NWS" >/dev/null 2>&1
 else

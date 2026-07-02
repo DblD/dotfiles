@@ -171,19 +171,21 @@ class Watcher:
         return True
 
     def reap_tab(self, label, pane_id):
-        """Close a finished worker's tab (--reap). Never the lead tab."""
+        """Close a finished worker's tab (--reap). Never the lead tab.
+        Returns True when the tab was closed."""
         tab = self.pane_tab.get(pane_id)
         if not tab:
-            return
+            return False
         if label == "lead" or self.tab_label.get(tab) == "lead":
-            return
+            return False
         try:
             subprocess.run([HERDR, "tab", "close", tab],
                            capture_output=True, timeout=10, check=False)
         except (OSError, subprocess.TimeoutExpired):
-            return
+            return False
         self.emit("reaped", "%s: reaped" % label,
                   label=label, pane=pane_id, tab=tab)
+        return True
 
     # ---- completion protocol ------------------------------------------------
     MAX_NUDGES = 2
@@ -212,6 +214,20 @@ class Watcher:
         with os.fdopen(fd, "w") as f:
             json.dump(doc, f, indent=2)
         os.replace(tmp, p)
+
+    def manifest_mark(self, label, field):
+        """Best-effort: set agents[label][field] = True (collected/reaped).
+        Skips silently when there is no manifest or no entry for the agent
+        (no-deliverable agents may have none); never breaks the event loop."""
+        try:
+            doc = self.manifest()
+            agent = (doc or {}).get("agents", {}).get(label)
+            if not isinstance(agent, dict):
+                return
+            agent[field] = True
+            self.manifest_write(doc)
+        except (OSError, ValueError, TypeError):
+            pass
 
     def run_verify(self, label):
         """`claude-team verify <session> <label> --json` in the project dir.
@@ -355,8 +371,11 @@ class Watcher:
                 self.emit("finished", "%s: finished" % label, label=label, pane=pane)
                 if self.protocol_on_finished(label, pane):
                     collected = self.collect(label, pane)
+                    if collected:
+                        self.manifest_mark(label, "collected")
                     if self.reap and collected:
-                        self.reap_tab(label, pane)
+                        if self.reap_tab(label, pane):
+                            self.manifest_mark(label, "reaped")
             return False
 
         pane = data.get("pane_id") or (data.get("pane") or {}).get("pane_id")

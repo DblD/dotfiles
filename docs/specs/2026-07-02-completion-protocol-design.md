@@ -104,6 +104,7 @@ Two new columns, manifest-sourced: `DELIVERABLE` (met / unmet / `-` when none de
 - **tmux backend** → `verify` and `status` work (they don't need herdr); nudging requires watch, which is herdr-only — documented limitation.
 - **Worker idle during nudge composition** → nudges are `tell`-delivered (send-text + enter), which is safe into an idle TUI prompt; they appear in the pane like human instructions, fully visible/auditable.
 - **Duplicate idle events** (herdr replays / flapping) → nudge increments only after a completed verify; debounce prevents double-nudging on one idle.
+- **Corrupt/deleted manifest while watch runs** → watch fails OPEN (protocol inert, collect/reap proceed unverified) — atomic writes make this require external interference; acceptable v1.
 
 ## Testing
 
