@@ -291,12 +291,16 @@ class Watcher:
         return False
 
     def protocol_on_finished(self, label, pane_id):
-        """Verify-gated completion. Returns True when collect/reap may proceed."""
+        """Verify-gated completion. Returns "met", "inert", or False.
+        Truthy -> collect may proceed. Only "met" may reap: an uncontracted
+        agent going idle is NOT done — reaping it kills a live worker between
+        turns (observed live 2026-07-02: --reap culled hand-rolled agents on
+        their first idle)."""
         doc = self.manifest()
         agent = (doc or {}).get("agents", {}).get(label)
         checks = (agent or {}).get("checks", {})
         if not agent or not (checks.get("branch_pushed") or checks.get("check")):
-            return True  # no deliverable declared -> protocol inert
+            return "inert"  # no deliverable declared -> collect, never reap
         if agent.get("state") in ("blocked", "incomplete"):
             # ABSORBING terminal states: the escalation nudge provokes a worker
             # reply, whose idle would otherwise re-escalate -> infinite loop of
@@ -313,7 +317,7 @@ class Watcher:
                 self.sidebar(pane_id, "✓ complete")
                 self.emit("verified", "%s: deliverable met (recovered after "
                           "escalation)" % label, label=label)
-                return True
+                return "met"
             self.emit("absorbed", "%s: still %s - staying quiet (escalated "
                       "already)" % (label, agent["state"]), label=label)
             return False
@@ -331,7 +335,7 @@ class Watcher:
             self.manifest_write(doc)
             self.sidebar(pane_id, "✓ complete")
             self.emit("verified", "%s: deliverable met" % label, label=label)
-            return True
+            return "met"
         blocked = self.pane_blocked_sentinel(pane_id)
         if blocked or agent.get("nudges", 0) >= self.MAX_NUDGES:
             agent["state"] = "blocked" if blocked else "incomplete"
@@ -389,11 +393,14 @@ class Watcher:
                 self.notify_blocked(label, pane)
             elif status in ("idle", "done") and prev == "working":
                 self.emit("finished", "%s: finished" % label, label=label, pane=pane)
-                if self.protocol_on_finished(label, pane):
+                verdict = self.protocol_on_finished(label, pane)
+                if verdict:
                     collected = self.collect(label, pane)
                     if collected:
                         self.manifest_mark(label, "collected")
-                    if self.reap and collected:
+                    # reap ONLY on a verified deliverable — an idle uncontracted
+                    # agent is between turns, not done
+                    if self.reap and collected and verdict == "met":
                         if self.reap_tab(label, pane):
                             self.manifest_mark(label, "reaped")
             return False
