@@ -45,6 +45,7 @@ Pure, side-effect-free checker.
   - `check`: run in the agent's `work_dir` with a **120 s timeout** (a hung build must not wedge the verifier); timeout counts as failed with detail "timeout".
 - `work_dir` = the agent's worktree if `worktrees: true` (same resolution as spawn), else the project path.
 - Output: human `PASS`/`FAIL` lines; `--json` emits one object per agent: `{"agent": "...", "met": bool, "checks": [{"type": "branch_pushed|check", "target": "...", "ok": bool, "detail": "..."}]}`.
+- **Teaching-error contract** (from MEA: "the error message is the documentation"): every failing check's `detail` must state what failed, what was expected, and a concrete next step — e.g. `branch agent/fix-build not found on origin — push it (git push -u origin agent/fix-build)`. These strings feed the nudges verbatim, so the nudge is self-explanatory to the worker with no extra composition.
 - Exit codes: 0 all met · 1 any unmet · 2 config/session/manifest not found.
 - Writes nothing. Agents without a `deliverable` are reported `met: true` with empty checks (and skipped by watch's loop).
 
@@ -59,8 +60,13 @@ verify(agent)
 │                    or state DELIVERABLE BLOCKED: <reason>") → nudges+1 → await next idle
 └─ unmet, nudges≥2 OR pane output contains "DELIVERABLE BLOCKED"
                    → manifest state=incomplete|blocked → toast "<session>: <agent>
-                     did not meet its deliverable — needs you" → NEVER reap
+                     did not meet its deliverable — needs you" → tell the worker
+                     "deliverable unmet after N nudges — escalated to human; stand by"
+                     (worker knows the loop ended; from MEA's builder-side escalation
+                     message) → NEVER reap
 ```
+
+**Sidebar protocol status** (from MEA's builder status-bar): watch mirrors protocol state onto the worker's pane via `herdr pane report-metadata <pane> --source claude-team-watch --custom-status "<text>"` at every transition — `verifying…`, `nudged ×1`, `✓ complete`, `✗ incomplete — needs you`, `blocked`. The herdr sidebar itself becomes the protocol board; no extra window needed. Best-effort: a failed report-metadata call never affects the policy loop.
 
 - Nudge text quotes verify's failing `detail` verbatim so the worker sees exactly what's missing.
 - Debounce: one in-flight verify per agent; an idle event during verification is ignored (the post-verify state decides the next step).
