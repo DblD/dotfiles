@@ -214,6 +214,8 @@ Usage:
                                        --wait: confirm the agent starts working
                                        (herdr only); --wait=N: wait up to N seconds
                                        for it to finish (idle)
+  claude-team status [session]         One-glance table of agents, states, and
+                                       status files (all team sessions, or one)
   claude-team watch <session-name>     Supervise a team session (herdr): notify on
                                        blocked agents, collect finished output
   claude-team --stop [session-name]    Stop a team session
@@ -895,6 +897,95 @@ cmd_cleanup() {
   green "Cleaned up $count worker windows from $session"
 }
 
+# --- Status: one-glance table of agents and their states ---
+
+status_file_field() { # $1=project $2=agent -> **Status:** value from agents/<name>.md, or "-"
+  local f="${1:-}/${TEAM_DIR}/agents/${2}.md"
+  if [[ -z "${1:-}" || ! -f "$f" ]]; then echo "-"; return; fi
+  local line
+  line=$(grep -m1 '^\*\*Status:\*\*' "$f" 2>/dev/null | sed 's/^\*\*Status:\*\* *//')
+  echo "${line:--}"
+}
+
+results_field() { # $1=project $2=agent -> "yes" if results/<name>.md exists, else "-"
+  local f="${1:-}/${TEAM_DIR}/results/${2}.md"
+  if [[ -n "${1:-}" && -f "$f" ]]; then echo "yes"; else echo "-"; fi
+}
+
+status_one_session() { # $1=session — print the agent table for one session
+  local session="$1"
+  local fmt='  %-16s %-10s %-14s %-24s %s\n'
+  bold "$session"
+  case "$BACKEND" in
+    herdr)
+      local ws panes project
+      ws=$(be_ws_id "$session")
+      [[ -n "$ws" ]] || { yellow "  workspace not found: $session"; return 0; }
+      panes=$("$HERDR_BIN" pane list --workspace "$ws" 2>/dev/null)
+      # project = cwd of the workspace root pane (first pane in list)
+      project=$(echo "$panes" | yq -p json -r '.result.panes[0].cwd // ""')
+      # shellcheck disable=SC2059
+      printf "$fmt" "AGENT" "STATE" "PANE" "STATUS-FILE" "RESULTS"
+      local tab_id label pane state
+      while IFS=$'\t' read -r tab_id label; do
+        [[ -n "$tab_id" ]] || continue
+        pane=$(echo "$panes" | yq -p json -r ".result.panes[] | select(.tab_id==\"$tab_id\") | .pane_id" | head -1)
+        state="-"
+        if [[ -n "$pane" ]]; then
+          state=$("$HERDR_BIN" pane get "$pane" 2>/dev/null | yq -p json -r '.result.pane.agent_status // "-"')
+          [[ -z "$state" || "$state" == "null" ]] && state="-"
+        fi
+        # shellcheck disable=SC2059
+        printf "$fmt" "$label" "$state" "${pane:--}" \
+          "$(status_file_field "$project" "$label")" "$(results_field "$project" "$label")"
+      done < <("$HERDR_BIN" tab list --workspace "$ws" 2>/dev/null \
+                 | yq -p json -r '.result.tabs[] | [.tab_id, (.label // .tab_id)] | @tsv')
+      ;;
+    tmux)
+      tmux has-session -t "$session" 2>/dev/null || { yellow "  session not found: $session"; return 0; }
+      local project window
+      project=$(tmux display-message -p -t "$session" '#{pane_current_path}' 2>/dev/null || true)
+      # shellcheck disable=SC2059
+      printf "$fmt" "AGENT" "STATE" "PANE" "STATUS-FILE" "RESULTS"
+      while IFS= read -r window; do
+        [[ -n "$window" ]] || continue
+        # shellcheck disable=SC2059
+        printf "$fmt" "$window" "-" "${session}:${window}" \
+          "$(status_file_field "$project" "$window")" "$(results_field "$project" "$window")"
+      done < <(tmux list-windows -t "$session" -F '#{window_name}' 2>/dev/null)
+      ;;
+    *) red "unknown backend: $BACKEND (use tmux|herdr)"; exit 1 ;;
+  esac
+  echo ""
+}
+
+cmd_status() {
+  local session="${1:-}"
+  local sessions
+  if [[ -n "$session" ]]; then
+    # Accept with/without team- prefix
+    if [[ "$session" != team-* ]]; then
+      session="team-${session}"
+    fi
+    if ! be_has_session "$session"; then
+      yellow "no team sessions running"
+      return 0
+    fi
+    sessions="$session"
+  else
+    sessions=$(be_list_sessions)
+    if [[ -z "$sessions" ]]; then
+      yellow "no team sessions running"
+      return 0
+    fi
+  fi
+  local s
+  while IFS= read -r s; do
+    [[ -n "$s" ]] && status_one_session "$s"
+  done <<< "$sessions"
+  return 0
+}
+
 # --- Tell: deliver an instruction to a running agent, guarantee submission ---
 # Motivated by the "typed but never pressed Enter" incident: a message sat
 # unsubmitted at a worker's prompt for an hour. tell always sends text + Enter.
@@ -1127,6 +1218,9 @@ main() {
     tell)
       shift
       cmd_tell "$@"
+      ;;
+    status)
+      cmd_status "${2:-}"
       ;;
     watch)
       cmd_watch "${2:-}"

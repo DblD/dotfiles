@@ -80,6 +80,30 @@ check "tell (tmux) carries message+Enter" "$TT" "do the thing Enter"
 TW=$("$CT" tell proj w1 "go" --wait --backend tmux --dry-run 2>&1)
 check "tell (tmux) --wait unsupported"    "$TW" "not supported on tmux backend"
 
+# --- status: one-glance agent table ---
+
+if command -v herdr >/dev/null && herdr status server 2>/dev/null | grep running >/dev/null; then
+  SJ=$(herdr workspace create --label 'team-stattest' --no-focus 2>/dev/null)
+  SWS=$(echo "$SJ" | yq -p json -r '.result.workspace.workspace_id')
+  if [ -n "$SWS" ] && [ "$SWS" != "null" ]; then
+    herdr tab create --workspace "$SWS" --label w1 --no-focus >/dev/null 2>&1
+    STOUT=$("$CT" status stattest --backend herdr 2>&1)
+    check "status shows session header" "$STOUT" "team-stattest"
+    check "status lists agent w1"       "$STOUT" "w1"
+    check "status prints table header"  "$STOUT" "AGENT"
+    herdr workspace close "$SWS" >/dev/null 2>&1
+  else
+    echo "  FAIL: status live test (could not create team-stattest workspace)"; fail=$((fail+1))
+  fi
+else
+  echo "  skip: status live test (no herdr server)"
+fi
+
+# status with no matching sessions exits 0 (tmux backend, bogus name)
+NOUT=$("$CT" status definitely-not-a-real-session --backend tmux 2>&1); NRC=$?
+check "status missing session says none running" "$NOUT" "no team sessions running"
+check_eq "status missing session exits 0" "$NRC" "0"
+
 # --- watch supervisor ---
 
 # no server needed: watch with no args prints usage and exits nonzero
