@@ -233,7 +233,12 @@ Usage:
                                        agent's deliverable (claude-team verify
                                        --json) instead of using the manifest's
                                        last recorded verification.
-  claude-team verify <session> [agent]  Check declared deliverables (pure, read-only)
+  claude-team verify <session> [agent] [--json]
+                                       Check declared deliverables against the
+                                       session manifest (pure, read-only —
+                                       writes nothing). --json: one JSON object
+                                       per agent (JSONL). Exit 0 all met, 1 any
+                                       unmet, 2 no manifest/unknown agent.
   claude-team watch <session-name> [--reap]
                                        Supervise a team session (herdr): notify on
                                        blocked agents, collect finished output;
@@ -265,6 +270,18 @@ Config format (v2 — task + fragments):
       mode: interactive                        # interactive or headless
       runner: claude                           # claude (default) or pi
       model: rtx3090/Qwen3-14B-AWQ             # optional --model for the runner
+
+Config format additions:
+  agents:
+    - name: backend
+      deliverable:                 # optional completion contract
+        branch_pushed: agent/backend   # verified via git ls-remote
+        check: "npx tsc --noEmit"      # verified via exit code (120s timeout)
+                                    # applies to v1 or v2 agents. claude-team
+                                    # watch verify-gates completion on it
+                                    # (nudge, then escalate); claude-team
+                                    # verify and status/status --verify
+                                    # check/display it on demand.
 
 Config format (v1 — legacy monolithic prompt):
   agents:

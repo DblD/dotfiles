@@ -13,6 +13,11 @@ events for the workspace whose label matches the given session, and:
 
 Stdlib only. Invoked by `claude-team watch <session>` (which exports
 CLAUDE_TEAM_BIN so verify can be shelled out to).
+v1 constraint: run_verify() is called synchronously from the single event
+loop (handle() -> protocol_on_finished()), so a slow deliverable check
+(subprocess timeout up to 120s, plus the branch_pushed ls-remote) blocks
+delivery of every other event for up to ~3 minutes worst case. Fine for a
+handful of agents; would need a worker pool for larger teams.
 Protocol notes (verified against herdr 0.7.1 / protocol 14):
   * RPC connections are one-shot: the server closes after one reply.
   * events.subscribe holds its connection open and streams NDJSON events.
