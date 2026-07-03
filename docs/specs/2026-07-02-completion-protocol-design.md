@@ -113,6 +113,19 @@ Two new columns, manifest-sourced: `DELIVERABLE` (met / unmet / `-` when none de
 3. **End-to-end (manual smoke):** real worker with a deliberately unmeetable `branch_pushed`, confirm 2 nudges then toast + INCOMPLETE.
 4. Existing 33 checks stay green; shellcheck/py_compile clean.
 
+## The `review:` deliverable (agent-as-verifier) — IMPLEMENTED 2026-07-03
+
+> **Status:** landed on `feat/claude-team-review-deliverable` (MVP). `claude-team
+> review <session> <agent>` spawns a reviewer tab (own persona + profile => own
+> model, or `runner: pi` for another provider) that reads the worker's session
+> and writes a graded verdict artifact `.claude-team/reviews/<agent>.verdict`;
+> `verify` folds it in as a `review` check (VERIFIED/PERFECT = met, PARTIAL/
+> FEEDBACK/FAILED = unmet, feedback flows to the nudge); `watch` auto-spawns the
+> reviewer once the deterministic checks pass and re-checks the parent when the
+> reviewer finishes. Config: `deliverable.review: {persona, profile, runner,
+> model}`. Deferred to a later pass: live per-turn review (currently end-of-task)
+> and the full structural input-lock. Original design below.
+
 ## Reserved v2 seam: the `review:` deliverable (agent-as-verifier)
 
 Design source: the **Pi Verifier Agent** system at `~/.code/learning/tac/MEA/the-verifier-agent-system/` (two-agent observer: interactive Builder + input-locked read-only Verifier; on every builder stop the verifier re-checks the work via allowlisted deterministic scripts, prompts corrective feedback back, max 3 loops, then escalates to human). Our v1 is that system's mechanical skeleton on herdr primitives — watch=verifier harness, `verify`=domain script, `tell`=`verifier_prompt`, nudge cap=max_loops, toast=escalation.

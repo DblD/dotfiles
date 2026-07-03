@@ -239,6 +239,16 @@ Usage:
                                        writes nothing). --json: one JSON object
                                        per agent (JSONL). Exit 0 all met, 1 any
                                        unmet, 2 no manifest/unknown agent.
+  claude-team review <session> <agent> [--wait]
+                                       Spawn the agent-as-verifier for a worker
+                                       whose deliverable declares review: — a
+                                       separate reviewer tab (its own profile =>
+                                       its own model, or runner: pi for another
+                                       provider) reads the worker's session and
+                                       writes a graded verdict artifact that
+                                       verify folds in (VERIFIED+ = met). watch
+                                       auto-spawns it once the deterministic
+                                       checks pass; --wait blocks for the verdict.
   claude-team watch <session-name> [--reap]
                                        Supervise a team session (herdr): notify on
                                        blocked agents, collect finished output;
@@ -433,8 +443,10 @@ for a in agent_list:
     if not name:
         raise SystemExit("manifest_seed: agent entry missing 'name' in config")
     deliverable = a.get("deliverable") or {}
+    review = deliverable.get("review") or {}
     checks = {"branch_pushed": deliverable.get("branch_pushed") or "",
-              "check": deliverable.get("check") or ""}
+              "check": deliverable.get("check") or "",
+              "review": review if isinstance(review, dict) else {}}
     if name in agents and isinstance(agents[name], dict):
         # existing agent: preserve protocol state, refresh checks only
         agents[name]["checks"] = checks
@@ -1078,7 +1090,7 @@ cmd_verify() {
   man=$(manifest_path_for "$session") || true
   [[ -z "$man" ]] && { red "no manifest for $session (looked in ./${TEAM_DIR}/manifest/)"; exit 2; }
   CV_MAN="$man" CV_AGENT="$only_agent" CV_JSON="$as_json" CV_SESSION="$session" python3 - <<'PYEOF'
-import json, os, subprocess, sys
+import json, os, re, subprocess, sys
 man = json.load(open(os.environ["CV_MAN"]))
 only, as_json = os.environ["CV_AGENT"], os.environ["CV_JSON"] == "true"
 worst = 0
@@ -1115,7 +1127,41 @@ for name, a in man["agents"].items():
             ok, detail = False, "`%s` timed out after 120s - make it faster or fix the hang" % c
         results.append({"type": "check", "target": c, "ok": ok, "detail": detail})
         met &= ok
-    if not checks.get("branch_pushed") and not checks.get("check"):
+    rv = checks.get("review") or {}
+    if rv:
+        # The reviewer (a separate, optionally diverse-model agent) writes a
+        # graded verdict artifact; we read it as one more check. VERIFIED/PERFECT
+        # = met; PARTIAL/FEEDBACK/FAILED = unmet (feedback flows to the nudge).
+        proj = man.get("project") or wd
+        vf = os.path.join(proj, ".claude-team", "reviews", name + ".verdict")
+        grade, fb = None, ""
+        try:
+            with open(vf) as fh:
+                for ln in fh:
+                    m = re.match(r"\s*VERDICT:\s*(PERFECT|VERIFIED|PARTIAL|FEEDBACK|FAILED)",
+                                 ln, re.I)
+                    if m:
+                        grade = m.group(1).upper()
+                    elif re.match(r"\s*(feedback|reason|reasons):", ln, re.I):
+                        fb = ln.split(":", 1)[1].strip()
+        except OSError:
+            pass
+        sess = os.environ["CV_SESSION"]
+        sess = sess[5:] if sess.startswith("team-") else sess
+        if grade is None:
+            ok = False
+            detail = ("reviewer not yet run - spawn it (claude-team review %s %s)"
+                      % (sess, name))
+        elif grade in ("PERFECT", "VERIFIED"):
+            ok, detail = True, "reviewer verdict %s" % grade
+        else:
+            ok = False
+            detail = "reviewer verdict %s%s" % (grade, (" - " + fb) if fb else "")
+        results.append({"type": "review", "target": rv.get("persona") or "review",
+                        "ok": ok, "detail": detail})
+        met &= ok
+    if not checks.get("branch_pushed") and not checks.get("check") \
+            and not (checks.get("review") or {}):
         met = True  # no deliverable declared -> vacuously met, protocol inert
     if as_json:
         print(json.dumps({"agent": name, "met": met, "checks": results}))
@@ -1131,6 +1177,99 @@ if only and not matched:
     sys.exit(2)
 sys.exit(worst)
 PYEOF
+}
+
+# --- Build the reviewer's prompt (persona + what to review + how to report) ---
+build_review_prompt() { # $1=worker $2=persona_file $3=verdict_file $4=session
+  local worker="$1" persona_file="$2" verdict_file="$3" session="$4"
+  local dir="$CONTRACT_TMPDIR"
+  mkdir -p "$dir" 2>/dev/null || dir="${TMPDIR:-/tmp}"
+  local out
+  out=$(mktemp "${dir}/ct-review-${worker}.XXXXXX") || { echo ""; return; }
+  {
+    [[ -n "$persona_file" && -f "$persona_file" ]] && { cat "$persona_file"; echo ""; }
+    echo "# Review task"
+    echo "You are the independent, READ-ONLY verifier for worker \`${worker}\` in"
+    echo "session \`${session}\`. Do not edit the worker's code."
+    echo ""
+    echo "1. Read what the worker actually did — its session transcript:"
+    echo "     herdr pane read ${worker} --source recent-unwrapped --lines 400"
+    echo "2. Atomize the worker's ORIGINAL task + deliverable contract into claims,"
+    echo "   and check each against real evidence (diffs, raw command output). A"
+    echo "   claim contradicted by its own output is void."
+    echo "3. Write your verdict to this exact file (overwrite it):"
+    echo "     ${verdict_file}"
+    echo "   First line MUST be:"
+    echo "     VERDICT: <PERFECT|VERIFIED|PARTIAL|FEEDBACK|FAILED>"
+    echo "   Then a 'feedback:' line naming the single most important gap (if any)."
+    echo "   PERFECT/VERIFIED = deliverable met; PARTIAL/FEEDBACK/FAILED = send it back."
+  } > "$out"
+  echo "$out"
+}
+
+# --- review: spawn the agent-as-verifier for one worker ---
+# The reviewer is a separate tab (its own persona + profile => its own model,
+# optionally a different provider via runner: pi) that reads the worker's session
+# and writes a graded verdict artifact that `verify` folds in. Reserved-v2 seam
+# from docs/specs/2026-07-02-completion-protocol-design.md, modelled on the MEA
+# Pi Verifier (~/.code/learning/tac/MEA/the-verifier-agent-system/).
+cmd_review() {
+  local session="${1:-}" agent="${2:-}"
+  [[ -z "$session" || -z "$agent" ]] && { red "usage: claude-team review <session> <agent> [--wait]"; exit 2; }
+  local do_wait=false
+  [[ "${3:-}" == "--wait" ]] && do_wait=true
+  [[ "$session" != team-* ]] && session="team-${session}"
+  local man=""
+  man=$(manifest_path_for "$session") || true
+  [[ -z "$man" ]] && { red "no manifest for $session (looked in ./${TEAM_DIR}/manifest/)"; exit 2; }
+
+  # Pull the review config + work_dir + project out of the manifest (JSON via python3).
+  local rvline
+  rvline=$(CR_MAN="$man" CR_AGENT="$agent" python3 - <<'PYEOF'
+import json, os
+man = json.load(open(os.environ["CR_MAN"]))
+a = (man.get("agents") or {}).get(os.environ["CR_AGENT"])
+if not a:
+    print("ERR\tno such agent"); raise SystemExit
+rv = (a.get("checks") or {}).get("review") or {}
+if not rv:
+    print("ERR\tno review deliverable declared"); raise SystemExit
+print("OK\t%s\t%s\t%s\t%s\t%s\t%s" % (
+    rv.get("persona", ""), rv.get("profile", ""),
+    rv.get("runner", "claude") or "claude", rv.get("model", ""),
+    a.get("work_dir", "") or man.get("project", "."), man.get("project", ".")))
+PYEOF
+)
+  [[ "${rvline%%$'\t'*}" == "OK" ]] || { red "review: ${rvline#*$'\t'} (agent '$agent' in $session)"; exit 2; }
+  local persona profile runner model work_dir project
+  IFS=$'\t' read -r _ persona profile runner model work_dir project <<<"$rvline"
+
+  local reviewer="${agent}-review"
+  local verdict_rel="${TEAM_DIR}/reviews/${agent}.verdict"
+  local verdict_file="${project}/${verdict_rel}"
+  $DRY_RUN || mkdir -p "${project}/${TEAM_DIR}/reviews"
+
+  local persona_file="$persona"
+  [[ -n "$persona_file" && "$persona_file" != /* ]] && persona_file="${project}/${persona}"
+
+  local prompt_file
+  prompt_file=$(build_review_prompt "$agent" "$persona_file" "$verdict_file" "$session")
+
+  green "  [review] spawning reviewer '$reviewer' profile=${profile:-default} runner=${runner}${model:+ model=$model}"
+  dim   "           reads worker '$agent' session -> writes verdict ${verdict_rel}"
+
+  be_new_worker "$session" "$reviewer" "$work_dir"
+  local cmd
+  cmd=$(build_runner_cmd "$runner" "$model" "$prompt_file" "$profile" "$project" interactive)
+  be_send "$session" "$reviewer" "$cmd" interactive
+
+  if $do_wait && ! $DRY_RUN; then
+    dim "  [review] waiting for reviewer to finish…"
+    local rp; rp=$(be_pane_for "$session" "$reviewer" 2>/dev/null || true)
+    [[ -n "$rp" ]] && "$HERDR_BIN" wait agent-status "$rp" --status idle --timeout 900000 >/dev/null 2>&1 || true
+    if [[ -f "$verdict_file" ]]; then green "  [review] verdict:"; sed 's/^/    /' "$verdict_file"
+    else yellow "  [review] no verdict written yet - check the reviewer pane"; fi
+  fi
 }
 
 # --- Status: one-glance table of agents and their states ---
@@ -1637,6 +1776,9 @@ main() {
       ;;
     verify)
       cmd_verify "${2:-}" "${3:-}" "${4:-}"
+      ;;
+    review)
+      cmd_review "${2:-}" "${3:-}" "${4:-}"
       ;;
     status)
       cmd_status "${2:-}"

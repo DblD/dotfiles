@@ -404,5 +404,49 @@ else
   echo "  skip: nudge loop live test (no herdr server)"
 fi
 
+# --- review: deliverable (agent-as-verifier) — pure fixtures, no herdr ---
+# The reviewer is a separate (optionally diverse-model) agent that reads the
+# worker's session and writes a graded verdict artifact; `verify` folds that
+# artifact in as one more check (VERIFIED+ = met, PARTIAL- = unmet).
+RVP="$TMP/rvproj"; mkdir -p "$RVP/.claude-team/manifest" "$RVP/.claude-team/reviews" "$RVP/.claude-team/verifiers"
+echo "read-only reviewer role card" > "$RVP/.claude-team/verifiers/code-review.md"
+cat > "$RVP/.claude-team/manifest/team-rvproj.json" <<J
+{"session":"team-rvproj","config_path":"none","project":"$RVP","spawned_at":"t",
+ "agents":{
+  "revok":  {"state":"pending","nudges":0,"verifications":[],"collected":false,"reaped":false,
+             "work_dir":"$RVP","checks":{"branch_pushed":"","check":"","review":{"persona":".claude-team/verifiers/code-review.md","profile":"council-fable"}}},
+  "revno":  {"state":"pending","nudges":0,"verifications":[],"collected":false,"reaped":false,
+             "work_dir":"$RVP","checks":{"branch_pushed":"","check":"","review":{"persona":".claude-team/verifiers/code-review.md","profile":"council-fable"}}},
+  "revwait":{"state":"pending","nudges":0,"verifications":[],"collected":false,"reaped":false,
+             "work_dir":"$RVP","checks":{"branch_pushed":"","check":"","review":{"persona":".claude-team/verifiers/code-review.md","profile":"council-fable"}}}}}
+J
+printf 'VERDICT: VERIFIED\nreasons: allowlist genuinely rewired; deny/round-trip tests green\n' > "$RVP/.claude-team/reviews/revok.verdict"
+printf 'VERDICT: PARTIAL\nfeedback: nova-web engine still on 1.4.12 - bump it\n'                > "$RVP/.claude-team/reviews/revno.verdict"
+# revwait: no verdict artifact yet (reviewer not run)
+RVOUT=$(cd "$RVP" && "$CT" verify rvproj 2>&1); RVRC=$?
+check    "verify: review VERIFIED -> PASS"       "$RVOUT" "revok: PASS"
+check    "verify: review PARTIAL -> FAIL"        "$RVOUT" "revno: FAIL"
+check    "verify: review feedback surfaced"      "$RVOUT" "nova-web engine still on 1.4.12"
+check    "verify: review not-yet-run -> FAIL"    "$RVOUT" "revwait: FAIL"
+check    "verify: review not-yet-run teaching"   "$RVOUT" "reviewer not yet run"
+check_eq "verify: review any-unmet exit 1"       "$RVRC"  "1"
+RVJ=$(cd "$RVP" && "$CT" verify rvproj revok --json 2>&1)
+check    "verify: review --json met"             "$RVJ"   '"met": true'
+check    "verify: review --json type"            "$RVJ"   '"type": "review"'
+# claude-team review <session> <agent> --dry-run: spawns a reviewer on the
+# DIVERSE profile, reading the worker's session, targeting the verdict artifact.
+RDOUT=$(cd "$RVP" && "$CT" review rvproj revok --dry-run 2>&1)
+check "review: names the reviewer tab"           "$RDOUT" "revok-review"
+check "review: reviewer uses the review profile" "$RDOUT" "council-fable"
+check "review: reviewer targets verdict artifact" "$RDOUT" "reviews/revok.verdict"
+check "review: reviewer reads worker session"    "$RDOUT" "session"
+
+# review: watch decision logic (maybe_spawn_reviewer / clear_review) — python unit
+if UOUT=$(python3 "$(dirname "$0")/claude-team-review-unit.py" 2>&1); then
+  echo "$UOUT" | sed 's/^/  /'; pass=$((pass + $(echo "$UOUT" | grep -c '  ok:')))
+else
+  echo "$UOUT" | sed 's/^/  /'; fail=$((fail + $(echo "$UOUT" | grep -c 'FAIL:')))
+fi
+
 echo "== pass=$pass fail=$fail =="
 [ "$fail" -eq 0 ]

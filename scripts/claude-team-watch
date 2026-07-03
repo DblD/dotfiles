@@ -250,6 +250,73 @@ class Watcher:
                 continue
         return None
 
+    # ---- agent-as-verifier (review deliverable) ----------------------------
+    def spawn_reviewer(self, label):
+        """Launch the reviewer tab for <label> via `claude-team review`."""
+        ct = os.environ.get("CLAUDE_TEAM_BIN", "claude-team")
+        try:
+            subprocess.run([ct, "review", self.session, label], cwd=self.project,
+                           capture_output=True, text=True, timeout=60)
+            return True
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+
+    def clear_review(self, label, agent):
+        """Drop a stale verdict + spawn flag so the next idle re-reviews."""
+        agent["review_spawned"] = False
+        try:
+            os.remove(os.path.join(self.project, ".claude-team", "reviews",
+                                   label + ".verdict"))
+        except OSError:
+            pass
+
+    def maybe_spawn_reviewer(self, label, pane_id, v, agent, doc):
+        """When a worker's deterministic checks pass but its agent-review is
+        still pending, spawn the reviewer and HOLD (don't nudge the worker for
+        the reviewer's absence). Returns True if it took over this idle."""
+        if not v:
+            return False
+        checks = v.get("checks", [])
+        review = [c for c in checks if c.get("type") == "review"]
+        if not review or agent.get("review_spawned"):
+            return False
+        pending = any("not yet run" in (c.get("detail") or "") for c in review)
+        nonrev_ok = all(c.get("ok") for c in checks if c.get("type") != "review")
+        if not (pending and nonrev_ok):
+            return False  # fix deterministic checks first; verdicts nudge normally
+        if not self.spawn_reviewer(label):
+            self.emit("warn", "%s: could not spawn reviewer" % label, label=label)
+            return False
+        agent["review_spawned"] = True
+        agent["review_pane"] = pane_id
+        agent["state"] = "reviewing"
+        self.manifest_write(doc)
+        self.sidebar(pane_id, "reviewing…")
+        self.emit("review", "%s: deterministic checks met - spawned reviewer, "
+                  "awaiting verdict" % label, label=label)
+        return True
+
+    def on_reviewer_finished(self, reviewer_label, reviewer_pane):
+        """A reviewer tab went idle: re-check its parent worker (the verdict
+        artifact is now on disk), then clean up the reviewer tab."""
+        parent = reviewer_label[:-len("-review")]
+        doc = self.manifest()
+        agent = (doc or {}).get("agents", {}).get(parent)
+        ppane = (agent or {}).get("review_pane")
+        if agent and ppane:
+            self.emit("review", "%s: reviewer finished - re-checking" % parent,
+                      label=parent)
+            verdict = self.protocol_on_finished(parent, ppane)
+            if verdict:
+                if self.collect(parent, ppane):
+                    self.manifest_mark(parent, "collected")
+                if self.reap and verdict == "met" and self.reap_tab(parent, ppane):
+                    self.manifest_mark(parent, "reaped")
+        # the reviewer itself is transient: collect its notes, reap its tab
+        self.collect(reviewer_label, reviewer_pane)
+        if self.reap:
+            self.reap_tab(reviewer_label, reviewer_pane)
+
     def sidebar(self, pane_id, text):
         """Best-effort protocol status on the worker's pane (never raises)."""
         try:
@@ -299,7 +366,8 @@ class Watcher:
         doc = self.manifest()
         agent = (doc or {}).get("agents", {}).get(label)
         checks = (agent or {}).get("checks", {})
-        if not agent or not (checks.get("branch_pushed") or checks.get("check")):
+        if not agent or not (checks.get("branch_pushed") or checks.get("check")
+                             or (checks.get("review") or {})):
             return "inert"  # no deliverable declared -> collect, never reap
         if agent.get("state") in ("blocked", "incomplete"):
             # ABSORBING terminal states: the escalation nudge provokes a worker
@@ -336,6 +404,10 @@ class Watcher:
             self.sidebar(pane_id, "✓ complete")
             self.emit("verified", "%s: deliverable met" % label, label=label)
             return "met"
+        # unmet only because an agent-review is still pending -> spawn the
+        # reviewer and hold, rather than nudging the worker for its absence.
+        if self.maybe_spawn_reviewer(label, pane_id, v, agent, doc):
+            return False
         blocked = self.pane_blocked_sentinel(pane_id)
         if blocked or agent.get("nudges", 0) >= self.MAX_NUDGES:
             agent["state"] = "blocked" if blocked else "incomplete"
@@ -353,6 +425,8 @@ class Watcher:
             return False  # never reap
         agent["nudges"] = agent.get("nudges", 0) + 1
         agent["state"] = "working"
+        if (agent.get("checks") or {}).get("review"):
+            self.clear_review(label, agent)  # re-review after the worker acts
         self.manifest_write(doc)
         if v is None:
             failing = "deliverable verification could not run - retrying next idle"
@@ -393,6 +467,9 @@ class Watcher:
                 self.notify_blocked(label, pane)
             elif status in ("idle", "done") and prev == "working":
                 self.emit("finished", "%s: finished" % label, label=label, pane=pane)
+                if label.endswith("-review"):
+                    self.on_reviewer_finished(label, pane)
+                    return False
                 verdict = self.protocol_on_finished(label, pane)
                 if verdict:
                     collected = self.collect(label, pane)
