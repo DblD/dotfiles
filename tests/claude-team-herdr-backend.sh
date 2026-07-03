@@ -435,11 +435,25 @@ check    "verify: review --json met"             "$RVJ"   '"met": true'
 check    "verify: review --json type"            "$RVJ"   '"type": "review"'
 # claude-team review <session> <agent> --dry-run: spawns a reviewer on the
 # DIVERSE profile, reading the worker's session, targeting the verdict artifact.
-RDOUT=$(cd "$RVP" && "$CT" review rvproj revok --dry-run 2>&1)
+RDOUT=$(cd "$RVP" && "$CT" review rvproj revok --dry-run --backend herdr 2>&1)
 check "review: names the reviewer tab"           "$RDOUT" "revok-review"
 check "review: reviewer uses the review profile" "$RDOUT" "council-fable"
 check "review: reviewer targets verdict artifact" "$RDOUT" "reviews/revok.verdict"
 check "review: reviewer reads worker session"    "$RDOUT" "session"
+# Finding-1 regression: the fixture's review omits `model`, so with a whitespace
+# delimiter the fields shifted and a filesystem PATH was passed as --model. Assert
+# no --model appears (model empty) and the reviewer spawns in the work_dir.
+check_eq "review: no bogus --model when model omitted" "$(echo "$RDOUT" | grep -c -- '--model')" "0"
+check    "review: reviewer spawned in work_dir"        "$RDOUT" "--cwd '$RVP'"
+
+# malformed verdict: file present but no valid VERDICT line -> distinct 'malformed'
+# state, blamed on the reviewer (not "reviewer not yet run", which would nudge the worker)
+printf 'the worker did fine I think, looks good\n' > "$RVP/.claude-team/reviews/revwait.verdict"
+RVB=$(cd "$RVP" && "$CT" verify rvproj revwait --json 2>&1)
+check "verify: malformed verdict -> not met"        "$RVB" '"met": false'
+check "verify: malformed verdict state"             "$RVB" '"review_state": "malformed"'
+check "verify: malformed blames reviewer not worker" "$RVB" "not the worker's fault"
+rm -f "$RVP/.claude-team/reviews/revwait.verdict"
 
 # review: watch decision logic (maybe_spawn_reviewer / clear_review) — python unit
 if UOUT=$(python3 "$(dirname "$0")/claude-team-review-unit.py" 2>&1); then

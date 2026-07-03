@@ -280,7 +280,7 @@ class Watcher:
         review = [c for c in checks if c.get("type") == "review"]
         if not review or agent.get("review_spawned"):
             return False
-        pending = any("not yet run" in (c.get("detail") or "") for c in review)
+        pending = any(c.get("review_state") == "pending" for c in review)
         nonrev_ok = all(c.get("ok") for c in checks if c.get("type") != "review")
         if not (pending and nonrev_ok):
             return False  # fix deterministic checks first; verdicts nudge normally
@@ -295,6 +295,14 @@ class Watcher:
         self.emit("review", "%s: deterministic checks met - spawned reviewer, "
                   "awaiting verdict" % label, label=label)
         return True
+
+    def is_our_reviewer(self, reviewer_label):
+        """True only if <parent>-review corresponds to a worker WE put under
+        review (parent exists in the manifest with review_spawned). Prevents a
+        legitimately-named worker like `security-review` being mis-routed."""
+        parent = reviewer_label[:-len("-review")]
+        agent = (self.manifest() or {}).get("agents", {}).get(parent)
+        return bool(agent and agent.get("review_spawned"))
 
     def on_reviewer_finished(self, reviewer_label, reviewer_pane):
         """A reviewer tab went idle: re-check its parent worker (the verdict
@@ -408,6 +416,16 @@ class Watcher:
         # reviewer and hold, rather than nudging the worker for its absence.
         if self.maybe_spawn_reviewer(label, pane_id, v, agent, doc):
             return False
+        # a reviewer that finished without a valid verdict is the reviewer's
+        # problem, not the worker's -> escalate to human, don't nudge the worker.
+        if v and any(c.get("review_state") == "malformed" for c in v.get("checks", [])):
+            agent["state"] = "incomplete"
+            self.manifest_write(doc)
+            self.sidebar(pane_id, "✗ reviewer needs you")
+            self.notify_blocked(label, pane_id)
+            self.emit("escalated", "%s: reviewer wrote no valid verdict - "
+                      "escalated to human" % label, label=label, state="incomplete")
+            return False
         blocked = self.pane_blocked_sentinel(pane_id)
         if blocked or agent.get("nudges", 0) >= self.MAX_NUDGES:
             agent["state"] = "blocked" if blocked else "incomplete"
@@ -425,8 +443,9 @@ class Watcher:
             return False  # never reap
         agent["nudges"] = agent.get("nudges", 0) + 1
         agent["state"] = "working"
-        if (agent.get("checks") or {}).get("review"):
-            self.clear_review(label, agent)  # re-review after the worker acts
+        if v and any(c.get("type") == "review" and not c.get("ok")
+                     for c in v.get("checks", [])):
+            self.clear_review(label, agent)  # stale/failed verdict -> fresh re-review
         self.manifest_write(doc)
         if v is None:
             failing = "deliverable verification could not run - retrying next idle"
@@ -467,7 +486,7 @@ class Watcher:
                 self.notify_blocked(label, pane)
             elif status in ("idle", "done") and prev == "working":
                 self.emit("finished", "%s: finished" % label, label=label, pane=pane)
-                if label.endswith("-review"):
+                if label.endswith("-review") and self.is_our_reviewer(label):
                     self.on_reviewer_finished(label, pane)
                     return False
                 verdict = self.protocol_on_finished(label, pane)

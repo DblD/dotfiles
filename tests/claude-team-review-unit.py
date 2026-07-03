@@ -6,6 +6,7 @@ maybe_spawn_reviewer / clear_review in isolation, monkeypatching the herdr-facin
 methods (spawn_reviewer, sidebar, emit, manifest_write)."""
 import importlib.machinery
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -39,9 +40,9 @@ def mk():
     return w, calls
 
 
-def v_review(detail, ok=False, det_checks=None):
+def v_review(detail, ok=False, det_checks=None, state="pending"):
     checks = list(det_checks or [])
-    checks.append({"type": "review", "ok": ok, "detail": detail})
+    checks.append({"type": "review", "ok": ok, "detail": detail, "review_state": state})
     return {"met": False, "checks": checks}
 
 
@@ -79,8 +80,14 @@ check("no-review-check -> no spawn", took is False and calls == [])
 #    flows through the normal nudge path carrying the reviewer's feedback
 w, calls = mk()
 agent = {"checks": {"review": {"persona": "p"}}}
-took = w.maybe_spawn_reviewer("w5", "p", v_review("reviewer verdict PARTIAL - fix X"), agent, {})
+took = w.maybe_spawn_reviewer("w5", "p", v_review("reviewer verdict PARTIAL - fix X", state="verdict"), agent, {})
 check("verdict-present -> no spawn (nudges normally)", took is False and calls == [])
+
+# 5b. a malformed verdict (file present, no valid grade) -> not pending -> no spawn
+w, calls = mk()
+agent = {"checks": {"review": {"persona": "p"}}}
+took = w.maybe_spawn_reviewer("w5b", "p", v_review("no valid VERDICT line", state="malformed"), agent, {})
+check("malformed verdict -> no spawn", took is False and calls == [])
 
 # 6. clear_review drops the stale verdict + resets the spawn flag
 w, _ = mk()
@@ -94,6 +101,18 @@ check("clear_review resets spawn flag", agent.get("review_spawned") is False)
 
 # 7. reviewer label -> parent derivation
 check("reviewer label -> parent", "w7-review"[:-len("-review")] == "w7")
+
+# 8. is_our_reviewer: true ONLY for a parent we put under review (guards a
+#    legitimately-named worker like `security-review` from being mis-routed)
+w, _ = mk()
+mdir = os.path.join(w.project, ".claude-team", "manifest")
+os.makedirs(mdir, exist_ok=True)
+with open(os.path.join(mdir, "team-x.json"), "w") as fh:
+    json.dump({"agents": {"w8": {"review_spawned": True}, "plain": {}}}, fh)
+check("is_our_reviewer: spawned parent -> true", w.is_our_reviewer("w8-review") is True)
+check("is_our_reviewer: unknown parent -> false", w.is_our_reviewer("nope-review") is False)
+check("is_our_reviewer: parent without review_spawned -> false",
+      w.is_our_reviewer("plain-review") is False)
 
 print("UNIT: %d fail" % len(fails))
 sys.exit(1 if fails else 0)

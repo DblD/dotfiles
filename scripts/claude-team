@@ -417,7 +417,7 @@ manifest_seed() { # $1=session $2=project_path $3=config_file
   local dir="$2/${TEAM_DIR}/manifest"
   mkdir -p "$dir"
   MS_SESSION="$1" MS_PROJECT="$2" MS_CONFIG="$3" MS_OUT="$dir/$1.json" python3 - <<'PYEOF'
-import datetime, json, os, subprocess, tempfile
+import datetime, json, os, subprocess, sys, tempfile
 cfg = os.environ["MS_CONFIG"]
 try:
     raw = subprocess.run(["yq", "-o=json", ".agents", cfg],
@@ -444,9 +444,14 @@ for a in agent_list:
         raise SystemExit("manifest_seed: agent entry missing 'name' in config")
     deliverable = a.get("deliverable") or {}
     review = deliverable.get("review") or {}
+    if review and not isinstance(review, dict):
+        sys.stderr.write("manifest_seed: agent %r: deliverable.review must be a "
+                         "mapping {persona,profile,...}, got %r - ignoring\n"
+                         % (name, review))
+        review = {}
     checks = {"branch_pushed": deliverable.get("branch_pushed") or "",
               "check": deliverable.get("check") or "",
-              "review": review if isinstance(review, dict) else {}}
+              "review": review}
     if name in agents and isinstance(agents[name], dict):
         # existing agent: preserve protocol state, refresh checks only
         agents[name]["checks"] = checks
@@ -476,6 +481,25 @@ doc = json.load(open(man))
 a = doc["agents"].get(os.environ["MW_AGENT"])
 if a is not None:
     a["work_dir"] = os.environ["MW_DIR"]
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(man))
+with os.fdopen(fd, "w") as f:
+    json.dump(doc, f, indent=2)
+os.replace(tmp, man)
+PYEOF
+}
+
+manifest_mark_review() { # $1=manifest $2=agent $3=worker_pane  (review spawned; parent pane for re-check)
+  $DRY_RUN && return 0
+  [[ -f "$1" ]] || return 0
+  MR_MAN="$1" MR_AGENT="$2" MR_PANE="$3" python3 - <<'PYEOF'
+import json, os, tempfile
+man = os.environ["MR_MAN"]
+doc = json.load(open(man))
+a = doc["agents"].get(os.environ["MR_AGENT"])
+if a is not None:
+    a["review_spawned"] = True
+    if os.environ["MR_PANE"]:
+        a["review_pane"] = os.environ["MR_PANE"]
 fd, tmp = tempfile.mkstemp(dir=os.path.dirname(man))
 with os.fdopen(fd, "w") as f:
     json.dump(doc, f, indent=2)
@@ -1134,31 +1158,36 @@ for name, a in man["agents"].items():
         # = met; PARTIAL/FEEDBACK/FAILED = unmet (feedback flows to the nudge).
         proj = man.get("project") or wd
         vf = os.path.join(proj, ".claude-team", "reviews", name + ".verdict")
-        grade, fb = None, ""
+        grade, fb, have_file = None, "", False
         try:
             with open(vf) as fh:
+                have_file = True
                 for ln in fh:
                     m = re.match(r"\s*VERDICT:\s*(PERFECT|VERIFIED|PARTIAL|FEEDBACK|FAILED)",
                                  ln, re.I)
-                    if m:
+                    if m and grade is None:          # first VERDICT line wins
                         grade = m.group(1).upper()
-                    elif re.match(r"\s*(feedback|reason|reasons):", ln, re.I):
+                    elif re.match(r"\s*(feedback|reason|reasons):", ln, re.I) and not fb:
                         fb = ln.split(":", 1)[1].strip()
         except OSError:
             pass
         sess = os.environ["CV_SESSION"]
         sess = sess[5:] if sess.startswith("team-") else sess
-        if grade is None:
-            ok = False
+        if grade is None and not have_file:
+            state, ok = "pending", False        # reviewer not run yet -> watch spawns it
             detail = ("reviewer not yet run - spawn it (claude-team review %s %s)"
                       % (sess, name))
+        elif grade is None:
+            state, ok = "malformed", False       # file present, no valid VERDICT: line
+            detail = ("reviewer wrote no valid 'VERDICT: <grade>' line - the reviewer "
+                      "needs attention (not the worker's fault)")
         elif grade in ("PERFECT", "VERIFIED"):
-            ok, detail = True, "reviewer verdict %s" % grade
+            state, ok, detail = "verdict", True, "reviewer verdict %s" % grade
         else:
-            ok = False
+            state, ok = "verdict", False
             detail = "reviewer verdict %s%s" % (grade, (" - " + fb) if fb else "")
         results.append({"type": "review", "target": rv.get("persona") or "review",
-                        "ok": ok, "detail": detail})
+                        "ok": ok, "detail": detail, "review_state": state})
         met &= ok
     if not checks.get("branch_pushed") and not checks.get("check") \
             and not (checks.get("review") or {}):
@@ -1180,8 +1209,8 @@ PYEOF
 }
 
 # --- Build the reviewer's prompt (persona + what to review + how to report) ---
-build_review_prompt() { # $1=worker $2=persona_file $3=verdict_file $4=session
-  local worker="$1" persona_file="$2" verdict_file="$3" session="$4"
+build_review_prompt() { # $1=worker $2=worker_ref(pane|label) $3=persona_file $4=verdict_file $5=session
+  local worker="$1" worker_ref="$2" persona_file="$3" verdict_file="$4" session="$5"
   local dir="$CONTRACT_TMPDIR"
   mkdir -p "$dir" 2>/dev/null || dir="${TMPDIR:-/tmp}"
   local out
@@ -1193,7 +1222,7 @@ build_review_prompt() { # $1=worker $2=persona_file $3=verdict_file $4=session
     echo "session \`${session}\`. Do not edit the worker's code."
     echo ""
     echo "1. Read what the worker actually did — its session transcript:"
-    echo "     herdr pane read ${worker} --source recent-unwrapped --lines 400"
+    echo "     herdr pane read ${worker_ref} --source recent-unwrapped --lines 400"
     echo "2. Atomize the worker's ORIGINAL task + deliverable contract into claims,"
     echo "   and check each against real evidence (diffs, raw command output). A"
     echo "   claim contradicted by its own output is void."
@@ -1227,33 +1256,54 @@ cmd_review() {
   local rvline
   rvline=$(CR_MAN="$man" CR_AGENT="$agent" python3 - <<'PYEOF'
 import json, os
+US = "\x1f"  # unit separator: a NON-whitespace delimiter, so empty fields (e.g.
+             # an omitted model) survive the shell read instead of shifting left.
 man = json.load(open(os.environ["CR_MAN"]))
 a = (man.get("agents") or {}).get(os.environ["CR_AGENT"])
 if not a:
-    print("ERR\tno such agent"); raise SystemExit
+    print("ERR" + US + "no such agent"); raise SystemExit
 rv = (a.get("checks") or {}).get("review") or {}
 if not rv:
-    print("ERR\tno review deliverable declared"); raise SystemExit
-print("OK\t%s\t%s\t%s\t%s\t%s\t%s" % (
-    rv.get("persona", ""), rv.get("profile", ""),
-    rv.get("runner", "claude") or "claude", rv.get("model", ""),
-    a.get("work_dir", "") or man.get("project", "."), man.get("project", ".")))
+    print("ERR" + US + "no review deliverable declared"); raise SystemExit
+print(US.join(["OK", rv.get("persona", ""), rv.get("profile", ""),
+               rv.get("runner", "claude") or "claude", rv.get("model", ""),
+               a.get("work_dir", "") or man.get("project", "."),
+               man.get("project", ".")]))
 PYEOF
 )
-  [[ "${rvline%%$'\t'*}" == "OK" ]] || { red "review: ${rvline#*$'\t'} (agent '$agent' in $session)"; exit 2; }
+  [[ "${rvline%%$'\037'*}" == "OK" ]] || { red "review: ${rvline#*$'\037'} (agent '$agent' in $session)"; exit 2; }
   local persona profile runner model work_dir project
-  IFS=$'\t' read -r _ persona profile runner model work_dir project <<<"$rvline"
+  IFS=$'\037' read -r _ persona profile runner model work_dir project <<<"$rvline"
 
   local reviewer="${agent}-review"
   local verdict_rel="${TEAM_DIR}/reviews/${agent}.verdict"
   local verdict_file="${project}/${verdict_rel}"
   $DRY_RUN || mkdir -p "${project}/${TEAM_DIR}/reviews"
 
-  local persona_file="$persona"
-  [[ -n "$persona_file" && "$persona_file" != /* ]] && persona_file="${project}/${persona}"
+  # Resolve the persona card: explicit path, else a name under the project's
+  # .claude-team/verifiers/, else a shared card under ~/.config/claude-teams/_verifiers/.
+  local persona_file=""
+  if [[ -n "$persona" ]]; then
+    local cfg="${CONFIG_DIR:-$HOME/.config/claude-teams}"
+    if   [[ "$persona" == /* ]]; then                                   persona_file="$persona"
+    elif [[ -f "${project}/${persona}" ]]; then                        persona_file="${project}/${persona}"
+    elif [[ -f "${project}/${TEAM_DIR}/verifiers/${persona}.md" ]]; then persona_file="${project}/${TEAM_DIR}/verifiers/${persona}.md"
+    elif [[ -f "${cfg}/_verifiers/${persona}.md" ]]; then              persona_file="${cfg}/_verifiers/${persona}.md"
+    else                                                               persona_file="${project}/${persona}"; fi
+  fi
+
+  # Point the reviewer at the worker's actual pane (falls back to the label), and
+  # record that this worker is under review so the watch re-check fires and no
+  # second reviewer is spawned — works for a manual `review` too, not just auto.
+  local worker_ref="$agent" worker_pane=""
+  if ! $DRY_RUN; then
+    worker_pane=$(be_pane_for "$session" "$agent" 2>/dev/null || true)
+    [[ -n "$worker_pane" ]] && worker_ref="$worker_pane"
+    manifest_mark_review "$man" "$agent" "$worker_pane"
+  fi
 
   local prompt_file
-  prompt_file=$(build_review_prompt "$agent" "$persona_file" "$verdict_file" "$session")
+  prompt_file=$(build_review_prompt "$agent" "$worker_ref" "$persona_file" "$verdict_file" "$session")
 
   green "  [review] spawning reviewer '$reviewer' profile=${profile:-default} runner=${runner}${model:+ model=$model}"
   dim   "           reads worker '$agent' session -> writes verdict ${verdict_rel}"
