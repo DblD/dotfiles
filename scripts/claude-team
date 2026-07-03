@@ -1314,11 +1314,16 @@ PYEOF
   be_send "$session" "$reviewer" "$cmd" interactive
 
   if $do_wait && ! $DRY_RUN; then
-    dim "  [review] waiting for reviewer to finish…"
-    local rp; rp=$(be_pane_for "$session" "$reviewer" 2>/dev/null || true)
-    [[ -n "$rp" ]] && "$HERDR_BIN" wait agent-status "$rp" --status idle --timeout 900000 >/dev/null 2>&1 || true
+    dim "  [review] waiting for reviewer to write its verdict…"
+    # Poll the verdict artifact — that IS the completion signal (the reviewer
+    # writes it as its final act). More robust than waiting on the reviewer's
+    # pane status, which races with tab creation right after spawn.
+    local waited=0 timeout=900
+    while [[ ! -f "$verdict_file" && "$waited" -lt "$timeout" ]]; do
+      sleep 5; waited=$((waited + 5))
+    done
     if [[ -f "$verdict_file" ]]; then green "  [review] verdict:"; sed 's/^/    /' "$verdict_file"
-    else yellow "  [review] no verdict written yet - check the reviewer pane"; fi
+    else yellow "  [review] no verdict after ${timeout}s - check the reviewer pane ('${reviewer}')"; fi
   fi
 }
 
