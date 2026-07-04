@@ -13,7 +13,11 @@ events for the workspace whose label matches the given session, and:
 
 Stdlib only. Invoked by `claude-team watch <session>` (which exports
 CLAUDE_TEAM_BIN so verify can be shelled out to).
-v1 constraint: run_verify() is called synchronously from the single event
+Reviews are non-blocking: spawning a reviewer registers it as in-flight
+(register_review) and returns; a timed loop tick (select) polls in-flight
+reviews (poll_reviews) and resolves each independently once its verdict
+artifact lands or its deadline passes, so concurrent reviews never serialize.
+v1 constraint: run_verify() is still called synchronously from the single event
 loop (handle() -> protocol_on_finished()), so a slow deliverable check
 (subprocess timeout up to 120s, plus the branch_pushed ls-remote) blocks
 delivery of every other event for up to ~3 minutes worst case. Fine for a
@@ -27,6 +31,7 @@ Protocol notes (verified against herdr 0.7.1 / protocol 14):
 
 import json
 import os
+import select
 import shutil
 import signal
 import socket
@@ -62,6 +67,7 @@ class Watcher:
         self.last_status = {}     # pane_id -> last agent_status
         self.pane_tab = {}        # pane_id -> tab_id
         self.tab_label = {}       # tab_id -> label
+        self.reviews = {}         # label -> {"pane": pane_id, "deadline": monotonic}; in-flight
 
     # ---- output -----------------------------------------------------------
     def emit(self, event, message, **extra):
@@ -191,6 +197,7 @@ class Watcher:
     MAX_NUDGES = 2       # end-of-task: fix the deliverable in a couple tries
     PER_TURN_MAX = 8     # per_turn review: continuous feedback needs more cycles
     REVIEW_TIMEOUT = 240 # how long to wait for a reviewer's verdict artifact (s)
+    REVIEW_POLL_INTERVAL = 3  # loop-tick cadence (s) for polling in-flight reviews
 
     def manifest_path(self):
         if not self.project:
@@ -307,14 +314,40 @@ class Watcher:
                 return pid
         return None
 
-    def await_and_finish_review(self, label, pane_id):
-        """After spawning the reviewer, WAIT for its verdict artifact, then finish
-        the parent's completion protocol. Bounded inline block (reviews serialize)
-        — replaces relying on the reviewer's pane transition, which pi never emits."""
-        waited = 0
-        while waited < self.REVIEW_TIMEOUT and not self.verdict_ready(label):
-            time.sleep(3)
-            waited += 3
+    def register_review(self, label, pane_id):
+        """Record a spawned review as in-flight and return immediately — poll_reviews()
+        resolves it once the verdict artifact lands or the deadline passes. Non-blocking
+        replacement for the old inline await, so concurrent reviews no longer serialize."""
+        self.reviews[label] = {"pane": pane_id,
+                               "deadline": time.monotonic() + self.REVIEW_TIMEOUT}
+
+    def poll_reviews(self):
+        """Resolve every in-flight review whose verdict artifact is ready or whose
+        deadline has passed. Called on each loop tick, so reviews complete without
+        blocking delivery of other panes' events; multiple reviews resolve
+        independently in a single pass."""
+        if not self.reviews:
+            return
+        now = time.monotonic()
+        for label in list(self.reviews):
+            info = self.reviews[label]
+            ready = self.verdict_ready(label)
+            if not ready and now < info["deadline"]:
+                continue
+            del self.reviews[label]               # drop before finishing (no re-entry)
+            self.finish_review(label, info["pane"], timed_out=not ready)
+
+    def finish_review(self, label, pane_id, timed_out=False):
+        """Run the parent's completion protocol now that its review is done (verdict
+        artifact ready or deadline passed): collect/reap the reviewer tab, run
+        protocol_on_finished, then collect/reap the parent and mark the manifest.
+        Timed-out reviews still resolve the parent (never stranded). Mirrors the old
+        await_and_finish_review tail exactly — only the blocking wait is gone. Relying
+        on the verdict artifact (not the reviewer's pane transition) is deliberate: pi
+        / non-Anthropic reviewers never emit working->idle."""
+        if timed_out:
+            self.emit("review", "%s: review timed out (%ds) - resolving parent"
+                      % (label, self.REVIEW_TIMEOUT), label=label)
         rpane = self.pane_for_label(label + "-review")   # reviewer's job is done
         if rpane:
             self.collect(label + "-review", rpane)
@@ -356,7 +389,7 @@ class Watcher:
         self.emit("review", "%s: spawned reviewer (%s), awaiting verdict"
                   % (label, "per-turn" if per_turn else "deterministic checks met"),
                   label=label)
-        self.await_and_finish_review(label, pane_id)   # verdict-artifact-driven completion
+        self.register_review(label, pane_id)   # non-blocking; poll_reviews resolves it
         return True
 
     def is_our_reviewer(self, reviewer_label):
@@ -374,8 +407,12 @@ class Watcher:
         doc = self.manifest()
         agent = (doc or {}).get("agents", {}).get(parent)
         ppane = (agent or {}).get("review_pane")
-        # await_and_finish_review (verdict-artifact-driven) is the primary path;
-        # only re-check here if it hasn't already resolved this review.
+        # poll_reviews (verdict-artifact-driven) is the primary path; drop any
+        # in-flight tracking so it won't ALSO resolve this review. The state guard
+        # then prevents a double protocol_on_finished when the poll got here first
+        # (it moves state away from "reviewing"). Resolving off manifest state keeps
+        # this path working even after a watch restart lost the in-memory registry.
+        self.reviews.pop(parent, None)
         if agent and ppane and agent.get("state") == "reviewing":
             self.emit("review", "%s: reviewer finished - re-checking" % parent,
                       label=parent)
@@ -593,6 +630,21 @@ class Watcher:
         return False
 
     # ---- main loops ----------------------------------------------------------
+    def _tick(self, s, timeout):
+        """Block up to `timeout`s for event-socket data, then ALWAYS poll in-flight
+        reviews before returning. Returns the bytes read, or b'' when the tick only
+        polled (select timed out). Raises ConnectionError if the socket closed. This
+        is the seam that lets the loop reach poll_reviews() on an idle system — a
+        verdict lands asynchronously, so a purely event-driven loop would never see it."""
+        ready, _, _ = select.select([s], [], [], timeout)
+        self.poll_reviews()
+        if not ready:
+            return b""
+        d = s.recv(65536)
+        if not d:
+            raise ConnectionError("event socket closed")
+        return d
+
     def watch_once(self):
         """One subscribe connection; returns when a re-subscribe is needed."""
         panes = self.refresh()
@@ -611,10 +663,12 @@ class Watcher:
                       % (self.session, self.ws, len(panes)),
                       workspace=self.ws, panes=sorted(subscribed))
             buf = b""
-            while True:  # raw recv loop (makefile buffering drops events)
-                d = s.recv(65536)
+            while True:  # tick loop: block <=interval for data, then poll reviews
+                # raw recv (makefile buffering drops events); _tick also polls
+                # in-flight reviews every tick, incl. idle ticks with no data
+                d = self._tick(s, self.REVIEW_POLL_INTERVAL)
                 if not d:
-                    raise ConnectionError("event socket closed")
+                    continue          # idle tick: only polled in-flight reviews
                 buf += d
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
