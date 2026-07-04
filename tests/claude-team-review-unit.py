@@ -37,6 +37,7 @@ def mk():
     w.sidebar = lambda *a, **k: None
     w.emit = lambda *a, **k: None
     w.manifest_write = lambda doc: None
+    w.await_and_finish_review = lambda *a, **k: None  # don't block/poll in unit tests
     return w, calls
 
 
@@ -119,6 +120,17 @@ check("is_our_reviewer: spawned parent -> true", w.is_our_reviewer("w8-review") 
 check("is_our_reviewer: unknown parent -> false", w.is_our_reviewer("nope-review") is False)
 check("is_our_reviewer: parent without review_spawned -> false",
       w.is_our_reviewer("plain-review") is False)
+
+# 9. verdict_ready: the cross-model completion signal — true only with a valid VERDICT line
+w, _ = mk()
+rd = os.path.join(w.project, ".claude-team", "reviews")
+with open(os.path.join(rd, "vr_ok.verdict"), "w") as fh:
+    fh.write("VERDICT: VERIFIED\nfeedback: none\n")
+with open(os.path.join(rd, "vr_bad.verdict"), "w") as fh:
+    fh.write("looks good to me, but no verdict line here\n")
+check("verdict_ready: valid VERDICT line -> true", w.verdict_ready("vr_ok") is True)
+check("verdict_ready: file without VERDICT -> false", w.verdict_ready("vr_bad") is False)
+check("verdict_ready: absent file -> false", w.verdict_ready("vr_missing") is False)
 
 print("UNIT: %d fail" % len(fails))
 sys.exit(1 if fails else 0)

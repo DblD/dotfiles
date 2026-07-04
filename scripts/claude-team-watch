@@ -190,6 +190,7 @@ class Watcher:
     # ---- completion protocol ------------------------------------------------
     MAX_NUDGES = 2       # end-of-task: fix the deliverable in a couple tries
     PER_TURN_MAX = 8     # per_turn review: continuous feedback needs more cycles
+    REVIEW_TIMEOUT = 240 # how long to wait for a reviewer's verdict artifact (s)
 
     def manifest_path(self):
         if not self.project:
@@ -278,6 +279,54 @@ class Watcher:
         except OSError:
             pass
 
+    def verdict_ready(self, label):
+        """True once the reviewer has written a valid VERDICT line to its artifact.
+        This file — not the reviewer's pane status — is the reliable cross-model
+        completion signal (pi/non-Anthropic reviewers don't report working->idle)."""
+        vf = os.path.join(self.project, ".claude-team", "reviews", label + ".verdict")
+        grades = ("PERFECT", "VERIFIED", "PARTIAL", "FEEDBACK", "FAILED")
+        try:
+            with open(vf) as fh:
+                for ln in fh:
+                    s = ln.strip().upper()
+                    if s.startswith("VERDICT:") and any(g in s for g in grades):
+                        return True
+        except OSError:
+            pass
+        return False
+
+    def pane_for_label(self, label):
+        """Resolve a label -> pane_id (refreshes the tab/pane maps first)."""
+        try:
+            self.refresh()
+        except (OSError, RuntimeError, json.JSONDecodeError):
+            pass
+        tabs = {t for t, l in self.tab_label.items() if l == label}
+        for pid, tid in self.pane_tab.items():
+            if tid in tabs:
+                return pid
+        return None
+
+    def await_and_finish_review(self, label, pane_id):
+        """After spawning the reviewer, WAIT for its verdict artifact, then finish
+        the parent's completion protocol. Bounded inline block (reviews serialize)
+        — replaces relying on the reviewer's pane transition, which pi never emits."""
+        waited = 0
+        while waited < self.REVIEW_TIMEOUT and not self.verdict_ready(label):
+            time.sleep(3)
+            waited += 3
+        rpane = self.pane_for_label(label + "-review")   # reviewer's job is done
+        if rpane:
+            self.collect(label + "-review", rpane)
+            if self.reap:
+                self.reap_tab(label + "-review", rpane)
+        verdict = self.protocol_on_finished(label, pane_id)
+        if verdict:
+            if self.collect(label, pane_id):
+                self.manifest_mark(label, "collected")
+            if self.reap and verdict == "met" and self.reap_tab(label, pane_id):
+                self.manifest_mark(label, "reaped")
+
     def maybe_spawn_reviewer(self, label, pane_id, v, agent, doc):
         """Spawn the agent-reviewer and HOLD when its review is pending. In the
         default (end-of-task) mode this waits until the deterministic checks pass;
@@ -307,6 +356,7 @@ class Watcher:
         self.emit("review", "%s: spawned reviewer (%s), awaiting verdict"
                   % (label, "per-turn" if per_turn else "deterministic checks met"),
                   label=label)
+        self.await_and_finish_review(label, pane_id)   # verdict-artifact-driven completion
         return True
 
     def is_our_reviewer(self, reviewer_label):
@@ -324,7 +374,9 @@ class Watcher:
         doc = self.manifest()
         agent = (doc or {}).get("agents", {}).get(parent)
         ppane = (agent or {}).get("review_pane")
-        if agent and ppane:
+        # await_and_finish_review (verdict-artifact-driven) is the primary path;
+        # only re-check here if it hasn't already resolved this review.
+        if agent and ppane and agent.get("state") == "reviewing":
             self.emit("review", "%s: reviewer finished - re-checking" % parent,
                       label=parent)
             verdict = self.protocol_on_finished(parent, ppane)
