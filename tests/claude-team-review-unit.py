@@ -210,5 +210,22 @@ w.rpc = lambda *a, **k: (called.append(1), {"workspaces": []})[1]
 w._maybe_check_alive()
 check("within interval -> no liveness RPC", called == [])
 
+# 16-19. review audit trail (F2): capture_review_artifact prefers the reviewer's
+#     authored review file and folds it into results/; missing/empty -> False so
+#     the caller falls back to the (flaky) pane scrape.
+w, _ = mk()
+rev_dir = os.path.join(w.project, ".claude-team", "reviews")
+check("no authored review -> capture False", w.capture_review_artifact("w1") is False)
+open(os.path.join(rev_dir, "w1.review.md"), "w").close()   # empty
+check("empty authored review -> capture False", w.capture_review_artifact("w1") is False)
+with open(os.path.join(rev_dir, "w1.review.md"), "w") as fh:
+    fh.write("claim: tests pass -> ran suite, 0 fail\nconclusion: VERIFIED\n")
+ok = w.capture_review_artifact("w1")
+res = os.path.join(w.project, ".claude-team", "results", "w1-review.md")
+body = open(res).read() if os.path.exists(res) else ""
+check("authored review -> capture True", ok is True)
+check("authored review lands in results",
+      "claim: tests pass" in body and "conclusion: VERIFIED" in body)
+
 print("UNIT: %d fail" % len(fails))
 sys.exit(1 if fails else 0)

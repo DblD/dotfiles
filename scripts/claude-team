@@ -1246,8 +1246,8 @@ PYEOF
 }
 
 # --- Build the reviewer's prompt (persona + what to review + how to report) ---
-build_review_prompt() { # $1=worker $2=worker_ref(pane|label) $3=persona_file $4=verdict_file $5=session
-  local worker="$1" worker_ref="$2" persona_file="$3" verdict_file="$4" session="$5"
+build_review_prompt() { # $1=worker $2=worker_ref(pane|label) $3=persona_file $4=verdict_file $5=session $6=review_file
+  local worker="$1" worker_ref="$2" persona_file="$3" verdict_file="$4" session="$5" review_file="${6:-}"
   local dir="$CONTRACT_TMPDIR"
   mkdir -p "$dir" 2>/dev/null || dir="${TMPDIR:-/tmp}"
   local out
@@ -1263,7 +1263,15 @@ build_review_prompt() { # $1=worker $2=worker_ref(pane|label) $3=persona_file $4
     echo "2. Atomize the worker's ORIGINAL task + deliverable contract into claims,"
     echo "   and check each against real evidence (diffs, raw command output). A"
     echo "   claim contradicted by its own output is void."
-    echo "3. Write your verdict to this exact file (overwrite it):"
+    if [[ -n "$review_file" ]]; then
+      echo "3. Write your FULL review to this file (overwrite it): one line per claim"
+      echo "   you checked, each with the concrete evidence for or against it, then a"
+      echo "   one-line conclusion. This is the durable audit trail — do not skip it:"
+      echo "     ${review_file}"
+      echo "4. Then write your verdict to this exact file (overwrite it):"
+    else
+      echo "3. Write your verdict to this exact file (overwrite it):"
+    fi
     echo "     ${verdict_file}"
     echo "   First line MUST be:"
     echo "     VERDICT: <PERFECT|VERIFIED|PARTIAL|FEEDBACK|FAILED>"
@@ -1315,6 +1323,10 @@ PYEOF
   local reviewer="${agent}-review"
   local verdict_rel="${TEAM_DIR}/reviews/${agent}.verdict"
   local verdict_file="${project}/${verdict_rel}"
+  # Durable audit trail the reviewer authors itself (the terse verdict carries
+  # only the grade; the pane scrape is unreliable — pi clears its own pane).
+  local review_rel="${TEAM_DIR}/reviews/${agent}.review.md"
+  local review_file="${project}/${review_rel}"
   $DRY_RUN || mkdir -p "${project}/${TEAM_DIR}/reviews"
 
   # Resolve the persona card: explicit path, else a name under the project's
@@ -1340,10 +1352,10 @@ PYEOF
   fi
 
   local prompt_file
-  prompt_file=$(build_review_prompt "$agent" "$worker_ref" "$persona_file" "$verdict_file" "$session")
+  prompt_file=$(build_review_prompt "$agent" "$worker_ref" "$persona_file" "$verdict_file" "$session" "$review_file")
 
   green "  [review] spawning reviewer '$reviewer' profile=${profile:-default} runner=${runner}${model:+ model=$model}"
-  dim   "           reads worker '$agent' session -> writes verdict ${verdict_rel}"
+  dim   "           reads worker '$agent' session -> writes review ${review_rel} + verdict ${verdict_rel}"
 
   be_new_worker "$session" "$reviewer" "$work_dir"
   local cmd

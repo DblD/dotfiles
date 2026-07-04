@@ -338,6 +338,34 @@ class Watcher:
             del self.reviews[label]               # drop before finishing (no re-entry)
             self.finish_review(label, info["pane"], timed_out=not ready)
 
+    def capture_review_artifact(self, label):
+        """Copy the reviewer-authored review file (reviews/<label>.review.md) into
+        results/ as the durable audit trail. Returns True when a non-empty review
+        was captured; False (caller falls back to the flaky pane scrape) when the
+        reviewer wrote nothing. The authored file — not the pane — is the reliable
+        record: pi/non-Anthropic reviewers clear their pane, so the scrape is
+        usually empty (the gap this closes)."""
+        if not self.project:
+            return False
+        src = os.path.join(self.project, ".claude-team", "reviews", label + ".review.md")
+        try:
+            with open(src, encoding="utf-8") as fh:
+                body = fh.read()
+        except OSError:
+            return False
+        if not body.strip():
+            return False
+        results = os.path.join(self.project, ".claude-team", "results")
+        try:
+            os.makedirs(results, exist_ok=True)
+            path = os.path.join(results,
+                                (label + "-review").replace(os.sep, "-") + ".md")
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write("\n## review of %s (authored)\n\n%s\n" % (label, body))
+        except OSError:
+            return False
+        return True
+
     def finish_review(self, label, pane_id, timed_out=False):
         """Run the parent's completion protocol now that its review is done (verdict
         artifact ready or deadline passed): collect/reap the reviewer tab, run
@@ -350,10 +378,13 @@ class Watcher:
             self.emit("review", "%s: review timed out (%ds) - resolving parent"
                       % (label, self.REVIEW_TIMEOUT), label=label)
         rpane = self.pane_for_label(label + "-review")   # reviewer's job is done
-        if rpane:
+        # Prefer the reviewer-authored review artifact as the durable audit trail;
+        # fall back to scraping the pane only if it didn't write one (pi clears its
+        # own pane, so the scrape is frequently empty).
+        if not self.capture_review_artifact(label) and rpane:
             self.collect(label + "-review", rpane)
-            if self.reap:
-                self.reap_tab(label + "-review", rpane)
+        if rpane and self.reap:
+            self.reap_tab(label + "-review", rpane)
         verdict = self.protocol_on_finished(label, pane_id)
         if verdict:
             if self.collect(label, pane_id):
