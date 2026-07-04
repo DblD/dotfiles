@@ -69,6 +69,7 @@ class Watcher:
         self.tab_label = {}       # tab_id -> label
         self.reviews = {}         # label -> {"pane": pane_id, "deadline": monotonic}; in-flight
         self._last_live_check = 0.0  # monotonic ts of the last workspace-liveness check
+        self._gone_count = 0      # consecutive 'workspace gone' observations (quorum before exit)
 
     # ---- output -----------------------------------------------------------
     def emit(self, event, message, **extra):
@@ -279,13 +280,17 @@ class Watcher:
         return True
 
     def clear_review(self, label, agent):
-        """Drop a stale verdict + spawn flag so the next idle re-reviews."""
+        """Drop the stale verdict + review artifact + spawn flag so the next idle
+        re-reviews from scratch. The .review.md must go too: a leftover would
+        otherwise be captured by capture_review_artifact as THIS cycle's audit
+        trail (masking the current reviewer's output)."""
         agent["review_spawned"] = False
-        try:
-            os.remove(os.path.join(self.project, ".claude-team", "reviews",
-                                   label + ".verdict"))
-        except OSError:
-            pass
+        rdir = os.path.join(self.project, ".claude-team", "reviews")
+        for suffix in (".verdict", ".review.md"):
+            try:
+                os.remove(os.path.join(rdir, label + suffix))
+            except OSError:
+                pass
 
     def verdict_ready(self, label):
         """True once the reviewer has written a valid VERDICT line to its artifact.
@@ -349,7 +354,10 @@ class Watcher:
             return False
         src = os.path.join(self.project, ".claude-team", "reviews", label + ".review.md")
         try:
-            with open(src, encoding="utf-8") as fh:
+            # errors="replace": a reviewer that dumps non-UTF-8 bytes must not crash
+            # the supervisor (a bare read would raise UnicodeDecodeError, a ValueError
+            # that no caller up to run() catches).
+            with open(src, encoding="utf-8", errors="replace") as fh:
                 body = fh.read()
         except OSError:
             return False
@@ -663,23 +671,34 @@ class Watcher:
 
     # ---- main loops ----------------------------------------------------------
     LIVENESS_INTERVAL = 30.0  # re-check the workspace still exists every N seconds
+    LIVENESS_GONE_QUORUM = 2  # consecutive 'gone' observations required before exiting
 
     def _maybe_check_alive(self):
-        """Periodically confirm our workspace still exists; exit cleanly if it was
-        closed (via `claude-team --stop`, a crash, or a manual close). Closing a
+        """Periodically confirm our workspace still exists; exit cleanly once it is
+        gone (via `claude-team --stop`, a crash, or a manual close). Closing a
         workspace does NOT close the watcher's global event socket, so without this
         the tick loop would select on a silent socket forever — a leaked process
         (the exact symptom we saw). Cheap: at most one workspace.list RPC every
-        LIVENESS_INTERVAL seconds. Reuses refresh()'s exit convention (sys.exit 0)."""
+        LIVENESS_INTERVAL seconds. Exit requires LIVENESS_GONE_QUORUM *consecutive*
+        'gone' readings so a single transient/partial reply can't kill a live
+        supervisor mid-run. Any error or malformed reply resets the counter and
+        never exits. Reuses refresh()'s exit convention (sys.exit 0)."""
         now = time.monotonic()
         if now - self._last_live_check < self.LIVENESS_INTERVAL:
             return
         self._last_live_check = now
         try:
             wss = self.rpc("workspace.list", {}).get("workspaces", [])
-        except (OSError, RuntimeError, json.JSONDecodeError):
-            return  # transient RPC failure — retry next interval, never exit on error
-        if self.ws and not any(w.get("label") == self.session for w in wss):
+            present = any(isinstance(w, dict) and w.get("label") == self.session
+                          for w in wss)
+        except (OSError, RuntimeError, TypeError, ValueError, AttributeError):
+            self._gone_count = 0  # transient/malformed reply — retry next interval, never exit
+            return
+        if not self.ws or present:
+            self._gone_count = 0
+            return
+        self._gone_count += 1
+        if self._gone_count >= self.LIVENESS_GONE_QUORUM:
             self.emit("closed", "workspace '%s' closed, exiting" % self.session)
             sys.exit(0)
 
