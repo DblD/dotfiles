@@ -181,5 +181,34 @@ w.poll_reviews()
 check("timed-out review still resolves its parent", resolved == ["ra", "rb"])
 check("timed-out review dropped from in-flight", "rb" not in w.reviews)
 
+# 13-15. workspace-liveness self-exit (F3): the tick periodically confirms our
+#     workspace still exists and exits cleanly once it's gone, so a watcher never
+#     leaks after its workspace is closed (--stop / crash / manual close).
+import time as _time
+w, _ = mk()
+w.ws = "wsX"; w._last_live_check = 0.0
+w.rpc = lambda method, params=None: {"workspaces": [{"label": "team-other"}]}
+try:
+    w._maybe_check_alive(); exited = False
+except SystemExit as e:
+    exited = (e.code == 0)
+check("workspace vanished -> watcher exits(0)", exited)
+
+w, _ = mk()
+w.ws = "wsX"; w._last_live_check = 0.0
+w.rpc = lambda method, params=None: {"workspaces": [{"label": "team-x"}]}  # our session
+try:
+    w._maybe_check_alive(); alive = True
+except SystemExit:
+    alive = False
+check("workspace present -> no exit", alive)
+
+w, _ = mk()
+w.ws = "wsX"; w._last_live_check = _time.monotonic()   # just checked
+called = []
+w.rpc = lambda *a, **k: (called.append(1), {"workspaces": []})[1]
+w._maybe_check_alive()
+check("within interval -> no liveness RPC", called == [])
+
 print("UNIT: %d fail" % len(fails))
 sys.exit(1 if fails else 0)

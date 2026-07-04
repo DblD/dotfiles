@@ -68,6 +68,7 @@ class Watcher:
         self.pane_tab = {}        # pane_id -> tab_id
         self.tab_label = {}       # tab_id -> label
         self.reviews = {}         # label -> {"pane": pane_id, "deadline": monotonic}; in-flight
+        self._last_live_check = 0.0  # monotonic ts of the last workspace-liveness check
 
     # ---- output -----------------------------------------------------------
     def emit(self, event, message, **extra):
@@ -630,14 +631,37 @@ class Watcher:
         return False
 
     # ---- main loops ----------------------------------------------------------
+    LIVENESS_INTERVAL = 30.0  # re-check the workspace still exists every N seconds
+
+    def _maybe_check_alive(self):
+        """Periodically confirm our workspace still exists; exit cleanly if it was
+        closed (via `claude-team --stop`, a crash, or a manual close). Closing a
+        workspace does NOT close the watcher's global event socket, so without this
+        the tick loop would select on a silent socket forever — a leaked process
+        (the exact symptom we saw). Cheap: at most one workspace.list RPC every
+        LIVENESS_INTERVAL seconds. Reuses refresh()'s exit convention (sys.exit 0)."""
+        now = time.monotonic()
+        if now - self._last_live_check < self.LIVENESS_INTERVAL:
+            return
+        self._last_live_check = now
+        try:
+            wss = self.rpc("workspace.list", {}).get("workspaces", [])
+        except (OSError, RuntimeError, json.JSONDecodeError):
+            return  # transient RPC failure — retry next interval, never exit on error
+        if self.ws and not any(w.get("label") == self.session for w in wss):
+            self.emit("closed", "workspace '%s' closed, exiting" % self.session)
+            sys.exit(0)
+
     def _tick(self, s, timeout):
         """Block up to `timeout`s for event-socket data, then ALWAYS poll in-flight
-        reviews before returning. Returns the bytes read, or b'' when the tick only
-        polled (select timed out). Raises ConnectionError if the socket closed. This
-        is the seam that lets the loop reach poll_reviews() on an idle system — a
-        verdict lands asynchronously, so a purely event-driven loop would never see it."""
+        reviews (and periodically check the workspace is still alive) before
+        returning. Returns the bytes read, or b'' when the tick only polled (select
+        timed out). Raises ConnectionError if the socket closed. This is the seam
+        that lets the loop reach poll_reviews() on an idle system — a verdict lands
+        asynchronously, so a purely event-driven loop would never see it."""
         ready, _, _ = select.select([s], [], [], timeout)
         self.poll_reviews()
+        self._maybe_check_alive()
         if not ready:
             return b""
         d = s.recv(65536)
