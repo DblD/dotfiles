@@ -462,5 +462,33 @@ else
   echo "$UOUT" | sed 's/^/  /'; fail=$((fail + $(echo "$UOUT" | grep -c 'FAIL:')))
 fi
 
+# --- live: guaranteed agent kickoff (be_confirm_launch) — needs herdr + claude ---
+# The launch path was intermittently dropping the Enter, leaving the agent's
+# command sitting unexecuted (agent_status stuck at "unknown"). This asserts a
+# REAL spawn confirms the agent started — the test category whose absence let a
+# green suite coexist with "can't reliably open a pane with an agent in it".
+if command -v herdr >/dev/null && herdr status server 2>/dev/null | grep running >/dev/null; then
+  LP="$TMP/launchproj"; mkdir -p "$LP/.claude-team/tasks"; git init -q "$LP" 2>/dev/null
+  echo 'Reply READY and stop. Do not use any tools.' > "$LP/.claude-team/tasks/noop.md"
+  cat > "$LP/launch.yaml" <<Y
+name: launchtest
+project: $LP
+worktrees: false
+agents:
+  - { name: lead, role: lead }
+  - { name: w1, role: worker, mode: interactive, task: .claude-team/tasks/noop.md, deliverable: { check: "true" } }
+Y
+  # be_confirm_launch polls the worker's LIVE agent_status during spawn and only
+  # prints "agent started" once it leaves "unknown" (a real agent ran); on a
+  # dropped launch that never recovers it prints "did NOT start". Assert on that
+  # result rather than re-reading status after (a quick agent reverts to a shell).
+  LOUT=$("$CT" spawn "$LP/launch.yaml" --backend herdr --yolo 2>&1)
+  check    "launch: real spawn confirms agent started" "$LOUT" "agent started"
+  check_eq "launch: no start-failure reported"         "$(echo "$LOUT" | grep -c 'did NOT start')" "0"
+  "$CT" --stop launchtest --backend herdr >/dev/null 2>&1
+else
+  echo "  skip: launch-confirm live test (no herdr server)"
+fi
+
 echo "== pass=$pass fail=$fail =="
 [ "$fail" -eq 0 ]

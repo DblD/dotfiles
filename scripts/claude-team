@@ -115,6 +115,34 @@ be_wait_ready() { # $1=pane — token built from parts so the typed command can'
   "$HERDR_BIN" wait output "$1" --match 'READY_OK' --source recent --timeout 8000 >/dev/null 2>&1 || true
 }
 
+be_agent_status() { # $1=pane -> agent_status ("unknown" if unreadable)
+  "$HERDR_BIN" pane get "$1" 2>/dev/null \
+    | yq -p json -r '.result.pane.agent_status // "unknown"' 2>/dev/null || echo unknown
+}
+
+# Guaranteed agent kickoff. After a launch command is sent, confirm the agent
+# actually STARTED: its agent_status leaves "unknown" (a plain shell/command
+# never does; only a real claude/pi agent reports working/idle/done). If it
+# stays "unknown", the launch command is likely sitting unexecuted at the prompt
+# (an intermittent herdr injection race — the observed failure) -> re-fire Enter
+# and retry. Returns 0 once the agent is up, 1 if it never started (surface it).
+be_confirm_launch() { # $1=session $2=label
+  [[ "$BACKEND" == "herdr" ]] || return 0
+  $DRY_RUN && return 0
+  local pane; pane=$(be_pane_for "$1" "$2" 2>/dev/null) || return 1
+  local waited st
+  for _ in 1 2 3; do
+    waited=0
+    while [[ "$waited" -lt 12 ]]; do
+      st=$(be_agent_status "$pane")
+      case "$st" in working|idle|done) return 0 ;; esac
+      sleep 1; waited=$((waited + 1))
+    done
+    "$HERDR_BIN" pane send-keys "$pane" enter >/dev/null 2>&1  # kick a sitting command
+  done
+  return 1
+}
+
 be_send() { # $1=session $2=name $3=cmd $4=mode  (cmd may contain -p "$(cat file)")
   local cmd="$3"
   [[ "${4:-}" == "headless" ]] && cmd="$3 ; exit"
@@ -953,6 +981,15 @@ cmd_spawn() {
     worker_cmd=$(build_runner_cmd "$runner" "$model" "$final_prompt_file" "$profile" "$project_path" "$mode")
     be_send "$session" "$name" "$worker_cmd" "$mode"
 
+    # --- Guaranteed kickoff: confirm the agent actually started (not lead) ---
+    if [[ -n "$final_prompt_file" && "$role" != "lead" ]]; then
+      if be_confirm_launch "$session" "$name"; then
+        dim "  [$name] agent started"
+      else
+        red "  [$name] agent did NOT start after retries — check its pane"
+      fi
+    fi
+
     # --- Initialize status file ---
     if [[ "$role" != "lead" ]]; then
       local status_file="${project_path}/${TEAM_DIR}/agents/${name}.md"
@@ -1312,6 +1349,10 @@ PYEOF
   local cmd
   cmd=$(build_runner_cmd "$runner" "$model" "$prompt_file" "$profile" "$project" interactive)
   be_send "$session" "$reviewer" "$cmd" interactive
+  # Guaranteed kickoff: confirm the reviewer actually started (re-fire Enter if
+  # its launch command is sitting unexecuted).
+  if be_confirm_launch "$session" "$reviewer"; then dim "  [review] reviewer started"
+  else red "  [review] reviewer did NOT start after retries — check its pane"; fi
 
   if $do_wait && ! $DRY_RUN; then
     dim "  [review] waiting for reviewer to write its verdict…"
