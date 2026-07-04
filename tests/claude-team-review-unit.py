@@ -37,7 +37,9 @@ def mk():
     w.sidebar = lambda *a, **k: None
     w.emit = lambda *a, **k: None
     w.manifest_write = lambda doc: None
-    w.await_and_finish_review = lambda *a, **k: None  # don't block/poll in unit tests
+    # register_review (the new non-blocking seam replacing the old inline await)
+    # runs real: it only records the review in-flight (w.reviews[...]) and does no
+    # I/O, so it never blocks the "loop" — that is exactly the property under test.
     return w, calls
 
 
@@ -55,6 +57,8 @@ check("pending+detOK -> spawns and holds", took is True and calls == ["w1"])
 check("pending -> state reviewing", agent.get("state") == "reviewing")
 check("pending -> review_spawned + pane recorded",
       agent.get("review_spawned") is True and agent.get("review_pane") == "pane1")
+check("pending -> review registered in-flight (non-blocking, no inline wait)",
+      "w1" in w.reviews and w.reviews["w1"]["pane"] == "pane1")
 
 # 2. deterministic check still failing -> do NOT spawn (fix deterministic first)
 w, calls = mk()
@@ -131,6 +135,51 @@ with open(os.path.join(rd, "vr_bad.verdict"), "w") as fh:
 check("verdict_ready: valid VERDICT line -> true", w.verdict_ready("vr_ok") is True)
 check("verdict_ready: file without VERDICT -> false", w.verdict_ready("vr_bad") is False)
 check("verdict_ready: absent file -> false", w.verdict_ready("vr_missing") is False)
+
+# 10. the event-loop tick reaches poll_reviews even with NO socket data waiting.
+#     This is the non-blocking property: _tick is exactly what the loop calls each
+#     iteration, so proving it polls on a select timeout proves the loop reaches the
+#     poll on an idle system (verdicts land asynchronously, between pane events).
+import socket as _socket
+w, _ = mk()
+ticks = []
+w.poll_reviews = lambda: ticks.append(True)
+srv, cli = _socket.socketpair()
+try:
+    d = w._tick(srv, 0.05)                 # nothing written to cli -> select times out
+    check("idle tick polls with no socket data", d == b"" and ticks == [True])
+    cli.sendall(b'{"e":1}\n')
+    d2 = w._tick(srv, 0.5)                  # data present -> still polls, returns bytes
+    check("busy tick polls and returns bytes", ticks == [True, True] and d2 == b'{"e":1}\n')
+finally:
+    srv.close()
+    cli.close()
+
+# 11. two reviews in-flight resolve INDEPENDENTLY — one verdict-ready, one still
+#     pending. Resolving the ready one must not block, drop, or resolve the other.
+#     protocol_on_finished is stubbed to record which parent it resolved (real state).
+w, _ = mk()
+resolved = []
+w.pane_for_label = lambda l: None
+w.collect = lambda *a, **k: True
+w.manifest_mark = lambda *a, **k: None
+w.protocol_on_finished = lambda label, pane: (resolved.append(label) or "inert")
+w.register_review("ra", "pane-a")
+w.register_review("rb", "pane-b")
+check("two reviews in-flight simultaneously", set(w.reviews) == {"ra", "rb"})
+with open(os.path.join(w.project, ".claude-team", "reviews", "ra.verdict"), "w") as fh:
+    fh.write("VERDICT: VERIFIED\n")
+w.poll_reviews()
+check("verdict-ready review resolves its parent", resolved == ["ra"])
+check("resolved review dropped from in-flight", "ra" not in w.reviews)
+check("pending review survives (not blocked by the other)", "rb" in w.reviews)
+
+# 12. a timed-out review still resolves its parent (never stranded) — continues
+#     with the same watcher; rb never got a verdict, force its deadline into the past.
+w.reviews["rb"]["deadline"] = 0.0
+w.poll_reviews()
+check("timed-out review still resolves its parent", resolved == ["ra", "rb"])
+check("timed-out review dropped from in-flight", "rb" not in w.reviews)
 
 print("UNIT: %d fail" % len(fails))
 sys.exit(1 if fails else 0)
