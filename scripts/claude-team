@@ -1,0 +1,1900 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# claude-team — tmux control room for coordinated Claude Code agent teams
+# Usage: claude-team [options] [config]
+
+readonly VERSION="2.1.0"
+readonly CONFIG_DIR="${HOME}/.config/claude-teams"
+readonly TEMPLATES_DIR="${CONFIG_DIR}/_templates"
+readonly GLOBAL_FRAGMENTS_DIR="${CONFIG_DIR}/_fragments"
+readonly GLOBAL_PROFILES_DIR="${CONFIG_DIR}/_profiles"
+readonly TEAM_DIR=".claude-team"
+# Stable, purgeable home for inject_contract's temp prompt copies (never
+# cleaned up automatically — see the comment on inject_contract).
+readonly CONTRACT_TMPDIR="${TMPDIR:-/tmp}/claude-team-contracts"
+
+# Colors
+red()    { printf '\033[0;31m%s\033[0m\n' "$*"; }
+green()  { printf '\033[0;32m%s\033[0m\n' "$*"; }
+yellow() { printf '\033[0;33m%s\033[0m\n' "$*"; }
+dim()    { printf '\033[0;90m%s\033[0m\n' "$*"; }
+bold()   { printf '\033[1m%s\033[0m\n' "$*"; }
+
+DRY_RUN=false
+YOLO=false
+VERBOSE=false
+JSON_OUT=false
+REAP=false
+VERIFY_STATUS=false
+BACKEND="${CLAUDE_TEAM_BACKEND:-tmux}"   # tmux | herdr
+HERDR_BIN="$(command -v herdr || echo /opt/homebrew/bin/herdr)"
+
+# Build the claude launch command (accounts for nesting + permission mode)
+claude_cmd() {
+  local cmd="clear && unset CLAUDECODE && claude"
+  # Always enable the option so workers can self-escalate if needed
+  cmd+=" --allow-dangerously-skip-permissions"
+  if $YOLO; then
+    cmd+=" --dangerously-skip-permissions"
+  fi
+  echo "$cmd"
+}
+
+run_cmd() {
+  if $DRY_RUN; then
+    dim "[dry-run] $*"
+  else
+    "$@"
+  fi
+}
+
+# ---- pane/session backend dispatch (tmux default, herdr optional) ----
+# herdr addressing is STATELESS: every invocation resolves names via herdr labels,
+# exactly like tmux resolves session:window names.
+# Mapping: session = workspace label; tmux window ≈ herdr TAB;
+# lead = tab labelled 'lead' (renamed tab 1); worker <name> = tab labelled <name>.
+
+be_ws_id() { # $1=session label -> workspace id (herdr)
+  "$HERDR_BIN" workspace list 2>/dev/null | yq -p json -r ".result.workspaces[] | select(.label==\"$1\") | .workspace_id" | head -1
+}
+
+be_pane_for() { # $1=session $2=name -> pane id (herdr; stateless label lookup)
+  if $DRY_RUN; then echo "<pane:$2>"; return 0; fi
+  local ws tab
+  ws=$(be_ws_id "$1")
+  [[ -n "$ws" ]] || { red "herdr: workspace '$1' not found"; return 1; }
+  tab=$("$HERDR_BIN" tab list --workspace "$ws" 2>/dev/null | yq -p json -r ".result.tabs[] | select(.label==\"$2\") | .tab_id" | head -1)
+  [[ -n "$tab" ]] || { red "herdr: tab '$2' not found in $1"; return 1; }
+  "$HERDR_BIN" pane list --workspace "$ws" 2>/dev/null | yq -p json -r ".result.panes[] | select(.tab_id==\"$tab\") | .pane_id" | head -1
+}
+
+be_has_session() { # $1=session
+  case "$BACKEND" in
+    tmux)  tmux has-session -t "$1" 2>/dev/null ;;
+    herdr) [[ -n "$(be_ws_id "$1")" ]] ;;
+  esac
+}
+
+be_new_session() { # $1=session $2=project_path
+  case "$BACKEND" in
+    tmux) run_cmd tmux new-session -d -s "$1" -n "lead" -c "$2" ;;
+    herdr)
+      if $DRY_RUN; then
+        dim "[dry-run] $HERDR_BIN workspace create --cwd '$2' --label '$1' --env CLAUDE_TEAM_BACKEND=herdr --no-focus"
+        dim "[dry-run] $HERDR_BIN tab rename <tab:1> 'lead'"
+      else
+        local j t1
+        j=$("$HERDR_BIN" workspace create --cwd "$2" --label "$1" --env CLAUDE_TEAM_BACKEND=herdr --no-focus)
+        t1=$(echo "$j" | yq -p json -r '.result.tab.tab_id')
+        "$HERDR_BIN" tab rename "$t1" "lead" >/dev/null
+        be_wait_ready "$(echo "$j" | yq -p json -r '.result.root_pane.pane_id')"
+      fi ;;
+    *) red "unknown backend: $BACKEND (use tmux|herdr)"; exit 1 ;;
+  esac
+}
+
+be_new_worker() { # $1=session $2=name $3=work_dir  (worktrees already resolved into work_dir)
+  case "$BACKEND" in
+    tmux) run_cmd tmux new-window -t "$1" -n "$2" -c "$3" ;;
+    herdr)
+      if $DRY_RUN; then
+        dim "[dry-run] $HERDR_BIN tab create --workspace <ws:$1> --cwd '$3' --label '$2' --no-focus"
+      else
+        local ws j
+        ws=$(be_ws_id "$1")
+        [[ -n "$ws" ]] || { red "herdr: workspace '$1' not found"; return 1; }
+        j=$("$HERDR_BIN" tab create --workspace "$ws" --cwd "$3" --label "$2" --no-focus)
+        be_wait_ready "$(echo "$j" | yq -p json -r '.result.root_pane.pane_id')"
+      fi ;;
+  esac
+}
+
+be_wait_ready() { # $1=pane — token built from parts so the typed command can't self-match
+  "$HERDR_BIN" pane run "$1" "printf 'REA%s\\n' 'DY_OK'" >/dev/null 2>&1
+  "$HERDR_BIN" wait output "$1" --match 'READY_OK' --source recent --timeout 8000 >/dev/null 2>&1 || true
+}
+
+be_agent_status() { # $1=pane -> agent_status ("unknown" if unreadable)
+  "$HERDR_BIN" pane get "$1" 2>/dev/null \
+    | yq -p json -r '.result.pane.agent_status // "unknown"' 2>/dev/null || echo unknown
+}
+
+# Guaranteed agent kickoff. After a launch command is sent, confirm the agent
+# actually STARTED: its agent_status leaves "unknown" (a plain shell/command
+# never does; only a real claude/pi agent reports working/idle/done). If it
+# stays "unknown", the launch command is likely sitting unexecuted at the prompt
+# (an intermittent herdr injection race — the observed failure) -> re-fire Enter
+# and retry. Returns 0 once the agent is up, 1 if it never started (surface it).
+be_confirm_launch() { # $1=session $2=label
+  [[ "$BACKEND" == "herdr" ]] || return 0
+  $DRY_RUN && return 0
+  local pane; pane=$(be_pane_for "$1" "$2" 2>/dev/null) || return 1
+  local waited st
+  for _ in 1 2 3; do
+    waited=0
+    while [[ "$waited" -lt 12 ]]; do
+      st=$(be_agent_status "$pane")
+      case "$st" in working|idle|done) return 0 ;; esac
+      sleep 1; waited=$((waited + 1))
+    done
+    "$HERDR_BIN" pane send-keys "$pane" enter >/dev/null 2>&1  # kick a sitting command
+  done
+  return 1
+}
+
+be_send() { # $1=session $2=name $3=cmd $4=mode  (cmd may contain -p "$(cat file)")
+  local cmd="$3"
+  [[ "${4:-}" == "headless" ]] && cmd="$3 ; exit"
+  case "$BACKEND" in
+    tmux)
+      [[ "${4:-}" == "headless" ]] && run_cmd tmux set-option -t "$1:$2" remain-on-exit off 2>/dev/null
+      run_cmd tmux send-keys -t "$1:$2" "$cmd" Enter ;;
+    herdr)
+      if $DRY_RUN; then dim "[dry-run] $HERDR_BIN pane run <pane:$2> \"$cmd\""
+      else
+        local p; p=$(be_pane_for "$1" "$2") || return 1
+        run_cmd "$HERDR_BIN" pane run "$p" "$cmd"
+      fi ;;
+  esac
+}
+
+be_send_lead() { be_send "$1" "lead" "$2" "interactive"; }
+
+be_list_sessions() { # list running team-* sessions
+  case "$BACKEND" in
+    tmux)  tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^team-' || true ;;
+    herdr) "$HERDR_BIN" workspace list 2>/dev/null | yq -p json -r '.result.workspaces[].label' | grep '^team-' || true ;;
+  esac
+}
+
+be_stop() { # $1=session
+  case "$BACKEND" in
+    tmux)  run_cmd tmux kill-session -t "$1" ;;
+    herdr)
+      if $DRY_RUN; then dim "[dry-run] $HERDR_BIN workspace close (label '$1')"
+      else
+        local ws
+        ws=$(be_ws_id "$1")
+        [[ -n "$ws" ]] || { red "herdr: workspace '$1' not found"; return 1; }
+        run_cmd "$HERDR_BIN" workspace close "$ws" >/dev/null
+      fi ;;
+  esac
+}
+
+be_attach() { # $1=session
+  case "$BACKEND" in
+    tmux)  if [[ -z "${TMUX:-}" ]]; then run_cmd tmux attach-session -t "$1"; else run_cmd tmux switch-client -t "$1"; fi ;;
+    herdr)
+      if $DRY_RUN; then dim "[dry-run] $HERDR_BIN workspace focus (label '$1')  # or run 'herdr' to attach"
+      else
+        local ws
+        ws=$(be_ws_id "$1")
+        [[ -n "$ws" ]] || { red "herdr: workspace '$1' not found"; return 1; }
+        run_cmd "$HERDR_BIN" workspace focus "$ws"
+      fi ;;
+  esac
+}
+
+be_select_lead() { # $1=session — focus the lead window/tab
+  case "$BACKEND" in
+    tmux)  run_cmd tmux select-window -t "$1:lead" ;;
+    herdr)
+      if $DRY_RUN; then dim "[dry-run] $HERDR_BIN tab focus <tab:lead>"
+      else
+        local ws tab
+        ws=$(be_ws_id "$1") || return 0
+        tab=$("$HERDR_BIN" tab list --workspace "$ws" 2>/dev/null | yq -p json -r '.result.tabs[] | select(.label=="lead") | .tab_id' | head -1)
+        [[ -n "$tab" ]] && run_cmd "$HERDR_BIN" tab focus "$tab" >/dev/null
+      fi ;;
+  esac
+}
+
+be_cleanup_workers() { # $1=session — close every worker window/tab except lead; echoes count
+  local count=0
+  case "$BACKEND" in
+    tmux)
+      for window in $(tmux list-windows -t "$1" -F '#{window_name}' 2>/dev/null); do
+        [[ "$window" != "lead" ]] && { run_cmd tmux kill-window -t "$1:${window}" 2>/dev/null && count=$((count+1)) || true; }
+      done ;;
+    herdr)
+      if $DRY_RUN; then dim "[dry-run] $HERDR_BIN tab close <each non-lead tab>"
+      else
+        local ws tab
+        ws=$(be_ws_id "$1") || { echo 0; return; }
+        while IFS= read -r tab; do
+          [[ -n "$tab" ]] && { run_cmd "$HERDR_BIN" tab close "$tab" >/dev/null 2>&1 && count=$((count+1)) || true; }
+        done < <("$HERDR_BIN" tab list --workspace "$ws" 2>/dev/null | yq -p json -r '.result.tabs[] | select(.label!="lead") | .tab_id')
+      fi ;;
+  esac
+  echo "$count"
+}
+
+usage() {
+  cat <<EOF
+claude-team v${VERSION} — tmux control room for Claude Code agent teams
+
+Usage:
+  claude-team <config>                 Launch from saved config (name or path)
+  claude-team --project <path>         Start interactive control room
+  claude-team spawn <config>           Spawn workers from config (used by team lead)
+  claude-team --pick                   fzf picker for saved configs
+  claude-team --list                   List saved configs
+  claude-team cleanup [session-name]   Kill completed worker windows
+  claude-team tell <session> <agent> "<message>" [--wait[=SECONDS]]
+                                       Deliver an instruction to a running agent
+                                       pane and guarantee submission (text + Enter).
+                                       --wait: confirm the agent starts working
+                                       (herdr only); --wait=N: wait up to N seconds
+                                       for it to finish (idle)
+  claude-team status [session] [--verify]
+                                       One-glance table of agents, states, and
+                                       status files (all team sessions, or one).
+                                       Adds DELIVERABLE (met/unmet/- from the
+                                       manifest's last verification) and
+                                       PROTOCOL (manifest state, or
+                                       "nudged xN" while working) columns from
+                                       the session manifest. If no live
+                                       session exists but a manifest does,
+                                       prints a manifest-only row per agent
+                                       (STATE "-"). --verify: live-check each
+                                       agent's deliverable (claude-team verify
+                                       --json) instead of using the manifest's
+                                       last recorded verification.
+  claude-team verify <session> [agent] [--json]
+                                       Check declared deliverables against the
+                                       session manifest (pure, read-only —
+                                       writes nothing). --json: one JSON object
+                                       per agent (JSONL). Exit 0 all met, 1 any
+                                       unmet, 2 no manifest/unknown agent.
+  claude-team review <session> <agent> [--wait]
+                                       Spawn the agent-as-verifier for a worker
+                                       whose deliverable declares review: — a
+                                       separate reviewer tab (its own profile =>
+                                       its own model, or runner: pi for another
+                                       provider) reads the worker's session and
+                                       writes a graded verdict artifact that
+                                       verify folds in (VERIFIED+ = met). watch
+                                       auto-spawns it once the deterministic
+                                       checks pass; --wait blocks for the verdict.
+  claude-team watch <session-name> [--reap]
+                                       Supervise a team session (herdr): notify on
+                                       blocked agents, collect finished output;
+                                       --reap closes a worker's tab once its
+                                       output is collected (never lead)
+  claude-team --stop [session-name]    Stop a team session
+  claude-team --help                   Show this help
+
+Options:
+  --yolo                               Skip all Claude permission prompts
+  --dry-run                            Print commands without executing
+  --verbose                            Show assembled prompts in dry-run
+  --session-name <name>                Override session name
+  --backend <tmux|herdr>               Pane/session backend (default: tmux)
+  --json                               watch: emit one JSON object per line
+  --reap                               watch: close a worker's tab after its
+                                       output is collected (default off)
+
+Config format (v2 — task + fragments):
+  agents:
+    - name: backend
+      task: .claude-team/tasks/backend.md     # task-specific instructions
+      profile: code-worker                     # permission profile
+      fragments: "api-patterns,svelte5-patterns"  # extra context fragments
+      verify: svelte                           # verification fragment
+      branch: feat/my-feature                  # branch context
+      owns: "app/src/routes/api/"              # file ownership
+      commit_style: per-task                   # per-task or single
+      mode: interactive                        # interactive or headless
+      runner: claude                           # claude (default) or pi
+      model: rtx3090/Qwen3-14B-AWQ             # optional --model for the runner
+
+Config format additions:
+  agents:
+    - name: backend
+      deliverable:                 # optional completion contract
+        branch_pushed: agent/backend   # verified via git ls-remote
+        check: "npx tsc --noEmit"      # verified via exit code (120s timeout)
+                                    # applies to v1 or v2 agents. claude-team
+                                    # watch verify-gates completion on it
+                                    # (nudge, then escalate); claude-team
+                                    # verify and status/status --verify
+                                    # check/display it on demand.
+
+Config format (v1 — legacy monolithic prompt):
+  agents:
+    - name: backend
+      prompt: .claude-team/prompts/backend.md  # full self-contained prompt
+      mode: interactive
+
+Examples:
+  claude-team --project ~/code/my-app
+  claude-team .claude-team/team-config.yml --yolo
+  claude-team --dry-run --verbose .claude-team/team-config.yml
+  claude-team --stop team-my-app
+EOF
+}
+
+# --- Config resolution ---
+
+resolve_config() {
+  local input="$1"
+
+  # Absolute or relative path to a .yml file
+  if [[ -f "$input" ]]; then
+    echo "$input"
+    return
+  fi
+
+  # Name without extension — look in config dir
+  if [[ -f "${CONFIG_DIR}/${input}.yml" ]]; then
+    echo "${CONFIG_DIR}/${input}.yml"
+    return
+  fi
+
+  red "Config not found: $input"
+  red "Looked in: $input, ${CONFIG_DIR}/${input}.yml"
+  exit 1
+}
+
+# --- Prompt resolution (legacy v1 style) ---
+
+resolve_prompt() {
+  local prompt_path="$1"
+  local work_dir="$2"
+
+  # No prompt — interactive mode
+  if [[ -z "$prompt_path" ]]; then
+    return
+  fi
+
+  # Absolute path
+  if [[ "$prompt_path" == /* || "$prompt_path" == ~/* ]]; then
+    local expanded
+    expanded=$(eval echo "$prompt_path")
+    if [[ -f "$expanded" ]]; then
+      echo "$expanded"
+    else
+      yellow "Warning: prompt not found: $expanded (falling back to interactive)"
+    fi
+    return
+  fi
+
+  # _templates/ prefix — resolve from global templates
+  if [[ "$prompt_path" == _templates/* ]]; then
+    local template="${CONFIG_DIR}/${prompt_path}"
+    if [[ -f "$template" ]]; then
+      echo "$template"
+    else
+      yellow "Warning: template not found: $template (falling back to interactive)"
+    fi
+    return
+  fi
+
+  # Relative path — resolve from working directory
+  local relative="${work_dir}/${prompt_path}"
+  if [[ -f "$relative" ]]; then
+    echo "$relative"
+    return
+  fi
+
+  yellow "Warning: prompt not found: $relative (falling back to interactive)"
+}
+
+# Append the deliverable contract to a COPY of the prompt file (never in place).
+# Echoes the path to use (the copy, or the original when no deliverable).
+# These temp files are deliberately NOT deleted (see the temp_files note in
+# cmd_spawn: the worker `cat`s them after the launch command is sent, so a
+# cleanup-on-exit trap here would race that read). They're created under
+# CONTRACT_TMPDIR instead of loose in $TMPDIR so they're findable
+# (`ls "$CONTRACT_TMPDIR"`) and safe to `rm -rf` in bulk.
+inject_contract() { # $1=prompt_file $2=agent $3=branch_pushed $4=check
+  local f="$1" name="$2" branch="$3" chk="$4"
+  [[ -z "$branch" && -z "$chk" ]] && { echo "$f"; return; }
+  local dir="$CONTRACT_TMPDIR"
+  mkdir -p "$dir" 2>/dev/null || dir="${TMPDIR:-/tmp}"
+  # NOTE: trailing X's only — BSD/macOS mktemp (unlike GNU) does not expand
+  # a template that has a suffix (e.g. ".md") after the X run.
+  local out
+  out=$(mktemp "${dir}/ct-contract-${name}.XXXXXX") || { echo "$f"; return; }
+  [[ -n "$f" && -f "$f" ]] && cat "$f" > "$out"
+  {
+    echo ""
+    echo "DELIVERABLE CONTRACT: your task is complete only when:"
+    [[ -n "$branch" ]] && echo "- branch \`$branch\` is pushed to origin"
+    [[ -n "$chk" ]] && echo "- \`$chk\` exits clean (0) in your working directory"
+    echo "When all hold, state DELIVERABLE MET. If you cannot meet the contract,"
+    echo "state DELIVERABLE BLOCKED: followed by the reason. Any claim about"
+    echo "execution results (tests, builds, migrations) must include the raw"
+    echo "command output - summaries don't count; a claim contradicted by its"
+    echo "output is void."
+  } >> "$out"
+  echo "$out"
+}
+
+# Seed .claude-team/manifest/<session>.json (atomic; python3 for correct JSON).
+# Watch owns all writes AFTER seeding. Called once per spawn, live mode only.
+# Re-spawn into an existing session MERGE-PRESERVES the manifest: existing
+# agents keep their protocol state (state/nudges/verifications/collected/
+# reaped/work_dir) with only their checks refreshed from the new config;
+# agents absent from the new config are never dropped (watch must not
+# collect/reap them unverified); only genuinely new agents get fresh
+# pending entries. Header keeps the original spawned_at.
+manifest_seed() { # $1=session $2=project_path $3=config_file
+  $DRY_RUN && return 0
+  local dir="$2/${TEAM_DIR}/manifest"
+  mkdir -p "$dir"
+  MS_SESSION="$1" MS_PROJECT="$2" MS_CONFIG="$3" MS_OUT="$dir/$1.json" python3 - <<'PYEOF'
+import datetime, json, os, subprocess, sys, tempfile
+cfg = os.environ["MS_CONFIG"]
+try:
+    raw = subprocess.run(["yq", "-o=json", ".agents", cfg],
+                         capture_output=True, text=True, check=True)
+except subprocess.CalledProcessError as e:
+    raise SystemExit("manifest_seed: yq failed: " + (e.stderr or "").strip())
+agent_list = json.loads(raw.stdout)
+if not agent_list:
+    raise SystemExit("manifest_seed: no agents parsed from config")
+out = os.environ["MS_OUT"]
+old = None
+if os.path.exists(out):
+    try:
+        old = json.load(open(out))
+    except (OSError, ValueError):
+        old = None  # corrupt previous manifest: re-seed from scratch
+# start from the old agents so entries absent from the new config are KEPT
+agents = dict((old or {}).get("agents") or {})
+for a in agent_list:
+    if a.get("role", "worker") == "lead":
+        continue
+    name = a.get("name")
+    if not name:
+        raise SystemExit("manifest_seed: agent entry missing 'name' in config")
+    deliverable = a.get("deliverable") or {}
+    review = deliverable.get("review") or {}
+    if review and not isinstance(review, dict):
+        sys.stderr.write("manifest_seed: agent %r: deliverable.review must be a "
+                         "mapping {persona,profile,...}, got %r - ignoring\n"
+                         % (name, review))
+        review = {}
+    checks = {"branch_pushed": deliverable.get("branch_pushed") or "",
+              "check": deliverable.get("check") or "",
+              "review": review}
+    if name in agents and isinstance(agents[name], dict):
+        # existing agent: preserve protocol state, refresh checks only
+        agents[name]["checks"] = checks
+    else:
+        agents[name] = {"state": "pending", "nudges": 0, "verifications": [],
+                        "collected": False, "reaped": False, "work_dir": "",
+                        "checks": checks}
+doc = {"session": os.environ["MS_SESSION"], "config_path": os.path.abspath(cfg),
+       "project": os.environ["MS_PROJECT"],
+       "spawned_at": (old or {}).get("spawned_at")
+           or datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+       "agents": agents}
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(out))
+with os.fdopen(fd, "w") as f:
+    json.dump(doc, f, indent=2)
+os.replace(tmp, out)
+PYEOF
+}
+
+manifest_set_workdir() { # $1=manifest $2=agent $3=work_dir  (spawn records resolved path)
+  $DRY_RUN && return 0
+  [[ -f "$1" ]] || return 0
+  MW_MAN="$1" MW_AGENT="$2" MW_DIR="$3" python3 - <<'PYEOF'
+import json, os, tempfile
+man = os.environ["MW_MAN"]
+doc = json.load(open(man))
+a = doc["agents"].get(os.environ["MW_AGENT"])
+if a is not None:
+    a["work_dir"] = os.environ["MW_DIR"]
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(man))
+with os.fdopen(fd, "w") as f:
+    json.dump(doc, f, indent=2)
+os.replace(tmp, man)
+PYEOF
+}
+
+manifest_mark_review() { # $1=manifest $2=agent $3=worker_pane  (review spawned; parent pane for re-check)
+  $DRY_RUN && return 0
+  [[ -f "$1" ]] || return 0
+  MR_MAN="$1" MR_AGENT="$2" MR_PANE="$3" python3 - <<'PYEOF'
+import json, os, tempfile
+man = os.environ["MR_MAN"]
+doc = json.load(open(man))
+a = doc["agents"].get(os.environ["MR_AGENT"])
+if a is not None:
+    a["review_spawned"] = True
+    if os.environ["MR_PANE"]:
+        a["review_pane"] = os.environ["MR_PANE"]
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(man))
+with os.fdopen(fd, "w") as f:
+    json.dump(doc, f, indent=2)
+os.replace(tmp, man)
+PYEOF
+}
+
+# --- Session naming ---
+
+session_name_from_path() {
+  local path="$1"
+  # Use the last directory component, sanitize for tmux
+  basename "$path" | tr '.' '-' | tr ' ' '-'
+}
+
+# --- Fragment/Profile resolution with fallback ---
+# Checks project-local first, then global
+
+resolve_fragment() {
+  local filename="$1"
+  local project_path="$2"
+  local local_path="${project_path}/${TEAM_DIR}/fragments/${filename}"
+  local global_path="${GLOBAL_FRAGMENTS_DIR}/${filename}"
+
+  if [[ -f "$local_path" ]]; then
+    echo "$local_path"
+  elif [[ -f "$global_path" ]]; then
+    echo "$global_path"
+  else
+    return 1
+  fi
+}
+
+resolve_profile() {
+  local filename="$1"
+  local project_path="$2"
+  local local_path="${project_path}/${TEAM_DIR}/profiles/${filename}"
+  local global_path="${GLOBAL_PROFILES_DIR}/${filename}"
+
+  if [[ -f "$local_path" ]]; then
+    echo "$local_path"
+  elif [[ -f "$global_path" ]]; then
+    echo "$global_path"
+  else
+    return 1
+  fi
+}
+
+# --- v2 Prompt Assembly ---
+# Assembles a full prompt from fragments + task file
+# Returns path to a temp file containing the assembled prompt
+
+assemble_prompt() {
+  local agent_name="$1"
+  local task_file="$2"
+  local project_path="$3"
+  local fragments="${4:-}"
+  local verify="${5:-}"
+  local branch="${6:-}"
+  local owns="${7:-}"
+  local commit_style="${8:-}"
+
+  local assembled=""
+
+  # Header
+  assembled+="# Worker: ${agent_name}
+
+"
+
+  # Branch context
+  if [[ -n "$branch" && "$branch" != "null" ]]; then
+    assembled+="**Branch:** \`${branch}\` (you are already on it)
+
+"
+  fi
+
+  # File ownership
+  if [[ -n "$owns" && "$owns" != "null" ]]; then
+    assembled+="**Files you own:** ${owns}
+Do NOT edit files outside your ownership scope. Other workers handle those.
+
+"
+  fi
+
+  # Common rules fragment (project-local → global fallback)
+  local rules_path
+  if rules_path=$(resolve_fragment "_rules.md" "$project_path"); then
+    local rules
+    rules=$(cat "$rules_path")
+    if [[ "$commit_style" == "per-task" ]]; then
+      rules=$(echo "$rules" | sed '/Co-Authored-By/a\
+- Commit after EACH task (not all at once)')
+    fi
+    assembled+="${rules}
+
+"
+    $VERBOSE && dim "    + rules: ${rules_path}" >&2
+  fi
+
+  # Status file fragment (project-local → global fallback)
+  local status_path
+  if status_path=$(resolve_fragment "_status-file.md" "$project_path"); then
+    assembled+="$(sed "s/{{AGENT_NAME}}/${agent_name}/g" "$status_path")
+
+"
+    $VERBOSE && dim "    + status: ${status_path}" >&2
+  fi
+
+  # Domain-specific fragments (project-local → global fallback)
+  if [[ -n "$fragments" && "$fragments" != "null" ]]; then
+    local IFS=','
+    for frag in $fragments; do
+      frag=$(echo "$frag" | xargs)  # trim whitespace
+      local frag_path
+      if frag_path=$(resolve_fragment "_${frag}.md" "$project_path"); then
+        assembled+="$(cat "$frag_path")
+
+"
+        $VERBOSE && dim "    + fragment: _${frag}.md (${frag_path})" >&2
+      else
+        yellow "    ! fragment not found: _${frag}.md (checked project + global)" >&2
+      fi
+    done
+  fi
+
+  # Separator
+  assembled+="---
+
+"
+
+  # Task body
+  local resolved_task="${project_path}/${task_file}"
+  if [[ -f "$resolved_task" ]]; then
+    assembled+="$(cat "$resolved_task")
+
+"
+  else
+    red "    Task file not found: $resolved_task" >&2
+    return 1
+  fi
+
+  # Verification fragment (project-local → global fallback)
+  if [[ -n "$verify" && "$verify" != "null" ]]; then
+    local verify_path
+    if verify_path=$(resolve_fragment "_verify-${verify}.md" "$project_path"); then
+      assembled+="
+$(cat "$verify_path")
+"
+      $VERBOSE && dim "    + verify: _verify-${verify}.md (${verify_path})" >&2
+    else
+      yellow "    ! verify fragment not found: _verify-${verify}.md (checked project + global)" >&2
+    fi
+  fi
+
+  # Write to temp file
+  local tmpfile
+  tmpfile=$(mktemp /tmp/claude-team-prompt-XXXXXXXXXX)
+  echo "$assembled" > "$tmpfile"
+
+  if $VERBOSE; then
+    dim "    Assembled: $(wc -c < "$tmpfile" | tr -d ' ') bytes, $(wc -l < "$tmpfile" | tr -d ' ') lines → $tmpfile" >&2
+  fi
+
+  echo "$tmpfile"
+}
+
+# --- Build per-agent claude command with profile ---
+
+build_worker_cmd() {
+  local prompt_file="$1"
+  local profile="${2:-}"
+  local project_path="${3:-}"
+  local mode="${4:-interactive}"
+
+  local cmd
+  cmd=$(claude_cmd)
+
+  # Apply permission profile via --settings (project-local → global fallback)
+  if [[ -n "$profile" && "$profile" != "null" ]]; then
+    local profile_path
+    if profile_path=$(resolve_profile "${profile}.json" "$project_path"); then
+      cmd+=" --settings '${profile_path}'"
+      $VERBOSE && dim "    + profile: ${profile}.json (${profile_path})" >&2
+    else
+      yellow "    ! profile not found: ${profile}.json (checked project + global)" >&2
+    fi
+  fi
+
+  if [[ "$mode" == "headless" ]]; then
+    cmd+=" -p"
+    cmd+=" --append-system-prompt \"\$(cat '${prompt_file}')\""
+  else
+    cmd+=" --append-system-prompt \"\$(cat '${prompt_file}')\""
+    cmd+=" \"Execute your task.\""
+  fi
+
+  echo "$cmd"
+}
+
+# --- Build per-agent command for the configured runner ---
+# runner=claude falls through to the existing claude_cmd/build_worker_cmd path.
+# runner=pi is a plain chat CLI: no claude flags, prompt via `pi -p "$(cat file)"`.
+
+build_runner_cmd() {
+  local runner="$1"
+  local model="$2"
+  local prompt_file="$3"
+  local profile="${4:-}"
+  local project_path="${5:-}"
+  local mode="${6:-interactive}"
+
+  local cmd
+  case "$runner" in
+    pi)
+      cmd="clear && pi"
+      if [[ -n "$model" && "$model" != "null" ]]; then
+        cmd+=" --model ${model}"
+      fi
+      if [[ -n "$prompt_file" ]]; then
+        cmd+=" -p \"\$(cat '${prompt_file}')\""
+      fi
+      ;;
+    *)  # claude (default)
+      if [[ -n "$prompt_file" ]]; then
+        cmd=$(build_worker_cmd "$prompt_file" "$profile" "$project_path" "$mode")
+      else
+        cmd=$(claude_cmd)
+      fi
+      if [[ -n "$model" && "$model" != "null" ]]; then
+        cmd+=" --model ${model}"
+      fi
+      ;;
+  esac
+
+  echo "$cmd"
+}
+
+# --- Project mode: start control room with team lead ---
+
+cmd_project() {
+  local project_path="$1"
+  project_path=$(cd "$project_path" && pwd)  # resolve to absolute
+
+  local session
+  if [[ -n "${SESSION_NAME_OVERRIDE:-}" ]]; then
+    session="$SESSION_NAME_OVERRIDE"
+  else
+    session="team-$(session_name_from_path "$project_path")"
+  fi
+
+  # Check if session already exists
+  if be_has_session "$session"; then
+    yellow "Session '$session' already exists. Attaching..."
+    be_attach "$session"
+    return
+  fi
+
+  # Create .claude-team directories in project
+  run_cmd mkdir -p "${project_path}/${TEAM_DIR}/agents"
+  run_cmd mkdir -p "${project_path}/${TEAM_DIR}/tasks"
+
+  green "Starting control room: $session"
+  green "Project: $project_path"
+
+  # Create session with lead window
+  be_new_session "$session" "$project_path"
+
+  # Start Claude with team lead system prompt via --append-system-prompt
+  local lead_prompt="${TEMPLATES_DIR}/team-lead.md"
+  if [[ -f "$lead_prompt" ]]; then
+    be_send_lead "$session" "$(claude_cmd) --append-system-prompt \"\$(cat '${lead_prompt}')\""
+  else
+    yellow "No team lead template found at $lead_prompt"
+    yellow "Starting plain Claude Code session"
+    be_send_lead "$session" "$(claude_cmd)"
+  fi
+
+  # Attach to the session
+  be_attach "$session"
+}
+
+# --- Spawn workers from config ---
+
+cmd_spawn() {
+  local config_file
+  config_file=$(resolve_config "$1")
+
+  local project_path
+  project_path=$(yq -r '.project // ""' "$config_file")
+  if [[ -z "$project_path" ]]; then
+    red "Config missing 'project' field"
+    exit 1
+  fi
+  project_path=$(eval echo "$project_path")
+  project_path=$(cd "$project_path" && pwd)
+
+  local config_name
+  config_name=$(yq -r '.name // "unnamed"' "$config_file")
+
+  local session
+  if [[ -n "${SESSION_NAME_OVERRIDE:-}" ]]; then
+    session="$SESSION_NAME_OVERRIDE"
+  else
+    session="team-$(session_name_from_path "$project_path")"
+  fi
+
+  # Ensure session exists (might be called by team lead from within session)
+  if ! be_has_session "$session"; then
+    green "Creating session: $session"
+    be_new_session "$session" "$project_path"
+  fi
+
+  local manifest_file="${project_path}/${TEAM_DIR}/manifest/${session}.json"
+  manifest_seed "$session" "$project_path" "$config_file"
+
+  local use_worktrees
+  use_worktrees=$(yq -r '.worktrees // false' "$config_file")
+  local worktree_base
+  worktree_base=$(yq -r '.worktree_base // "../worktrees"' "$config_file")
+  local base_branch
+  base_branch=$(yq -r '.base_branch // "develop"' "$config_file")
+  local branch_prefix
+  branch_prefix=$(yq -r '.branch_prefix // "agent"' "$config_file")
+
+  # Create team dirs
+  run_cmd mkdir -p "${project_path}/${TEAM_DIR}/agents"
+
+  # Count agents
+  local agent_count
+  agent_count=$(yq -r '.agents | length' "$config_file")
+
+  bold "Spawning $agent_count agents for: $config_name"
+  dim "Session: $session"
+  echo ""
+
+  # Track temp files for cleanup
+  local temp_files=()
+
+  for i in $(seq 0 $((agent_count - 1))); do
+    local name role mode
+    name=$(yq -r ".agents[$i].name" "$config_file")
+    role=$(yq -r ".agents[$i].role // \"worker\"" "$config_file")
+    mode=$(yq -r ".agents[$i].mode // \"interactive\"" "$config_file")
+
+    # Skip lead if it already exists (tmux: lead window; herdr: workspace root pane)
+    if [[ "$role" == "lead" ]]; then
+      if [[ "$BACKEND" == "herdr" ]]; then
+        dim "  Lead = workspace root pane, skipping"
+        continue
+      elif tmux list-windows -t "$session" -F '#{window_name}' 2>/dev/null | grep -q "^lead$"; then
+        dim "  Lead window exists, skipping"
+        continue
+      fi
+    fi
+
+    # Read v2 fields (task + fragments) or v1 field (prompt)
+    local task prompt profile fragments verify branch owns commit_style
+    task=$(yq -r ".agents[$i].task // \"\"" "$config_file")
+    prompt=$(yq -r ".agents[$i].prompt // \"\"" "$config_file")
+    profile=$(yq -r ".agents[$i].profile // \"\"" "$config_file")
+    fragments=$(yq -r ".agents[$i].fragments // \"\"" "$config_file")
+    verify=$(yq -r ".agents[$i].verify // \"\"" "$config_file")
+    branch=$(yq -r ".agents[$i].branch // \"${base_branch}\"" "$config_file")
+    owns=$(yq -r ".agents[$i].owns // \"\"" "$config_file")
+    commit_style=$(yq -r ".agents[$i].commit_style // \"\"" "$config_file")
+    local agent_worktree
+    agent_worktree=$(yq -r ".agents[$i].worktree // \"auto\"" "$config_file")
+    local runner model
+    runner=$(yq -r ".agents[$i].runner // \"claude\"" "$config_file")
+    model=$(yq -r ".agents[$i].model // \"\"" "$config_file")
+    local d_branch d_check
+    d_branch=$(yq -r ".agents[$i].deliverable.branch_pushed // \"\"" "$config_file")
+    d_check=$(yq -r ".agents[$i].deliverable.check // \"\"" "$config_file")
+
+    case "$runner" in
+      claude|pi) ;;
+      *) red "  [$name] unknown runner: $runner (skipping)"; continue ;;
+    esac
+
+    # Determine working directory
+    local work_dir="$project_path"
+
+    if [[ "$use_worktrees" == "true" && "$role" != "lead" && "$agent_worktree" != "false" ]]; then
+      local wt_path="${project_path}/${worktree_base}/${name}"
+      local wt_branch="${branch_prefix}/${name}"
+
+      if [[ -d "$wt_path" ]]; then
+        dim "  Reusing worktree: $wt_path"
+      else
+        green "  Creating worktree: $wt_path (branch: $wt_branch)"
+        run_cmd git -C "$project_path" worktree add "$wt_path" -b "$wt_branch" "$base_branch" 2>/dev/null || \
+          run_cmd git -C "$project_path" worktree add "$wt_path" "$wt_branch" 2>/dev/null || \
+          { red "  Failed to create worktree for $name"; continue; }
+      fi
+      work_dir="$wt_path"
+    fi
+
+    if [[ "$role" != "lead" ]]; then
+      manifest_set_workdir "$manifest_file" "$name" "$work_dir"
+    fi
+
+    # --- Determine prompt source ---
+    local final_prompt_file=""
+
+    if [[ -n "$task" ]]; then
+      # v2 style: assemble from fragments + task file
+      green "  [$name] v2 task=${task} profile=${profile}"
+      final_prompt_file=$(assemble_prompt \
+        "$name" "$task" "$project_path" \
+        "$fragments" "$verify" "$branch" "$owns" "$commit_style") || {
+        red "  Failed to assemble prompt for $name"
+        continue
+      }
+      temp_files+=("$final_prompt_file")
+
+    elif [[ -n "$prompt" ]]; then
+      # v1 style: monolithic prompt file
+      yellow "  [$name] v1 (legacy) prompt=${prompt}"
+      final_prompt_file=$(resolve_prompt "$prompt" "$work_dir")
+
+    else
+      # No prompt — plain interactive
+      dim "  [$name] no prompt (interactive)"
+    fi
+
+    if [[ -n "$d_branch" || -n "$d_check" ]]; then
+      final_prompt_file=$(inject_contract "$final_prompt_file" "$name" "$d_branch" "$d_check")
+      temp_files+=("$final_prompt_file")
+      dim "  deliverable contract injected for $name"
+    fi
+
+    # --- Show assembled prompt in verbose dry-run (v2 only — v1 prompts are already readable files) ---
+    if $DRY_RUN && $VERBOSE && [[ -n "$task" && -n "$final_prompt_file" && -f "$final_prompt_file" ]]; then
+      echo ""
+      dim "  ┌─── Assembled prompt for [$name] ───"
+      sed 's/^/  │ /' "$final_prompt_file" | head -40
+      local total_lines
+      total_lines=$(wc -l < "$final_prompt_file" | tr -d ' ')
+      if [[ "$total_lines" -gt 40 ]]; then
+        dim "  │ ... ($((total_lines - 40)) more lines)"
+      fi
+      dim "  └─── end prompt ───"
+      echo ""
+    fi
+
+    # --- Create worker pane/window ---
+    be_new_worker "$session" "$name" "$work_dir"
+
+    # --- Build and send runner command (claude default, pi supported) ---
+    local worker_cmd
+    worker_cmd=$(build_runner_cmd "$runner" "$model" "$final_prompt_file" "$profile" "$project_path" "$mode")
+    be_send "$session" "$name" "$worker_cmd" "$mode"
+
+    # --- Guaranteed kickoff: confirm the agent actually started (not lead) ---
+    if [[ -n "$final_prompt_file" && "$role" != "lead" ]]; then
+      if be_confirm_launch "$session" "$name"; then
+        dim "  [$name] agent started"
+      else
+        red "  [$name] agent did NOT start after retries — check its pane"
+      fi
+    fi
+
+    # --- Initialize status file ---
+    if [[ "$role" != "lead" ]]; then
+      local status_file="${project_path}/${TEAM_DIR}/agents/${name}.md"
+      if ! $DRY_RUN; then
+        cat > "$status_file" <<STATUSEOF
+# Agent: ${name}
+**Status:** Starting
+**Current task:** Initializing
+**Completed:** (none yet)
+**Blockers:** (none)
+**Updated:** $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+STATUSEOF
+      else
+        dim "  [dry-run] Would create status file: $status_file"
+      fi
+    fi
+
+    echo ""
+  done
+
+  # Note: temp files are intentionally NOT cleaned up here.
+  # Claude reads them via $(cat ...) after tmux sends the command.
+  # Contract-injected copies live under "$CONTRACT_TMPDIR" (purge with
+  # `rm -rf "$CONTRACT_TMPDIR"` once every worker has picked up its prompt);
+  # everything else lives loose in $TMPDIR and is cleaned up by the OS.
+  if [[ ${#temp_files[@]} -gt 0 ]]; then
+    dim "Temp prompt files (auto-cleaned by OS; contract copies under $CONTRACT_TMPDIR):"
+    for tf in "${temp_files[@]}"; do
+      dim "  $tf"
+    done
+  fi
+
+  echo ""
+  green "All agents spawned. Switch windows with prefix+<number> or prefix+n/p"
+}
+
+# --- Launch from saved config ---
+
+cmd_launch() {
+  local config_file
+  config_file=$(resolve_config "$1")
+
+  local project_path
+  project_path=$(yq -r '.project // ""' "$config_file")
+  if [[ -z "$project_path" ]]; then
+    red "Config missing 'project' field"
+    exit 1
+  fi
+  project_path=$(eval echo "$project_path")
+  project_path=$(cd "$project_path" && pwd)
+
+  local session
+  if [[ -n "${SESSION_NAME_OVERRIDE:-}" ]]; then
+    session="$SESSION_NAME_OVERRIDE"
+  else
+    session="team-$(session_name_from_path "$project_path")"
+  fi
+
+  # Check if session already exists
+  if be_has_session "$session"; then
+    yellow "Session '$session' already exists. Attaching..."
+    be_attach "$session"
+    return
+  fi
+
+  # Create session
+  be_new_session "$session" "$project_path"
+
+  # Spawn all agents
+  cmd_spawn "$1"
+
+  # Attach
+  # Select lead window
+  be_select_lead "$session"
+
+  be_attach "$session"
+}
+
+# --- List saved configs ---
+
+cmd_list() {
+  if [[ ! -d "$CONFIG_DIR" ]] || ! ls "${CONFIG_DIR}"/*.yml &>/dev/null; then
+    yellow "No saved configs found in $CONFIG_DIR"
+    return
+  fi
+
+  echo "Saved team configs:"
+  for f in "${CONFIG_DIR}"/*.yml; do
+    [[ "$(basename "$f")" == "_"* ]] && continue  # skip _templates etc
+    local name
+    name=$(basename "$f" .yml)
+    local desc
+    desc=$(yq -r '.name // ""' "$f" 2>/dev/null)
+    if [[ -n "$desc" ]]; then
+      printf "  %-20s %s\n" "$name" "$desc"
+    else
+      printf "  %s\n" "$name"
+    fi
+  done
+}
+
+# --- fzf picker ---
+
+cmd_pick() {
+  if [[ ! -d "$CONFIG_DIR" ]] || ! ls "${CONFIG_DIR}"/*.yml &>/dev/null; then
+    red "No saved configs found in $CONFIG_DIR"
+    exit 1
+  fi
+
+  local choice
+  choice=$(for f in "${CONFIG_DIR}"/*.yml; do
+    [[ "$(basename "$f")" == _* ]] && continue
+    basename "$f" .yml
+  done | fzf --prompt="Team config: " --preview "yq '.' ${CONFIG_DIR}/{}.yml" \
+  ) || exit 0
+
+  cmd_launch "$choice"
+}
+
+# --- Cleanup dead worker windows ---
+
+cmd_cleanup() {
+  local session="${1:-}"
+
+  if [[ -z "$session" ]]; then
+    # Auto-detect only works from inside a tmux session
+    if [[ "$BACKEND" == "tmux" ]]; then
+      session=$(tmux display-message -p '#{session_name}' 2>/dev/null || true)
+    else
+      red "cleanup with --backend herdr requires a session name"
+      return 1
+    fi
+  fi
+
+  if [[ -z "$session" ]] || ! be_has_session "$session"; then
+    red "No active team session found"
+    return
+  fi
+
+  # Kill all windows/tabs except 'lead'
+  local count
+  count=$(be_cleanup_workers "$session")
+
+  green "Cleaned up $count worker windows from $session"
+}
+
+# --- Verify deliverables (pure: reads manifest, writes nothing) ---
+cmd_verify() {
+  local session="${1:-}" only_agent="${2:-}" as_json=false
+  [[ "${2:-}" == "--json" ]] && { as_json=true; only_agent=""; }
+  [[ "${3:-}" == "--json" ]] && as_json=true
+  # --json is a global flag: main()'s pre-dispatch parser strips it out of the
+  # positional args wherever it appears, so it never actually reaches here as
+  # $2/$3 in normal CLI use — fall back to the already-parsed global.
+  $JSON_OUT && as_json=true
+  [[ -z "$session" ]] && { red "usage: claude-team verify <session> [agent] [--json]"; exit 2; }
+  [[ "$session" != team-* ]] && session="team-${session}"
+  local man=""
+  man=$(manifest_path_for "$session") || true
+  [[ -z "$man" ]] && { red "no manifest for $session (looked in ./${TEAM_DIR}/manifest/)"; exit 2; }
+  CV_MAN="$man" CV_AGENT="$only_agent" CV_JSON="$as_json" CV_SESSION="$session" python3 - <<'PYEOF'
+import json, os, re, subprocess, sys
+man = json.load(open(os.environ["CV_MAN"]))
+only, as_json = os.environ["CV_AGENT"], os.environ["CV_JSON"] == "true"
+worst = 0
+matched = False
+for name, a in man["agents"].items():
+    if only and name != only:
+        continue
+    matched = True
+    checks, results, met = a.get("checks", {}), [], True
+    wd = a.get("work_dir") or man.get("project") or "."
+    b = checks.get("branch_pushed") or ""
+    if b:
+        try:
+            r = subprocess.run(["git", "-C", wd, "ls-remote", "origin", b],
+                               capture_output=True, text=True, timeout=60)
+            ok = bool(r.stdout.strip())
+            detail = ("branch %s is on origin" % b) if ok else \
+                     ("branch %s not found on origin - push it (git push -u origin %s)" % (b, b))
+        except subprocess.TimeoutExpired:
+            ok, detail = False, "git ls-remote timed out after 60s - is origin reachable?"
+        results.append({"type": "branch_pushed", "target": b, "ok": ok, "detail": detail})
+        met &= ok
+    c = checks.get("check") or ""
+    if c:
+        try:
+            r = subprocess.run(["bash", "-c", c], cwd=wd, capture_output=True,
+                               text=True, timeout=120)
+            ok = r.returncode == 0
+            tail = (r.stdout + r.stderr).strip().splitlines()[-1:] or [""]
+            detail = ("`%s` exited 0" % c) if ok else \
+                     ("`%s` exited %d in %s - last output: %s ; fix until it exits 0"
+                      % (c, r.returncode, wd, tail[0][:160]))
+        except subprocess.TimeoutExpired:
+            ok, detail = False, "`%s` timed out after 120s - make it faster or fix the hang" % c
+        results.append({"type": "check", "target": c, "ok": ok, "detail": detail})
+        met &= ok
+    rv = checks.get("review") or {}
+    if rv:
+        # The reviewer (a separate, optionally diverse-model agent) writes a
+        # graded verdict artifact; we read it as one more check. VERIFIED/PERFECT
+        # = met; PARTIAL/FEEDBACK/FAILED = unmet (feedback flows to the nudge).
+        proj = man.get("project") or wd
+        vf = os.path.join(proj, ".claude-team", "reviews", name + ".verdict")
+        grade, fb, have_file = None, "", False
+        try:
+            with open(vf) as fh:
+                have_file = True
+                for ln in fh:
+                    m = re.match(r"\s*VERDICT:\s*(PERFECT|VERIFIED|PARTIAL|FEEDBACK|FAILED)",
+                                 ln, re.I)
+                    if m and grade is None:          # first VERDICT line wins
+                        grade = m.group(1).upper()
+                    elif re.match(r"\s*(feedback|reason|reasons):", ln, re.I) and not fb:
+                        fb = ln.split(":", 1)[1].strip()
+        except OSError:
+            pass
+        sess = os.environ["CV_SESSION"]
+        sess = sess[5:] if sess.startswith("team-") else sess
+        if grade is None and not have_file:
+            state, ok = "pending", False        # reviewer not run yet -> watch spawns it
+            detail = ("reviewer not yet run - spawn it (claude-team review %s %s)"
+                      % (sess, name))
+        elif grade is None:
+            state, ok = "malformed", False       # file present, no valid VERDICT: line
+            detail = ("reviewer wrote no valid 'VERDICT: <grade>' line - the reviewer "
+                      "needs attention (not the worker's fault)")
+        elif grade in ("PERFECT", "VERIFIED"):
+            state, ok, detail = "verdict", True, "reviewer verdict %s" % grade
+        else:
+            state, ok = "verdict", False
+            detail = "reviewer verdict %s%s" % (grade, (" - " + fb) if fb else "")
+        results.append({"type": "review", "target": rv.get("persona") or "review",
+                        "ok": ok, "detail": detail, "review_state": state})
+        met &= ok
+    if not checks.get("branch_pushed") and not checks.get("check") \
+            and not (checks.get("review") or {}):
+        met = True  # no deliverable declared -> vacuously met, protocol inert
+    if as_json:
+        print(json.dumps({"agent": name, "met": met, "checks": results}))
+    else:
+        print("%s: %s" % (name, "PASS" if met else "FAIL"))
+        for r in results:
+            print("  [%s] %s" % ("ok" if r["ok"] else "XX", r["detail"]))
+    if not met:
+        worst = 1
+if only and not matched:
+    print("no agent '%s' in manifest for %s"
+          % (only, os.environ["CV_SESSION"]))
+    sys.exit(2)
+sys.exit(worst)
+PYEOF
+}
+
+# --- Build the reviewer's prompt (persona + what to review + how to report) ---
+build_review_prompt() { # $1=worker $2=worker_ref(pane|label) $3=persona_file $4=verdict_file $5=session
+  local worker="$1" worker_ref="$2" persona_file="$3" verdict_file="$4" session="$5"
+  local dir="$CONTRACT_TMPDIR"
+  mkdir -p "$dir" 2>/dev/null || dir="${TMPDIR:-/tmp}"
+  local out
+  out=$(mktemp "${dir}/ct-review-${worker}.XXXXXX") || { echo ""; return; }
+  {
+    [[ -n "$persona_file" && -f "$persona_file" ]] && { cat "$persona_file"; echo ""; }
+    echo "# Review task"
+    echo "You are the independent, READ-ONLY verifier for worker \`${worker}\` in"
+    echo "session \`${session}\`. Do not edit the worker's code."
+    echo ""
+    echo "1. Read what the worker actually did — its session transcript:"
+    echo "     herdr pane read ${worker_ref} --source recent-unwrapped --lines 400"
+    echo "2. Atomize the worker's ORIGINAL task + deliverable contract into claims,"
+    echo "   and check each against real evidence (diffs, raw command output). A"
+    echo "   claim contradicted by its own output is void."
+    echo "3. Write your verdict to this exact file (overwrite it):"
+    echo "     ${verdict_file}"
+    echo "   First line MUST be:"
+    echo "     VERDICT: <PERFECT|VERIFIED|PARTIAL|FEEDBACK|FAILED>"
+    echo "   Then a 'feedback:' line naming the single most important gap (if any)."
+    echo "   PERFECT/VERIFIED = deliverable met; PARTIAL/FEEDBACK/FAILED = send it back."
+  } > "$out"
+  echo "$out"
+}
+
+# --- review: spawn the agent-as-verifier for one worker ---
+# The reviewer is a separate tab (its own persona + profile => its own model,
+# optionally a different provider via runner: pi) that reads the worker's session
+# and writes a graded verdict artifact that `verify` folds in. Reserved-v2 seam
+# from docs/specs/2026-07-02-completion-protocol-design.md, modelled on the MEA
+# Pi Verifier (~/.code/learning/tac/MEA/the-verifier-agent-system/).
+cmd_review() {
+  local session="${1:-}" agent="${2:-}"
+  [[ -z "$session" || -z "$agent" ]] && { red "usage: claude-team review <session> <agent> [--wait]"; exit 2; }
+  local do_wait=false
+  [[ "${3:-}" == "--wait" ]] && do_wait=true
+  [[ "$session" != team-* ]] && session="team-${session}"
+  local man=""
+  man=$(manifest_path_for "$session") || true
+  [[ -z "$man" ]] && { red "no manifest for $session (looked in ./${TEAM_DIR}/manifest/)"; exit 2; }
+
+  # Pull the review config + work_dir + project out of the manifest (JSON via python3).
+  local rvline
+  rvline=$(CR_MAN="$man" CR_AGENT="$agent" python3 - <<'PYEOF'
+import json, os
+US = "\x1f"  # unit separator: a NON-whitespace delimiter, so empty fields (e.g.
+             # an omitted model) survive the shell read instead of shifting left.
+man = json.load(open(os.environ["CR_MAN"]))
+a = (man.get("agents") or {}).get(os.environ["CR_AGENT"])
+if not a:
+    print("ERR" + US + "no such agent"); raise SystemExit
+rv = (a.get("checks") or {}).get("review") or {}
+if not rv:
+    print("ERR" + US + "no review deliverable declared"); raise SystemExit
+print(US.join(["OK", rv.get("persona", ""), rv.get("profile", ""),
+               rv.get("runner", "claude") or "claude", rv.get("model", ""),
+               a.get("work_dir", "") or man.get("project", "."),
+               man.get("project", ".")]))
+PYEOF
+)
+  [[ "${rvline%%$'\037'*}" == "OK" ]] || { red "review: ${rvline#*$'\037'} (agent '$agent' in $session)"; exit 2; }
+  local persona profile runner model work_dir project
+  IFS=$'\037' read -r _ persona profile runner model work_dir project <<<"$rvline"
+
+  local reviewer="${agent}-review"
+  local verdict_rel="${TEAM_DIR}/reviews/${agent}.verdict"
+  local verdict_file="${project}/${verdict_rel}"
+  $DRY_RUN || mkdir -p "${project}/${TEAM_DIR}/reviews"
+
+  # Resolve the persona card: explicit path, else a name under the project's
+  # .claude-team/verifiers/, else a shared card under ~/.config/claude-teams/_verifiers/.
+  local persona_file=""
+  if [[ -n "$persona" ]]; then
+    local cfg="${CONFIG_DIR:-$HOME/.config/claude-teams}"
+    if   [[ "$persona" == /* ]]; then                                   persona_file="$persona"
+    elif [[ -f "${project}/${persona}" ]]; then                        persona_file="${project}/${persona}"
+    elif [[ -f "${project}/${TEAM_DIR}/verifiers/${persona}.md" ]]; then persona_file="${project}/${TEAM_DIR}/verifiers/${persona}.md"
+    elif [[ -f "${cfg}/_verifiers/${persona}.md" ]]; then              persona_file="${cfg}/_verifiers/${persona}.md"
+    else                                                               persona_file="${project}/${persona}"; fi
+  fi
+
+  # Point the reviewer at the worker's actual pane (falls back to the label), and
+  # record that this worker is under review so the watch re-check fires and no
+  # second reviewer is spawned — works for a manual `review` too, not just auto.
+  local worker_ref="$agent" worker_pane=""
+  if ! $DRY_RUN; then
+    worker_pane=$(be_pane_for "$session" "$agent" 2>/dev/null || true)
+    [[ -n "$worker_pane" ]] && worker_ref="$worker_pane"
+    manifest_mark_review "$man" "$agent" "$worker_pane"
+  fi
+
+  local prompt_file
+  prompt_file=$(build_review_prompt "$agent" "$worker_ref" "$persona_file" "$verdict_file" "$session")
+
+  green "  [review] spawning reviewer '$reviewer' profile=${profile:-default} runner=${runner}${model:+ model=$model}"
+  dim   "           reads worker '$agent' session -> writes verdict ${verdict_rel}"
+
+  be_new_worker "$session" "$reviewer" "$work_dir"
+  local cmd
+  cmd=$(build_runner_cmd "$runner" "$model" "$prompt_file" "$profile" "$project" interactive)
+  be_send "$session" "$reviewer" "$cmd" interactive
+  # Guaranteed kickoff: confirm the reviewer actually started (re-fire Enter if
+  # its launch command is sitting unexecuted).
+  if be_confirm_launch "$session" "$reviewer"; then dim "  [review] reviewer started"
+  else red "  [review] reviewer did NOT start after retries — check its pane"; fi
+
+  if $do_wait && ! $DRY_RUN; then
+    dim "  [review] waiting for reviewer to write its verdict…"
+    # Poll the verdict artifact — that IS the completion signal (the reviewer
+    # writes it as its final act). More robust than waiting on the reviewer's
+    # pane status, which races with tab creation right after spawn.
+    local waited=0 timeout=900
+    while [[ ! -f "$verdict_file" && "$waited" -lt "$timeout" ]]; do
+      sleep 5; waited=$((waited + 5))
+    done
+    if [[ -f "$verdict_file" ]]; then green "  [review] verdict:"; sed 's/^/    /' "$verdict_file"
+    else yellow "  [review] no verdict after ${timeout}s - check the reviewer pane ('${reviewer}')"; fi
+  fi
+}
+
+# --- Status: one-glance table of agents and their states ---
+
+status_file_field() { # $1=project $2=agent -> **Status:** value from agents/<name>.md, or "-"
+  local f="${1:-}/${TEAM_DIR}/agents/${2}.md"
+  if [[ -z "${1:-}" || ! -f "$f" ]]; then echo "-"; return; fi
+  local line
+  line=$(grep -m1 '^\*\*Status:\*\*' "$f" 2>/dev/null | sed 's/^\*\*Status:\*\* *//')
+  echo "${line:--}"
+}
+
+results_field() { # $1=project $2=agent -> "yes" if results/<name>.md exists, else "-"
+  local f="${1:-}/${TEAM_DIR}/results/${2}.md"
+  if [[ -n "${1:-}" && -f "$f" ]]; then echo "yes"; else echo "-"; fi
+}
+
+# Manifest lookup for a session (same convention as cmd_verify): project-local
+# first, then one directory up, then an optional caller-supplied extra dir
+# (e.g. a project path already resolved from the workspace/pane cwd, used to
+# retry when $PWD isn't the project root). Echoes the path, or nothing
+# (rc=1) if absent.
+manifest_path_for() { # $1=session $2=extra_dir (optional)
+  local session="$1" extra="${2:-}" d
+  for d in "$PWD" "$PWD/.." ${extra:+"$extra"}; do
+    if [[ -f "$d/${TEAM_DIR}/manifest/${session}.json" ]]; then
+      echo "$d/${TEAM_DIR}/manifest/${session}.json"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# $1=manifest_path -> "<agent>\t<deliverable>\t<protocol>" per line.
+# deliverable: met/unmet from the LAST entry of verifications, "-" if none.
+# protocol: manifest state; "nudged xN" when state=="working" and nudges>0; "-" if absent.
+# Resilient to a corrupt/truncated manifest: prints nothing and exits nonzero
+# (caller degrades to "-" columns + a warning) rather than letting an
+# unhandled json.load exception kill the whole script under set -euo pipefail.
+manifest_columns() {
+  local man="$1"
+  [[ -f "$man" ]] || return 0
+  MCOL_MAN="$man" python3 - <<'PYEOF'
+import json, os, sys
+try:
+    doc = json.load(open(os.environ["MCOL_MAN"]))
+except (OSError, ValueError):
+    sys.exit(1)
+for name, a in doc.get("agents", {}).items():
+    verifications = a.get("verifications") or []
+    if verifications:
+        deliverable = "met" if verifications[-1].get("met") else "unmet"
+    else:
+        deliverable = "-"
+    state = a.get("state") or ""
+    nudges = a.get("nudges") or 0
+    if state == "working" and nudges > 0:
+        protocol = "nudged x%d" % nudges
+    elif state:
+        protocol = state
+    else:
+        protocol = "-"
+    print("%s\t%s\t%s" % (name, deliverable, protocol))
+PYEOF
+}
+
+# $1=JSONL from `cmd_verify <session> --json` -> "<agent>\t<met|unmet>" per line.
+verify_columns() {
+  local jsonl="$1"
+  [[ -n "$jsonl" ]] || return 0
+  VCOL_JSONL="$jsonl" python3 - <<'PYEOF'
+import json, os
+for line in os.environ["VCOL_JSONL"].splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        obj = json.loads(line)
+    except ValueError:
+        continue
+    print("%s\t%s" % (obj.get("agent", ""), "met" if obj.get("met") else "unmet"))
+PYEOF
+}
+
+# $1=tsv-lines (from manifest_columns/verify_columns) $2=agent $3=colnum -> field value, or "-"
+# bash-3.2-safe lookup (no associative arrays): one awk pass per call.
+mc_field() {
+  local lines="$1" agent="$2" col="$3"
+  [[ -n "$lines" ]] || { echo "-"; return; }
+  printf '%s\n' "$lines" | awk -F'\t' -v a="$agent" -v c="$col" '
+    $1==a { print $c; found=1; exit }
+    END { if (!found) print "-" }'
+}
+
+status_one_session() { # $1=session — print the agent table for one session
+  local session="$1"
+  local fmt='  %-16s %-10s %-14s %-24s %-8s %-12s %s\n'
+  bold "$session"
+  case "$BACKEND" in
+    herdr)
+      local ws panes project
+      ws=$(be_ws_id "$session")
+      [[ -n "$ws" ]] || { yellow "  workspace not found: $session"; return 0; }
+      panes=$("$HERDR_BIN" pane list --workspace "$ws" 2>/dev/null)
+      # project = cwd of the workspace root pane (first pane in list)
+      project=$(echo "$panes" | yq -p json -r '.result.panes[0].cwd // ""')
+      # Manifest lookup: $PWD first (via manifest_path_for's own convention),
+      # then retry against the workspace root pane's cwd — covers the common
+      # case where status is invoked from outside the project directory.
+      local man mc_lines="" vc_lines=""
+      man=$(manifest_path_for "$session" "$project") || true
+      if [[ -n "$man" ]]; then
+        mc_lines=$(manifest_columns "$man") || { yellow "warning: unreadable manifest for $session"; mc_lines=""; }
+      fi
+      if $VERIFY_STATUS && [[ -n "$man" ]]; then
+        local verify_json
+        verify_json=$(cmd_verify "$session" --json 2>/dev/null) || true
+        vc_lines=$(verify_columns "$verify_json")
+      fi
+      # shellcheck disable=SC2059
+      printf "$fmt" "AGENT" "STATE" "PANE" "STATUS-FILE" "RESULTS" "DELIVERABLE" "PROTOCOL"
+      local tab_id label pane state deliverable protocol
+      while IFS=$'\t' read -r tab_id label; do
+        [[ -n "$tab_id" ]] || continue
+        pane=$(echo "$panes" | yq -p json -r ".result.panes[] | select(.tab_id==\"$tab_id\") | .pane_id" | head -1)
+        state="-"
+        if [[ -n "$pane" ]]; then
+          state=$("$HERDR_BIN" pane get "$pane" 2>/dev/null | yq -p json -r '.result.pane.agent_status // "-"')
+          [[ -z "$state" || "$state" == "null" ]] && state="-"
+        fi
+        if $VERIFY_STATUS && [[ -n "$vc_lines" ]]; then
+          deliverable=$(mc_field "$vc_lines" "$label" 2)
+        else
+          deliverable=$(mc_field "$mc_lines" "$label" 2)
+        fi
+        protocol=$(mc_field "$mc_lines" "$label" 3)
+        # shellcheck disable=SC2059
+        printf "$fmt" "$label" "$state" "${pane:--}" \
+          "$(status_file_field "$project" "$label")" "$(results_field "$project" "$label")" \
+          "$deliverable" "$protocol"
+      done < <("$HERDR_BIN" tab list --workspace "$ws" 2>/dev/null \
+                 | yq -p json -r '.result.tabs[] | [.tab_id, (.label // .tab_id)] | @tsv')
+      ;;
+    tmux)
+      tmux has-session -t "$session" 2>/dev/null || { yellow "  session not found: $session"; return 0; }
+      local project window deliverable protocol
+      project=$(tmux display-message -p -t "$session" '#{pane_current_path}' 2>/dev/null || true)
+      # Manifest lookup: $PWD first, then retry against the session's pane
+      # cwd — covers status invoked from outside the project directory.
+      local man mc_lines="" vc_lines=""
+      man=$(manifest_path_for "$session" "$project") || true
+      if [[ -n "$man" ]]; then
+        mc_lines=$(manifest_columns "$man") || { yellow "warning: unreadable manifest for $session"; mc_lines=""; }
+      fi
+      if $VERIFY_STATUS && [[ -n "$man" ]]; then
+        local verify_json
+        verify_json=$(cmd_verify "$session" --json 2>/dev/null) || true
+        vc_lines=$(verify_columns "$verify_json")
+      fi
+      # shellcheck disable=SC2059
+      printf "$fmt" "AGENT" "STATE" "PANE" "STATUS-FILE" "RESULTS" "DELIVERABLE" "PROTOCOL"
+      while IFS= read -r window; do
+        [[ -n "$window" ]] || continue
+        if $VERIFY_STATUS && [[ -n "$vc_lines" ]]; then
+          deliverable=$(mc_field "$vc_lines" "$window" 2)
+        else
+          deliverable=$(mc_field "$mc_lines" "$window" 2)
+        fi
+        protocol=$(mc_field "$mc_lines" "$window" 3)
+        # shellcheck disable=SC2059
+        printf "$fmt" "$window" "-" "${session}:${window}" \
+          "$(status_file_field "$project" "$window")" "$(results_field "$project" "$window")" \
+          "$deliverable" "$protocol"
+      done < <(tmux list-windows -t "$session" -F '#{window_name}' 2>/dev/null)
+      ;;
+    *) red "unknown backend: $BACKEND (use tmux|herdr)"; exit 1 ;;
+  esac
+  echo ""
+}
+
+# Manifest-only fallback: no live workspace/tmux session for $1, but a manifest
+# exists at $2. Prints the session header + one row per manifest agent with
+# STATE "-" (there is no live pane/window to read a state from). Resilient to
+# a corrupt/truncated manifest: degrades to a warning + header-only table
+# (rc 0) instead of dying under set -euo pipefail.
+status_manifest_only() { # $1=session $2=manifest_path
+  local session="$1" man="$2"
+  local project rc=0
+  project=$(SM_MAN="$man" python3 - <<'PYEOF'
+import json, os, sys
+try:
+    doc = json.load(open(os.environ["SM_MAN"]))
+except (OSError, ValueError):
+    sys.exit(1)
+print(doc.get("project", ""))
+PYEOF
+) || rc=$?
+  local fmt='  %-16s %-10s %-14s %-24s %-8s %-12s %s\n'
+  bold "$session"
+  [[ $rc -ne 0 ]] && yellow "warning: unreadable manifest for $session"
+  # shellcheck disable=SC2059
+  printf "$fmt" "AGENT" "STATE" "PANE" "STATUS-FILE" "RESULTS" "DELIVERABLE" "PROTOCOL"
+  if [[ $rc -ne 0 ]]; then
+    echo ""
+    return 0
+  fi
+  local mc_lines vc_lines="" name deliverable protocol
+  mc_lines=$(manifest_columns "$man") || mc_lines=""
+  if $VERIFY_STATUS; then
+    local verify_json
+    verify_json=$(cmd_verify "$session" --json 2>/dev/null) || true
+    vc_lines=$(verify_columns "$verify_json")
+  fi
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    if $VERIFY_STATUS && [[ -n "$vc_lines" ]]; then
+      deliverable=$(mc_field "$vc_lines" "$name" 2)
+    else
+      deliverable=$(mc_field "$mc_lines" "$name" 2)
+    fi
+    protocol=$(mc_field "$mc_lines" "$name" 3)
+    # shellcheck disable=SC2059
+    printf "$fmt" "$name" "-" "-" \
+      "$(status_file_field "$project" "$name")" "$(results_field "$project" "$name")" \
+      "$deliverable" "$protocol"
+  done < <(printf '%s\n' "$mc_lines" | awk -F'\t' 'NF{print $1}')
+  echo ""
+}
+
+cmd_status() {
+  local session="${1:-}"
+  local sessions
+  if [[ -n "$session" ]]; then
+    # Accept with/without team- prefix
+    if [[ "$session" != team-* ]]; then
+      session="team-${session}"
+    fi
+    if ! be_has_session "$session"; then
+      local man
+      man=$(manifest_path_for "$session") || true
+      if [[ -n "$man" ]]; then
+        status_manifest_only "$session" "$man"
+        return 0
+      fi
+      yellow "no team sessions running"
+      return 0
+    fi
+    sessions="$session"
+  else
+    sessions=$(be_list_sessions)
+    if [[ -z "$sessions" ]]; then
+      yellow "no team sessions running"
+      return 0
+    fi
+  fi
+  local s
+  while IFS= read -r s; do
+    [[ -n "$s" ]] && status_one_session "$s"
+  done <<< "$sessions"
+  return 0
+}
+
+# --- Tell: deliver an instruction to a running agent, guarantee submission ---
+# Motivated by the "typed but never pressed Enter" incident: a message sat
+# unsubmitted at a worker's prompt for an hour. tell always sends text + Enter.
+
+cmd_tell() {
+  local session="" agent="" message="" wait_mode="" wait_secs=""
+  local positional=()
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --wait) wait_mode="ack" ;;
+      --wait=*)
+        wait_mode="complete"
+        wait_secs="${arg#--wait=}"
+        if ! [[ "$wait_secs" =~ ^[0-9]+$ ]]; then
+          red "tell: --wait=SECONDS must be a number (got '$wait_secs')"
+          exit 1
+        fi ;;
+      *) positional+=("$arg") ;;
+    esac
+  done
+  session="${positional[0]:-}"
+  agent="${positional[1]:-}"
+  message="${positional[2]:-}"
+
+  if [[ -z "$session" || -z "$agent" || -z "$message" ]]; then
+    red "Usage: claude-team tell <session> <agent> \"<message>\" [--wait[=SECONDS]]"
+    exit 1
+  fi
+
+  # Add team- prefix if not present (same normalization as stop)
+  if [[ "$session" != team-* ]]; then
+    session="team-${session}"
+  fi
+
+  case "$BACKEND" in
+    tmux)
+      run_cmd tmux send-keys -t "${session}:${agent}" "$message" Enter
+      green "told ${agent}: ${message}"
+      if [[ -n "$wait_mode" ]]; then
+        yellow "--wait not supported on tmux backend"
+      fi
+      ;;
+    herdr)
+      local pane
+      pane=$(be_pane_for "$session" "$agent") || exit 1
+      # TUI agent prompt: pane run is for shell commands; a running agent
+      # needs literal text followed by an explicit Enter keypress.
+      if $DRY_RUN; then
+        dim "[dry-run] $HERDR_BIN pane send-text $pane \"$message\""
+        dim "[dry-run] $HERDR_BIN pane send-keys $pane enter"
+      else
+        "$HERDR_BIN" pane send-text "$pane" "$message" >/dev/null
+        "$HERDR_BIN" pane send-keys "$pane" enter >/dev/null
+      fi
+      green "told ${agent}: ${message}"
+      if [[ -n "$wait_mode" ]]; then
+        if $DRY_RUN; then
+          dim "[dry-run] $HERDR_BIN wait agent-status $pane --status working --timeout 15000"
+          [[ "$wait_mode" == "complete" ]] && \
+            dim "[dry-run] $HERDR_BIN wait agent-status $pane --status idle --timeout $((wait_secs * 1000))"
+        elif [[ "$wait_mode" == "ack" ]]; then
+          if "$HERDR_BIN" wait agent-status "$pane" --status working --timeout 15000 >/dev/null 2>&1; then
+            green "acknowledged (working)"
+          else
+            yellow "no state change seen — check the pane"
+          fi
+        else
+          # completion wait: confirm pickup first, then wait for idle
+          "$HERDR_BIN" wait agent-status "$pane" --status working --timeout 15000 >/dev/null 2>&1 || true
+          if "$HERDR_BIN" wait agent-status "$pane" --status idle --timeout $((wait_secs * 1000)) >/dev/null 2>&1; then
+            green "completed (idle)"
+          else
+            yellow "not idle after ${wait_secs}s — check the pane"
+          fi
+        fi
+      fi
+      ;;
+    *) red "unknown backend: $BACKEND (use tmux|herdr)"; exit 1 ;;
+  esac
+}
+
+# --- Watch: exec the python supervisor (herdr events) ---
+
+cmd_watch() {
+  local session="${1:-}"
+  if [[ -z "$session" || "$session" == "-h" || "$session" == "--help" ]]; then
+    usage
+    exit 1
+  fi
+  if [[ "$session" != team-* ]]; then
+    session="team-${session}"
+  fi
+  local sock="${HERDR_SOCKET_PATH:-${HOME}/.config/herdr/herdr.sock}"
+  local self="${BASH_SOURCE[0]}"
+  if command -v realpath &>/dev/null; then
+    self="$(realpath "$self")"
+  fi
+  local watch_bin
+  watch_bin="$(cd "$(dirname "$self")" && pwd)/claude-team-watch"
+  if [[ ! -x "$watch_bin" ]]; then
+    red "watch helper not found: $watch_bin"
+    exit 1
+  fi
+  local extra=()
+  if $JSON_OUT; then
+    extra+=(--json)
+  fi
+  if $REAP; then
+    extra+=(--reap)
+  fi
+  # Hand watch our own path so it can shell out to `claude-team verify`.
+  local ct_bin
+  ct_bin="$(cd "$(dirname "$self")" && pwd)/$(basename "$self")"
+  export CLAUDE_TEAM_BIN="$ct_bin"
+  exec "$watch_bin" "$session" --socket "$sock" "${extra[@]}"
+}
+
+# --- Stop session ---
+
+cmd_stop() {
+  local session="${1:-}"
+
+  if [[ -z "$session" ]]; then
+    # Pick from running team sessions
+    local sessions
+    sessions=$(be_list_sessions)
+
+    if [[ -z "$sessions" ]]; then
+      yellow "No team sessions running"
+      return
+    fi
+
+    if command -v fzf &>/dev/null; then
+      session=$(echo "$sessions" | fzf --prompt="Stop session: ") || return
+    else
+      echo "Running team sessions:"
+      echo "$sessions"
+      echo ""
+      read -rp "Session to stop: " session
+    fi
+  fi
+
+  # Add team- prefix if not present
+  if [[ "$session" != team-* ]]; then
+    session="team-${session}"
+  fi
+
+  if ! be_has_session "$session"; then
+    red "Session not found: $session"
+    exit 1
+  fi
+
+  # Check for worktrees (tmux only; herdr worktree cleanup is a follow-up)
+  local session_path=""
+  [[ "$BACKEND" == "tmux" ]] && session_path=$(tmux display-message -t "$session" -p '#{pane_current_path}' 2>/dev/null || true)
+
+  if [[ -n "$session_path" && -d "${session_path}/.git" ]]; then
+    local worktrees
+    worktrees=$(git -C "$session_path" worktree list --porcelain 2>/dev/null | grep '^worktree ' | grep -v "^worktree $session_path$" || true)
+    if [[ -n "$worktrees" ]]; then
+      echo "Active worktrees:"
+      echo "$worktrees" | sed 's/^worktree /  /'
+      echo ""
+      read -rp "Remove worktrees? [y/N] " -n 1 reply
+      echo ""
+      if [[ "$reply" =~ ^[Yy]$ ]]; then
+        echo "$worktrees" | sed 's/^worktree //' | while read -r wt; do
+          green "Removing worktree: $wt"
+          run_cmd git -C "$session_path" worktree remove "$wt" --force
+        done
+      fi
+    fi
+  fi
+
+  green "Stopping session: $session"
+  be_stop "$session"
+}
+
+# --- Main ---
+
+main() {
+  if [[ $# -eq 0 ]]; then
+    usage
+    exit 0
+  fi
+
+  # Check dependencies
+  for cmd in tmux yq; do
+    if ! command -v "$cmd" &>/dev/null; then
+      red "Required: $cmd is not installed"
+      exit 1
+    fi
+  done
+
+  # Parse global flags first
+  local args=()
+  SESSION_NAME_OVERRIDE=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) DRY_RUN=true ;;
+      --yolo) YOLO=true ;;
+      --verbose) VERBOSE=true ;;
+      --json) JSON_OUT=true ;;
+      --reap) REAP=true ;;
+      --verify) VERIFY_STATUS=true ;;
+      --session-name) SESSION_NAME_OVERRIDE="$2"; shift ;;
+      --backend) BACKEND="$2"; shift ;;
+      *) args+=("$1") ;;
+    esac
+    shift
+  done
+  set -- "${args[@]}"
+
+  case "${1:-}" in
+    --help|-h)
+      usage
+      ;;
+    --project|-p)
+      [[ -z "${2:-}" ]] && { red "Missing project path"; exit 1; }
+      cmd_project "$2"
+      ;;
+    --pick)
+      cmd_pick
+      ;;
+    --list|-l)
+      cmd_list
+      ;;
+    --stop|-s)
+      cmd_stop "${2:-}"
+      ;;
+    spawn)
+      [[ -z "${2:-}" ]] && { red "Missing config file"; exit 1; }
+      cmd_spawn "$2"
+      ;;
+    cleanup)
+      cmd_cleanup "${2:-}"
+      ;;
+    tell)
+      shift
+      cmd_tell "$@"
+      ;;
+    verify)
+      cmd_verify "${2:-}" "${3:-}" "${4:-}"
+      ;;
+    review)
+      cmd_review "${2:-}" "${3:-}" "${4:-}"
+      ;;
+    status)
+      cmd_status "${2:-}"
+      ;;
+    watch)
+      cmd_watch "${2:-}"
+      ;;
+    --version|-v)
+      echo "claude-team v${VERSION}"
+      ;;
+    -*)
+      red "Unknown option: $1"
+      usage
+      exit 1
+      ;;
+    *)
+      # Treat as config name/path
+      cmd_launch "$1"
+      ;;
+  esac
+}
+
+main "$@"
