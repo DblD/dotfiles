@@ -372,6 +372,10 @@ class Watcher:
                 fh.write("\n## review of %s (authored)\n\n%s\n" % (label, body))
         except OSError:
             return False
+        # Surface the artifact in the --json stream, mirroring collect()'s event,
+        # so a UI/lead sees the durable review was produced.
+        self.emit("collected", "%s: review artifact -> %s" % (label + "-review", path),
+                  label=label, path=path)
         return True
 
     def finish_review(self, label, pane_id, timed_out=False):
