@@ -485,7 +485,8 @@ Y
   LOUT=$("$CT" spawn "$LP/launch.yaml" --backend herdr --yolo 2>&1)
   check    "launch: real spawn confirms agent started" "$LOUT" "agent started"
   check_eq "launch: no start-failure reported"         "$(echo "$LOUT" | grep -c 'did NOT start')" "0"
-  "$CT" --stop launchtest --backend herdr >/dev/null 2>&1
+  # session derives from the project BASENAME (launchproj), not the config name
+  "$CT" --stop launchproj --backend herdr >/dev/null 2>&1
 else
   echo "  skip: launch-confirm live test (no herdr server)"
 fi
