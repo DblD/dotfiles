@@ -984,12 +984,17 @@ cmd_spawn() {
     # worker always launches bypassed; its permission-profile deny-list
     # (push/merge/checkout/rm-rf) is the safety rail. Uncontracted workers keep
     # the interactive default (bypass stays opt-in via --yolo).
-    local worker_cmd _saved_yolo="$YOLO"
-    if [[ ( -n "$d_branch" || -n "$d_check" ) && "$runner" == "claude" ]]; then
-      YOLO=true
-    fi
-    worker_cmd=$(build_runner_cmd "$runner" "$model" "$final_prompt_file" "$profile" "$project_path" "$mode")
-    YOLO="$_saved_yolo"
+    # YOLO is set INSIDE the command-substitution subshell for contracted claude
+    # workers, so it can never touch parent state — no save/restore, and no risk
+    # of a leaked global if code is later inserted here. (if/fi, not `&& YOLO=`,
+    # so a false condition doesn't trip set -e.)
+    local worker_cmd
+    worker_cmd=$(
+      if [[ ( -n "$d_branch" || -n "$d_check" ) && "$runner" == "claude" ]]; then
+        YOLO=true
+      fi
+      build_runner_cmd "$runner" "$model" "$final_prompt_file" "$profile" "$project_path" "$mode"
+    )
     be_send "$session" "$name" "$worker_cmd" "$mode"
 
     # --- Guaranteed kickoff: confirm the agent actually started (not lead) ---
