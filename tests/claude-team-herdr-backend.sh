@@ -27,6 +27,7 @@ agents:
   - { name: w3, role: worker, mode: interactive, runner: bogus, prompt: .claude-team/agents/w1.md }
   - { name: w4, role: worker, mode: interactive,
       deliverable: { branch_pushed: agent/w4, check: "true" } }
+  - { name: w5, role: worker, mode: interactive, prompt: .claude-team/agents/w1.md }
 Y
 
 pass=0; fail=0
@@ -46,7 +47,21 @@ check "worker cmd via pane run (herdr)"        "$OUT" "herdr pane run <pane:w1>"
 check "injected worker_cmd carries \$(cat prompt)" "$OUT" "$TMP/proj/.claude-team/agents/w1.md"
 # runner: field — w1 stays claude (unchanged), w2 runs pi with model, w3 (unknown) skipped
 W1LINE=$(echo "$OUT" | grep -F "pane run <pane:w1>")
-check "w1 (claude) launch unchanged"     "$W1LINE" "unset CLAUDECODE && claude --allow-dangerously-skip-permissions"
+check "w1 (claude) base launch shape"    "$W1LINE" "unset CLAUDECODE && claude --allow-dangerously-skip-permissions"
+# A contracted worker (declares a deliverable) runs under `watch` with no human
+# in the loop, so it MUST launch bypassed (--dangerously-skip-permissions) or it
+# stalls at the plan/permission gate and the completion protocol dead-locks. Its
+# permission-profile deny-list is the safety rail. w1 is contracted -> BOTH the
+# --allow- flag AND the bypass flag are present (2 occurrences of the substring).
+check "w1 (contracted claude) launches bypassed" \
+  "$W1LINE" " --dangerously-skip-permissions"
+# w5 is an UNCONTRACTED claude worker (no deliverable) -> NOT auto-bypassed; it
+# carries only --allow-dangerously-skip-permissions, never the bare bypass flag
+# (the leading space distinguishes it from the --allow- form). Bypass stays
+# opt-in via --yolo for uncontracted workers.
+W5LINE=$(echo "$OUT" | grep -F "pane run <pane:w5>")
+check_eq "w5 (uncontracted claude) not auto-bypassed" \
+  "$(echo "$W5LINE" | grep -cF -- ' --dangerously-skip-permissions')" "0"
 # w1 now carries a deliverable (see below), so --append-system-prompt points at
 # the contract-injected temp copy rather than the original file — match the flag
 # syntax path-agnostically here, and verify the actual file content further down.

@@ -977,8 +977,19 @@ cmd_spawn() {
     be_new_worker "$session" "$name" "$work_dir"
 
     # --- Build and send runner command (claude default, pi supported) ---
-    local worker_cmd
+    # A contracted worker (declares a deliverable) runs autonomously under
+    # `watch` with no human in the loop. If it launches non-bypassed it stalls
+    # at Claude's plan/permission gate — `watch` can only report "blocked", not
+    # answer it — and the completion protocol dead-locks. So a contracted claude
+    # worker always launches bypassed; its permission-profile deny-list
+    # (push/merge/checkout/rm-rf) is the safety rail. Uncontracted workers keep
+    # the interactive default (bypass stays opt-in via --yolo).
+    local worker_cmd _saved_yolo="$YOLO"
+    if [[ ( -n "$d_branch" || -n "$d_check" ) && "$runner" == "claude" ]]; then
+      YOLO=true
+    fi
     worker_cmd=$(build_runner_cmd "$runner" "$model" "$final_prompt_file" "$profile" "$project_path" "$mode")
+    YOLO="$_saved_yolo"
     be_send "$session" "$name" "$worker_cmd" "$mode"
 
     # --- Guaranteed kickoff: confirm the agent actually started (not lead) ---
