@@ -60,7 +60,13 @@ w, calls = mk()
 agent = {"checks": {"review": {"persona": "p"}}}
 det_fail = [{"type": "check", "ok": False, "detail": "check failed"}]
 took = w.maybe_spawn_reviewer("w2", "p", v_review("reviewer not yet run", det_checks=det_fail), agent, {})
-check("det-check failing -> no spawn", took is False and calls == [])
+check("det-check failing -> no spawn (end-of-task mode)", took is False and calls == [])
+
+# 2b. per_turn: reviewer DOES spawn even while deterministic checks fail (continuous review)
+w, calls = mk()
+agent = {"checks": {"review": {"persona": "p", "per_turn": True}}}
+took = w.maybe_spawn_reviewer("pt", "p", v_review("reviewer not yet run", det_checks=det_fail), agent, {})
+check("per_turn -> spawns despite failing deterministic check", took is True and calls == ["pt"])
 
 # 3. already spawned -> no double spawn
 w, calls = mk()

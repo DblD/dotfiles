@@ -123,8 +123,12 @@ Two new columns, manifest-sourced: `DELIVERABLE` (met / unmet / `-` when none de
 > FEEDBACK/FAILED = unmet, feedback flows to the nudge); `watch` auto-spawns the
 > reviewer once the deterministic checks pass and re-checks the parent when the
 > reviewer finishes. Config: `deliverable.review: {persona, profile, runner,
-> model}`. Deferred to a later pass: live per-turn review (currently end-of-task)
-> and the full structural input-lock. Original design below.
+> model, per_turn}`. Non-Anthropic reviewers work via `runner: pi` (Kimi, local
+> fleet, DeepSeek — proven end-to-end). **`per_turn: true`** reviews after every
+> worker turn (continuous course-correction), not just at task-end — the reviewer
+> fires on each idle even before deterministic checks pass, with a higher
+> escalation cap. Deferred: the full structural input-lock (read-only-by-
+> architecture persona sandbox). Original design below.
 
 ## Reserved v2 seam: the `review:` deliverable (agent-as-verifier)
 

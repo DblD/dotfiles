@@ -188,7 +188,8 @@ class Watcher:
         return True
 
     # ---- completion protocol ------------------------------------------------
-    MAX_NUDGES = 2
+    MAX_NUDGES = 2       # end-of-task: fix the deliverable in a couple tries
+    PER_TURN_MAX = 8     # per_turn review: continuous feedback needs more cycles
 
     def manifest_path(self):
         if not self.project:
@@ -252,14 +253,21 @@ class Watcher:
 
     # ---- agent-as-verifier (review deliverable) ----------------------------
     def spawn_reviewer(self, label):
-        """Launch the reviewer tab for <label> via `claude-team review`."""
+        """Launch the reviewer tab for <label> via `claude-team review`. watch is
+        herdr-only, so pass --backend explicitly rather than depending on inherited
+        env; surface a non-zero exit instead of silently reporting success."""
         ct = os.environ.get("CLAUDE_TEAM_BIN", "claude-team")
         try:
-            subprocess.run([ct, "review", self.session, label], cwd=self.project,
-                           capture_output=True, text=True, timeout=60)
-            return True
+            p = subprocess.run([ct, "review", self.session, label, "--backend", "herdr"],
+                               cwd=self.project, capture_output=True, text=True, timeout=90)
         except (OSError, subprocess.TimeoutExpired):
             return False
+        if p.returncode != 0:
+            self.emit("warn", "%s: reviewer spawn failed (rc=%d): %s"
+                      % (label, p.returncode, (p.stderr or p.stdout or "").strip()[:160]),
+                      label=label)
+            return False
+        return True
 
     def clear_review(self, label, agent):
         """Drop a stale verdict + spawn flag so the next idle re-reviews."""
@@ -271,9 +279,10 @@ class Watcher:
             pass
 
     def maybe_spawn_reviewer(self, label, pane_id, v, agent, doc):
-        """When a worker's deterministic checks pass but its agent-review is
-        still pending, spawn the reviewer and HOLD (don't nudge the worker for
-        the reviewer's absence). Returns True if it took over this idle."""
+        """Spawn the agent-reviewer and HOLD when its review is pending. In the
+        default (end-of-task) mode this waits until the deterministic checks pass;
+        in per_turn mode it fires on EVERY worker idle for continuous review.
+        Returns True if it took over this idle."""
         if not v:
             return False
         checks = v.get("checks", [])
@@ -281,9 +290,12 @@ class Watcher:
         if not review or agent.get("review_spawned"):
             return False
         pending = any(c.get("review_state") == "pending" for c in review)
+        if not pending:
+            return False
+        per_turn = bool(((agent.get("checks") or {}).get("review") or {}).get("per_turn"))
         nonrev_ok = all(c.get("ok") for c in checks if c.get("type") != "review")
-        if not (pending and nonrev_ok):
-            return False  # fix deterministic checks first; verdicts nudge normally
+        if not per_turn and not nonrev_ok:
+            return False  # end-of-task mode: fix deterministic checks first
         if not self.spawn_reviewer(label):
             self.emit("warn", "%s: could not spawn reviewer" % label, label=label)
             return False
@@ -292,8 +304,9 @@ class Watcher:
         agent["state"] = "reviewing"
         self.manifest_write(doc)
         self.sidebar(pane_id, "reviewing…")
-        self.emit("review", "%s: deterministic checks met - spawned reviewer, "
-                  "awaiting verdict" % label, label=label)
+        self.emit("review", "%s: spawned reviewer (%s), awaiting verdict"
+                  % (label, "per-turn" if per_turn else "deterministic checks met"),
+                  label=label)
         return True
 
     def is_our_reviewer(self, reviewer_label):
@@ -426,8 +439,10 @@ class Watcher:
             self.emit("escalated", "%s: reviewer wrote no valid verdict - "
                       "escalated to human" % label, label=label, state="incomplete")
             return False
+        per_turn = bool(((agent.get("checks") or {}).get("review") or {}).get("per_turn"))
+        cap = self.PER_TURN_MAX if per_turn else self.MAX_NUDGES
         blocked = self.pane_blocked_sentinel(pane_id)
-        if blocked or agent.get("nudges", 0) >= self.MAX_NUDGES:
+        if blocked or agent.get("nudges", 0) >= cap:
             agent["state"] = "blocked" if blocked else "incomplete"
             self.manifest_write(doc)
             self.sidebar(pane_id, "✗ %s — needs you" % agent["state"])
@@ -453,14 +468,19 @@ class Watcher:
         else:
             failing = "; ".join(c["detail"] for c in v.get("checks", [])
                                 if not c.get("ok")) or "deliverable checks failed"
-            nudge_text = ("DELIVERABLE UNMET: %s - finish the deliverable or "
-                          "state DELIVERABLE BLOCKED: <reason>" % failing)
+            if per_turn:
+                nudge_text = ("REVIEW (turn %d): %s - incorporate this and continue; "
+                              "state DELIVERABLE BLOCKED: <reason> only if truly stuck"
+                              % (agent["nudges"], failing))
+            else:
+                nudge_text = ("DELIVERABLE UNMET: %s - finish the deliverable or "
+                              "state DELIVERABLE BLOCKED: <reason>" % failing)
         if not self.nudge(pane_id, nudge_text):
             self.emit("warn", "%s: nudge delivery failed - check the pane"
                       % label, label=label)
         self.sidebar(pane_id, "nudged ×%d" % agent["nudges"])
         self.emit("nudged", "%s: nudged (%d/%d): %s"
-                  % (label, agent["nudges"], self.MAX_NUDGES, failing),
+                  % (label, agent["nudges"], cap, failing),
                   label=label, nudges=agent["nudges"])
         return False  # not complete yet; await next idle
 
