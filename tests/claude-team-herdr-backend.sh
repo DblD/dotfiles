@@ -454,6 +454,7 @@ RDOUT=$(cd "$RVP" && "$CT" review rvproj revok --dry-run --backend herdr 2>&1)
 check "review: names the reviewer tab"           "$RDOUT" "revok-review"
 check "review: reviewer uses the review profile" "$RDOUT" "council-fable"
 check "review: reviewer targets verdict artifact" "$RDOUT" "reviews/revok.verdict"
+check "review: reviewer authors a review artifact"  "$RDOUT" "reviews/revok.review.md"
 check "review: reviewer reads worker session"    "$RDOUT" "session"
 # Finding-1 regression: the fixture's review omits `model`, so with a whitespace
 # delimiter the fields shifted and a filesystem PATH was passed as --model. Assert

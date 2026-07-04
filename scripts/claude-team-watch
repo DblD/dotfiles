@@ -68,6 +68,8 @@ class Watcher:
         self.pane_tab = {}        # pane_id -> tab_id
         self.tab_label = {}       # tab_id -> label
         self.reviews = {}         # label -> {"pane": pane_id, "deadline": monotonic}; in-flight
+        self._last_live_check = 0.0  # monotonic ts of the last workspace-liveness check
+        self._gone_count = 0      # consecutive 'workspace gone' observations (quorum before exit)
 
     # ---- output -----------------------------------------------------------
     def emit(self, event, message, **extra):
@@ -278,13 +280,17 @@ class Watcher:
         return True
 
     def clear_review(self, label, agent):
-        """Drop a stale verdict + spawn flag so the next idle re-reviews."""
+        """Drop the stale verdict + review artifact + spawn flag so the next idle
+        re-reviews from scratch. The .review.md must go too: a leftover would
+        otherwise be captured by capture_review_artifact as THIS cycle's audit
+        trail (masking the current reviewer's output)."""
         agent["review_spawned"] = False
-        try:
-            os.remove(os.path.join(self.project, ".claude-team", "reviews",
-                                   label + ".verdict"))
-        except OSError:
-            pass
+        rdir = os.path.join(self.project, ".claude-team", "reviews")
+        for suffix in (".verdict", ".review.md"):
+            try:
+                os.remove(os.path.join(rdir, label + suffix))
+            except OSError:
+                pass
 
     def verdict_ready(self, label):
         """True once the reviewer has written a valid VERDICT line to its artifact.
@@ -337,6 +343,41 @@ class Watcher:
             del self.reviews[label]               # drop before finishing (no re-entry)
             self.finish_review(label, info["pane"], timed_out=not ready)
 
+    def capture_review_artifact(self, label):
+        """Copy the reviewer-authored review file (reviews/<label>.review.md) into
+        results/ as the durable audit trail. Returns True when a non-empty review
+        was captured; False (caller falls back to the flaky pane scrape) when the
+        reviewer wrote nothing. The authored file — not the pane — is the reliable
+        record: pi/non-Anthropic reviewers clear their pane, so the scrape is
+        usually empty (the gap this closes)."""
+        if not self.project:
+            return False
+        src = os.path.join(self.project, ".claude-team", "reviews", label + ".review.md")
+        try:
+            # errors="replace": a reviewer that dumps non-UTF-8 bytes must not crash
+            # the supervisor (a bare read would raise UnicodeDecodeError, a ValueError
+            # that no caller up to run() catches).
+            with open(src, encoding="utf-8", errors="replace") as fh:
+                body = fh.read()
+        except OSError:
+            return False
+        if not body.strip():
+            return False
+        results = os.path.join(self.project, ".claude-team", "results")
+        try:
+            os.makedirs(results, exist_ok=True)
+            path = os.path.join(results,
+                                (label + "-review").replace(os.sep, "-") + ".md")
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write("\n## review of %s (authored)\n\n%s\n" % (label, body))
+        except OSError:
+            return False
+        # Surface the artifact in the --json stream, mirroring collect()'s event,
+        # so a UI/lead sees the durable review was produced.
+        self.emit("collected", "%s: review artifact -> %s" % (label + "-review", path),
+                  label=label, path=path)
+        return True
+
     def finish_review(self, label, pane_id, timed_out=False):
         """Run the parent's completion protocol now that its review is done (verdict
         artifact ready or deadline passed): collect/reap the reviewer tab, run
@@ -349,10 +390,13 @@ class Watcher:
             self.emit("review", "%s: review timed out (%ds) - resolving parent"
                       % (label, self.REVIEW_TIMEOUT), label=label)
         rpane = self.pane_for_label(label + "-review")   # reviewer's job is done
-        if rpane:
+        # Prefer the reviewer-authored review artifact as the durable audit trail;
+        # fall back to scraping the pane only if it didn't write one (pi clears its
+        # own pane, so the scrape is frequently empty).
+        if not self.capture_review_artifact(label) and rpane:
             self.collect(label + "-review", rpane)
-            if self.reap:
-                self.reap_tab(label + "-review", rpane)
+        if rpane and self.reap:
+            self.reap_tab(label + "-review", rpane)
         verdict = self.protocol_on_finished(label, pane_id)
         if verdict:
             if self.collect(label, pane_id):
@@ -630,14 +674,48 @@ class Watcher:
         return False
 
     # ---- main loops ----------------------------------------------------------
+    LIVENESS_INTERVAL = 30.0  # re-check the workspace still exists every N seconds
+    LIVENESS_GONE_QUORUM = 2  # consecutive 'gone' observations required before exiting
+
+    def _maybe_check_alive(self):
+        """Periodically confirm our workspace still exists; exit cleanly once it is
+        gone (via `claude-team --stop`, a crash, or a manual close). Closing a
+        workspace does NOT close the watcher's global event socket, so without this
+        the tick loop would select on a silent socket forever — a leaked process
+        (the exact symptom we saw). Cheap: at most one workspace.list RPC every
+        LIVENESS_INTERVAL seconds. Exit requires LIVENESS_GONE_QUORUM *consecutive*
+        'gone' readings so a single transient/partial reply can't kill a live
+        supervisor mid-run. Any error or malformed reply resets the counter and
+        never exits. Reuses refresh()'s exit convention (sys.exit 0)."""
+        now = time.monotonic()
+        if now - self._last_live_check < self.LIVENESS_INTERVAL:
+            return
+        self._last_live_check = now
+        try:
+            wss = self.rpc("workspace.list", {}).get("workspaces", [])
+            present = any(isinstance(w, dict) and w.get("label") == self.session
+                          for w in wss)
+        except (OSError, RuntimeError, TypeError, ValueError, AttributeError):
+            self._gone_count = 0  # transient/malformed reply — retry next interval, never exit
+            return
+        if not self.ws or present:
+            self._gone_count = 0
+            return
+        self._gone_count += 1
+        if self._gone_count >= self.LIVENESS_GONE_QUORUM:
+            self.emit("closed", "workspace '%s' closed, exiting" % self.session)
+            sys.exit(0)
+
     def _tick(self, s, timeout):
         """Block up to `timeout`s for event-socket data, then ALWAYS poll in-flight
-        reviews before returning. Returns the bytes read, or b'' when the tick only
-        polled (select timed out). Raises ConnectionError if the socket closed. This
-        is the seam that lets the loop reach poll_reviews() on an idle system — a
-        verdict lands asynchronously, so a purely event-driven loop would never see it."""
+        reviews (and periodically check the workspace is still alive) before
+        returning. Returns the bytes read, or b'' when the tick only polled (select
+        timed out). Raises ConnectionError if the socket closed. This is the seam
+        that lets the loop reach poll_reviews() on an idle system — a verdict lands
+        asynchronously, so a purely event-driven loop would never see it."""
         ready, _, _ = select.select([s], [], [], timeout)
         self.poll_reviews()
+        self._maybe_check_alive()
         if not ready:
             return b""
         d = s.recv(65536)

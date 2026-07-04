@@ -181,5 +181,99 @@ w.poll_reviews()
 check("timed-out review still resolves its parent", resolved == ["ra", "rb"])
 check("timed-out review dropped from in-flight", "rb" not in w.reviews)
 
+# 13-17. workspace-liveness self-exit (F3): the tick confirms our workspace still
+#     exists and exits once it's gone, but only after LIVENESS_GONE_QUORUM (2)
+#     CONSECUTIVE 'gone' readings — one transient/partial reply must not kill a
+#     live supervisor. Any error / malformed reply resets the counter, never exits.
+import time as _time
+def gone_watcher():
+    w, _ = mk()
+    w.ws = "wsX"; w._last_live_check = 0.0
+    return w
+
+# a single 'gone' observation does NOT exit (quorum not met)
+w = gone_watcher()
+w.rpc = lambda method=None, params=None: {"workspaces": [{"label": "team-other"}]}
+try:
+    w._maybe_check_alive(); first_survived = True
+except SystemExit:
+    first_survived = False
+check("single 'gone' does not exit (quorum)", first_survived and w._gone_count == 1)
+# a second CONSECUTIVE 'gone' -> exit(0)
+w._last_live_check = 0.0
+try:
+    w._maybe_check_alive(); exited = False
+except SystemExit as e:
+    exited = (e.code == 0)
+check("two consecutive 'gone' -> exit(0)", exited)
+
+# a 'present' reply between resets the counter (no exit next time)
+w = gone_watcher()
+w.rpc = lambda method=None, params=None: {"workspaces": [{"label": "team-other"}]}
+w._maybe_check_alive()                                   # gone_count -> 1
+w._last_live_check = 0.0
+w.rpc = lambda method=None, params=None: {"workspaces": [{"label": "team-x"}]}  # present
+w._maybe_check_alive()
+check("'present' resets the gone counter", w._gone_count == 0)
+
+# malformed rpc results must not crash or exit; they reset. Two shapes:
+#   (a) result isn't a dict -> .get raises AttributeError
+#   (b) 'workspaces' isn't iterable -> the any(...) raises TypeError
+for label, bad in (("non-dict result", ["not-a-dict"]),
+                   ("non-iterable workspaces", {"workspaces": 42})):
+    w = gone_watcher(); w._gone_count = 1
+    w.rpc = (lambda b: (lambda method=None, params=None: b))(bad)
+    try:
+        w._maybe_check_alive(); safe = True
+    except SystemExit:
+        safe = False
+    check("malformed reply (%s) -> no exit, resets" % label,
+          safe and w._gone_count == 0)
+
+# within the interval -> skip the RPC entirely (cheap)
+w = gone_watcher(); w._last_live_check = _time.monotonic()
+called = []
+w.rpc = lambda *a, **k: (called.append(1), {"workspaces": []})[1]
+w._maybe_check_alive()
+check("within interval -> no liveness RPC", called == [])
+
+# 16-19. review audit trail (F2): capture_review_artifact prefers the reviewer's
+#     authored review file and folds it into results/; missing/empty -> False so
+#     the caller falls back to the (flaky) pane scrape.
+w, _ = mk()
+rev_dir = os.path.join(w.project, ".claude-team", "reviews")
+check("no authored review -> capture False", w.capture_review_artifact("w1") is False)
+open(os.path.join(rev_dir, "w1.review.md"), "w").close()   # empty
+check("empty authored review -> capture False", w.capture_review_artifact("w1") is False)
+with open(os.path.join(rev_dir, "w1.review.md"), "w") as fh:
+    fh.write("claim: tests pass -> ran suite, 0 fail\nconclusion: VERIFIED\n")
+ok = w.capture_review_artifact("w1")
+res = os.path.join(w.project, ".claude-team", "results", "w1-review.md")
+body = open(res).read() if os.path.exists(res) else ""
+check("authored review -> capture True", ok is True)
+check("authored review lands in results",
+      "claim: tests pass" in body and "conclusion: VERIFIED" in body)
+
+# 20. F2 hardening: a non-UTF-8 review file must NOT crash the watcher (read uses
+#     errors="replace"; a bare utf-8 read would raise UnicodeDecodeError, uncaught).
+w, _ = mk()
+with open(os.path.join(w.project, ".claude-team", "reviews", "w1.review.md"), "wb") as fh:
+    fh.write(b"claim ok \xff\xfe raw-bytes\nconclusion: VERIFIED\n")
+try:
+    ok = w.capture_review_artifact("w1"); crashed = False
+except Exception:
+    ok, crashed = False, True
+check("non-UTF-8 review captured, no crash", (not crashed) and ok is True)
+
+# 21. F2 hardening: clear_review drops BOTH the verdict AND the review artifact,
+#     so a stale review.md can't be captured as the next cycle's audit trail.
+w, _ = mk()
+rd = os.path.join(w.project, ".claude-team", "reviews")
+open(os.path.join(rd, "w1.verdict"), "w").close()
+open(os.path.join(rd, "w1.review.md"), "w").close()
+w.clear_review("w1", {"review_spawned": True})
+check("clear_review removes stale verdict", not os.path.exists(os.path.join(rd, "w1.verdict")))
+check("clear_review removes stale review.md", not os.path.exists(os.path.join(rd, "w1.review.md")))
+
 print("UNIT: %d fail" % len(fails))
 sys.exit(1 if fails else 0)
