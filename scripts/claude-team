@@ -28,6 +28,10 @@ JSON_OUT=false
 REAP=false
 VERIFY_STATUS=false
 BACKEND="${CLAUDE_TEAM_BACKEND:-tmux}"   # tmux | herdr
+# Did the caller pin the backend explicitly (env or --backend)? If so it wins; else
+# session-scoped commands resolve it from the session's manifest (see resolve_backend).
+BACKEND_EXPLICIT=false
+[[ -n "${CLAUDE_TEAM_BACKEND:-}" ]] && BACKEND_EXPLICIT=true
 HERDR_BIN="$(command -v herdr || echo /opt/homebrew/bin/herdr)"
 
 # Build the claude launch command (accounts for nesting + permission mode)
@@ -444,7 +448,7 @@ manifest_seed() { # $1=session $2=project_path $3=config_file
   $DRY_RUN && return 0
   local dir="$2/${TEAM_DIR}/manifest"
   mkdir -p "$dir"
-  MS_SESSION="$1" MS_PROJECT="$2" MS_CONFIG="$3" MS_OUT="$dir/$1.json" python3 - <<'PYEOF'
+  MS_SESSION="$1" MS_PROJECT="$2" MS_CONFIG="$3" MS_OUT="$dir/$1.json" MS_BACKEND="$BACKEND" python3 - <<'PYEOF'
 import datetime, json, os, subprocess, sys, tempfile
 cfg = os.environ["MS_CONFIG"]
 try:
@@ -489,6 +493,10 @@ for a in agent_list:
                         "checks": checks}
 doc = {"session": os.environ["MS_SESSION"], "config_path": os.path.abspath(cfg),
        "project": os.environ["MS_PROJECT"],
+       # Persist the backend so session-scoped commands (review, --stop, tell, …)
+       # resolve it from here instead of silently defaulting to tmux. Preserve the
+       # old value on a re-spawn that somehow lacks one.
+       "backend": os.environ.get("MS_BACKEND") or (old or {}).get("backend") or "",
        "spawned_at": (old or {}).get("spawned_at")
            or datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
        "agents": agents}
@@ -1309,6 +1317,7 @@ cmd_review() {
   local do_wait=false
   [[ "${3:-}" == "--wait" ]] && do_wait=true
   [[ "$session" != team-* ]] && session="team-${session}"
+  resolve_backend "$session"
   local man=""
   man=$(manifest_path_for "$session") || true
   [[ -z "$man" ]] && { red "no manifest for $session (looked in ./${TEAM_DIR}/manifest/)"; exit 2; }
@@ -1425,6 +1434,32 @@ manifest_path_for() { # $1=session $2=extra_dir (optional)
     fi
   done
   return 1
+}
+
+# Make --backend STICK per session. A session-scoped command (review, --stop, tell,
+# attach, status) must not silently default to tmux for a herdr session. Resolution
+# order: an explicit --backend / CLAUDE_TEAM_BACKEND wins; else the backend recorded
+# in the session's manifest; else a live probe (herdr workspace, then tmux session);
+# else leave the current default. Sets the global BACKEND.
+resolve_backend() { # $1=session
+  $BACKEND_EXPLICIT && return 0
+  local session="$1" man b
+  man=$(manifest_path_for "$session") || true
+  if [[ -n "$man" ]]; then
+    b=$(MAN="$man" python3 -c 'import json,os
+try: print((json.load(open(os.environ["MAN"])) or {}).get("backend") or "")
+except Exception: print("")' 2>/dev/null)
+    if [[ "$b" == "herdr" || "$b" == "tmux" ]]; then BACKEND="$b"; return 0; fi
+  fi
+  # No recorded backend (older manifest / none found) — probe what's actually running.
+  if "$HERDR_BIN" workspace list 2>/dev/null \
+       | yq -p json -r '.result.workspaces[].label' 2>/dev/null | grep -qx "$session"; then
+    BACKEND=herdr; return 0
+  fi
+  if command -v tmux >/dev/null && tmux has-session -t "$session" 2>/dev/null; then
+    BACKEND=tmux; return 0
+  fi
+  return 0
 }
 
 # $1=manifest_path -> "<agent>\t<deliverable>\t<protocol>" per line.
@@ -1631,6 +1666,7 @@ cmd_status() {
     if [[ "$session" != team-* ]]; then
       session="team-${session}"
     fi
+    resolve_backend "$session"
     if ! be_has_session "$session"; then
       local man
       man=$(manifest_path_for "$session") || true
@@ -1690,6 +1726,7 @@ cmd_tell() {
   if [[ "$session" != team-* ]]; then
     session="team-${session}"
   fi
+  resolve_backend "$session"   # honor the session's recorded backend, not the tmux default
 
   case "$BACKEND" in
     tmux)
@@ -1803,6 +1840,7 @@ cmd_stop() {
   if [[ "$session" != team-* ]]; then
     session="team-${session}"
   fi
+  resolve_backend "$session"   # honor the session's recorded backend, not the tmux default
 
   if ! be_has_session "$session"; then
     red "Session not found: $session"
@@ -1863,7 +1901,7 @@ main() {
       --reap) REAP=true ;;
       --verify) VERIFY_STATUS=true ;;
       --session-name) SESSION_NAME_OVERRIDE="$2"; shift ;;
-      --backend) BACKEND="$2"; shift ;;
+      --backend) BACKEND="$2"; BACKEND_EXPLICIT=true; shift ;;
       *) args+=("$1") ;;
     esac
     shift

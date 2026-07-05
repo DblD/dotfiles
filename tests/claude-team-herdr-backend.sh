@@ -185,6 +185,7 @@ Y
   "$CT" spawn "$TMP/mteam.yaml" --backend herdr >/dev/null 2>&1 || true
   Man="$MPROJ/.claude-team/manifest/team-mproj.json"
   check "manifest seeded"        "$(ls "$Man" 2>/dev/null)" "$Man"
+  check "manifest records backend (persist half of backend-stick)" "$(cat "$Man" 2>/dev/null)" '"backend": "herdr"'
   check "manifest has mw checks" "$(cat "$Man" 2>/dev/null)" '"branch_pushed": "agent/mw"'
   check "manifest agent pending" "$(cat "$Man" 2>/dev/null)" '"state": "pending"'
   # re-spawn into the existing session must MERGE-PRESERVE protocol state,
@@ -426,7 +427,7 @@ fi
 RVP="$TMP/rvproj"; mkdir -p "$RVP/.claude-team/manifest" "$RVP/.claude-team/reviews" "$RVP/.claude-team/verifiers"
 echo "read-only reviewer role card" > "$RVP/.claude-team/verifiers/code-review.md"
 cat > "$RVP/.claude-team/manifest/team-rvproj.json" <<J
-{"session":"team-rvproj","config_path":"none","project":"$RVP","spawned_at":"t",
+{"session":"team-rvproj","config_path":"none","project":"$RVP","backend":"herdr","spawned_at":"t",
  "agents":{
   "revok":  {"state":"pending","nudges":0,"verifications":[],"collected":false,"reaped":false,
              "work_dir":"$RVP","checks":{"branch_pushed":"","check":"","review":{"persona":".claude-team/verifiers/code-review.md","profile":"council-fable"}}},
@@ -456,6 +457,11 @@ check "review: reviewer uses the review profile" "$RDOUT" "council-fable"
 check "review: reviewer targets verdict artifact" "$RDOUT" "reviews/revok.verdict"
 check "review: reviewer authors a review artifact"  "$RDOUT" "reviews/revok.review.md"
 check "review: reviewer reads worker session"    "$RDOUT" "session"
+# backend STICKS per session: review WITHOUT --backend resolves herdr from the
+# manifest's "backend" field, instead of silently defaulting to tmux (the bug).
+RSTICK=$(cd "$RVP" && "$CT" review rvproj revok --dry-run 2>&1)
+check    "review: backend sticks (herdr spawn, no --backend flag)" "$RSTICK" "pane run"
+check_eq "review: no tmux fallback when manifest=herdr"            "$(echo "$RSTICK" | grep -c 'tmux ')" "0"
 # Finding-1 regression: the fixture's review omits `model`, so with a whitespace
 # delimiter the fields shifted and a filesystem PATH was passed as --model. Assert
 # no --model appears (model empty) and the reviewer spawns in the work_dir.
