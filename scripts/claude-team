@@ -1735,12 +1735,19 @@ herdr_submit() { # $1=pane $2=message
 
 cmd_tell() {
   local session="" agent="" message="" wait_mode="" wait_secs=""
-  local select_opt="" force=false
+  local select_opt="" force=false expect_select=false
   local positional=()
   local arg
   for arg in "$@"; do
+    if $expect_select; then
+      expect_select=false
+      select_opt="$arg"
+      [[ "$select_opt" =~ ^[0-9]+$ ]] || { red "tell: --select N must be a number (got '$select_opt')"; exit 1; }
+      continue
+    fi
     case "$arg" in
       --wait) wait_mode="ack" ;;
+      --select) expect_select=true ;;
       --select=*) select_opt="${arg#--select=}"
                   [[ "$select_opt" =~ ^[0-9]+$ ]] || { red "tell: --select=N must be a number (got '$select_opt')"; exit 1; } ;;
       --force) force=true ;;
@@ -1754,6 +1761,10 @@ cmd_tell() {
       *) positional+=("$arg") ;;
     esac
   done
+  if $expect_select; then
+    red "tell: --select needs a number (e.g. --select 2)"
+    exit 1
+  fi
   session="${positional[0]:-}"
   agent="${positional[1]:-}"
   message="${positional[2]:-}"
@@ -1761,7 +1772,7 @@ cmd_tell() {
   # message is required for a normal tell, but NOT when --select answers a selector
   if [[ -z "$session" || -z "$agent" ]] || { [[ -z "$message" ]] && [[ -z "$select_opt" ]]; }; then
     red "Usage: claude-team tell <session> <agent> \"<message>\" [--wait[=SECONDS]]"
-    red "   or: claude-team tell <session> <agent> --select <N>   (answer an interactive selector)"
+    red "   or: claude-team tell <session> <agent> --select <N> [\"<message>\"]   (answer a selector, optionally follow up)"
     red "       add --force to send a message even when the pane is at a selector"
     exit 1
   fi
@@ -1788,6 +1799,20 @@ cmd_tell() {
         if $DRY_RUN; then dim "[dry-run] $HERDR_BIN pane send-keys $pane $select_opt enter"
         else "$HERDR_BIN" pane send-keys "$pane" "$select_opt" enter >/dev/null; fi
         green "selected option $select_opt for ${agent}"
+        # Optional chained follow-up: "Type something."-style options submit the
+        # selection immediately and the agent resumes before a second tell can land.
+        # Delivering the instruction in the same command closes that race — either
+        # into the freshly opened text field, or queued in the REPL input.
+        if [[ -n "$message" ]]; then
+          if $DRY_RUN; then
+            dim "[dry-run] sleep 1; $HERDR_BIN pane send-text $pane \"$message\" + send-keys enter (retry until working)"
+          else
+            sleep 1   # let the selector dismiss / text field render before typing
+            herdr_submit "$pane" "$message" \
+              || yellow "couldn't confirm ${agent} picked up the follow-up after 3 Enters — check the pane"
+          fi
+          green "told ${agent}: ${message}"
+        fi
       elif $DRY_RUN; then
         $force || dim "[dry-run] guard: refuse if $pane is at an interactive selector (--force overrides)"
         dim "[dry-run] $HERDR_BIN pane send-text $pane \"$message\" + send-keys enter (retry until working)"
@@ -1803,7 +1828,7 @@ cmd_tell() {
           || yellow "couldn't confirm ${agent} picked up the message after 3 Enters — check the pane"
         green "told ${agent}: ${message}"
       fi
-      if [[ -z "$select_opt" && -n "$wait_mode" ]]; then
+      if [[ -n "$wait_mode" && ( -z "$select_opt" || -n "$message" ) ]]; then
         if $DRY_RUN; then
           dim "[dry-run] $HERDR_BIN wait agent-status $pane --status working --timeout 15000"
           [[ "$wait_mode" == "complete" ]] && \
