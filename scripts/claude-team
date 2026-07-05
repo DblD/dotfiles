@@ -1034,6 +1034,19 @@ STATUSEOF
     echo ""
   done
 
+  # Run a command in the lead ROOT pane so the lead shows the team's state at a
+  # glance instead of sitting as an idle shell. Default: a live `status` dashboard —
+  # plain `status` (NOT --verify: a cheap manifest read, not the per-agent deliverable
+  # checks), refreshed every ~20s. `lead_cmd: none` opts out; any other value runs
+  # verbatim. The lead tab is labelled "lead" by be_new_session, so be_send_lead finds it.
+  local lead_cmd ct_self
+  lead_cmd=$(yq -r '.lead_cmd // ""' "$config_file")
+  ct_self="${BASH_SOURCE[0]}"; command -v realpath >/dev/null && ct_self="$(realpath "$ct_self")"
+  if [[ -z "$lead_cmd" ]]; then
+    lead_cmd="while true; do clear; '${CLAUDE_TEAM_BIN:-$ct_self}' status '${session}'; sleep 20; done"
+  fi
+  [[ "$lead_cmd" != "none" ]] && be_send_lead "$session" "$lead_cmd"
+
   # Note: temp files are intentionally NOT cleaned up here.
   # Claude reads them via $(cat ...) after tmux sends the command.
   # Contract-injected copies live under "$CONTRACT_TMPDIR" (purge with
