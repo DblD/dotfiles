@@ -234,12 +234,21 @@ fi
 
 # --- tell: guaranteed-submission instruction delivery ---
 
-# herdr dry-run: send-text then send-keys enter (bare session name normalizes to team-proj)
+# herdr dry-run: selector-safe send — send-text then Enter RETRIED until the agent
+# picks up (guaranteed submission), plus a guard against blind-sending into a selector.
 TOUT=$("$CT" tell proj w1 "do the thing" --backend herdr --dry-run 2>&1)
-check "tell (herdr) sends text to pane"   "$TOUT" "pane send-text <pane:w1>"
-check "tell (herdr) carries the message"  "$TOUT" 'do the thing'
-check "tell (herdr) presses enter"        "$TOUT" "send-keys <pane:w1> enter"
-check "tell (herdr) confirms delivery"    "$TOUT" "told w1: do the thing"
+check "tell (herdr) sends text to pane"       "$TOUT" "pane send-text <pane:w1>"
+check "tell (herdr) carries the message"      "$TOUT" 'do the thing'
+check "tell (herdr) guarantees submission"    "$TOUT" "retry until working"
+check "tell (herdr) guards against selectors" "$TOUT" "interactive selector"
+check "tell (herdr) confirms delivery"        "$TOUT" "told w1: do the thing"
+# --select answers an interactive selector explicitly (digit + Enter); no message needed
+TSEL=$("$CT" tell proj w1 --select=2 --backend herdr --dry-run 2>&1)
+check "tell --select sends the digit + enter" "$TSEL" "send-keys <pane:w1> 2 enter"
+check "tell --select confirms the choice"     "$TSEL" "selected option 2 for w1"
+# --force skips the selector guard
+TFRC=$("$CT" tell proj w1 "override" --force --backend herdr --dry-run 2>&1)
+check_eq "tell --force skips the selector guard" "$(echo "$TFRC" | grep -c 'interactive selector')" "0"
 
 # tmux dry-run: send-keys with message + Enter
 TT=$("$CT" tell proj w1 "do the thing" --backend tmux --dry-run 2>&1)
