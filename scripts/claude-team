@@ -1709,13 +1709,41 @@ cmd_status() {
 # Motivated by the "typed but never pressed Enter" incident: a message sat
 # unsubmitted at a worker's prompt for an hour. tell always sends text + Enter.
 
+# Detect an interactive selector in an agent pane (plan-approval / confirm menu).
+# claude renders these as "❯ 1. …" numbered options or a "proceed?" prompt. A plain
+# tell into one would let the trailing Enter take the HIGHLIGHTED DEFAULT (this class
+# executed a production `qm destroy`), so tell refuses unless --select / --force.
+herdr_pane_at_selector() { # $1=pane -> 0 if a selector is showing
+  local v
+  v=$("$HERDR_BIN" pane read "$1" --source visible --lines 40 2>/dev/null) || return 1
+  echo "$v" | grep -qE '❯[[:space:]]*[0-9]+\.|Would you like to proceed|Do you want to (proceed|continue)|❯[[:space:]]*(Yes|No)[,.]'
+}
+
+# Send a message to a herdr agent pane and GUARANTEE it submits. Bracketed paste can
+# swallow the Enter, leaving the text typed-but-unsent; press Enter until the agent
+# picks it up (goes working). A repeat Enter on an already-empty REPL input is a no-op,
+# so retrying is safe. Returns non-zero if pickup was never confirmed.
+herdr_submit() { # $1=pane $2=message
+  local pane="$1" msg="$2" i
+  "$HERDR_BIN" pane send-text "$pane" "$msg" >/dev/null
+  for i in 1 2 3; do
+    "$HERDR_BIN" pane send-keys "$pane" enter >/dev/null
+    "$HERDR_BIN" wait agent-status "$pane" --status working --timeout 5000 >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
+
 cmd_tell() {
   local session="" agent="" message="" wait_mode="" wait_secs=""
+  local select_opt="" force=false
   local positional=()
   local arg
   for arg in "$@"; do
     case "$arg" in
       --wait) wait_mode="ack" ;;
+      --select=*) select_opt="${arg#--select=}"
+                  [[ "$select_opt" =~ ^[0-9]+$ ]] || { red "tell: --select=N must be a number (got '$select_opt')"; exit 1; } ;;
+      --force) force=true ;;
       --wait=*)
         wait_mode="complete"
         wait_secs="${arg#--wait=}"
@@ -1730,8 +1758,11 @@ cmd_tell() {
   agent="${positional[1]:-}"
   message="${positional[2]:-}"
 
-  if [[ -z "$session" || -z "$agent" || -z "$message" ]]; then
+  # message is required for a normal tell, but NOT when --select answers a selector
+  if [[ -z "$session" || -z "$agent" ]] || { [[ -z "$message" ]] && [[ -z "$select_opt" ]]; }; then
     red "Usage: claude-team tell <session> <agent> \"<message>\" [--wait[=SECONDS]]"
+    red "   or: claude-team tell <session> <agent> --select <N>   (answer an interactive selector)"
+    red "       add --force to send a message even when the pane is at a selector"
     exit 1
   fi
 
@@ -1752,17 +1783,27 @@ cmd_tell() {
     herdr)
       local pane
       pane=$(be_pane_for "$session" "$agent") || exit 1
-      # TUI agent prompt: pane run is for shell commands; a running agent
-      # needs literal text followed by an explicit Enter keypress.
-      if $DRY_RUN; then
-        dim "[dry-run] $HERDR_BIN pane send-text $pane \"$message\""
-        dim "[dry-run] $HERDR_BIN pane send-keys $pane enter"
+      if [[ -n "$select_opt" ]]; then
+        # Explicitly answer an interactive selector: send the digit, then Enter.
+        if $DRY_RUN; then dim "[dry-run] $HERDR_BIN pane send-keys $pane $select_opt enter"
+        else "$HERDR_BIN" pane send-keys "$pane" "$select_opt" enter >/dev/null; fi
+        green "selected option $select_opt for ${agent}"
+      elif $DRY_RUN; then
+        $force || dim "[dry-run] guard: refuse if $pane is at an interactive selector (--force overrides)"
+        dim "[dry-run] $HERDR_BIN pane send-text $pane \"$message\" + send-keys enter (retry until working)"
+        green "told ${agent}: ${message}"
       else
-        "$HERDR_BIN" pane send-text "$pane" "$message" >/dev/null
-        "$HERDR_BIN" pane send-keys "$pane" enter >/dev/null
+        # Guard: don't blind-send into a selector — a trailing Enter takes the default.
+        if ! $force && herdr_pane_at_selector "$pane"; then
+          red "tell: ${agent} is at an interactive selector — a plain message could take the highlighted default."
+          red "     answer it:  claude-team tell $session $agent --select <N>   (or add --force to send anyway)"
+          exit 1
+        fi
+        herdr_submit "$pane" "$message" \
+          || yellow "couldn't confirm ${agent} picked up the message after 3 Enters — check the pane"
+        green "told ${agent}: ${message}"
       fi
-      green "told ${agent}: ${message}"
-      if [[ -n "$wait_mode" ]]; then
+      if [[ -z "$select_opt" && -n "$wait_mode" ]]; then
         if $DRY_RUN; then
           dim "[dry-run] $HERDR_BIN wait agent-status $pane --status working --timeout 15000"
           [[ "$wait_mode" == "complete" ]] && \
