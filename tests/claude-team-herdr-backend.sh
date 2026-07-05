@@ -97,6 +97,23 @@ check "w4 contract-only file exists" "$([ -f "$W4_PROMPT_PATH" ] && echo yes)" "
 check "w4 contract-only file carries the deliverable contract" \
   "$(cat "$W4_PROMPT_PATH" 2>/dev/null)" "DELIVERABLE CONTRACT"
 
+# --- lead_cmd: the lead ROOT pane auto-runs a command (default = live status dashboard) ---
+# team.yaml has no lead_cmd, so OUT exercises the default.
+LEADLINE=$(echo "$OUT" | grep -F "pane run <pane:lead>")
+check    "lead: default dashboard sent to the lead pane" "$LEADLINE" "pane run <pane:lead>"
+check    "lead: default is plain status of the session"  "$LEADLINE" "status 'team-proj'"
+check    "lead: dashboard refreshes (~20s)"              "$LEADLINE" "sleep 20"
+check_eq "lead: default dashboard is NOT --verify"       "$(echo "$LEADLINE" | grep -c -- '--verify')" "0"
+# explicit lead_cmd runs verbatim
+LC="$TMP/leadproj"; mkdir -p "$LC/.claude-team/agents"; echo x > "$LC/.claude-team/agents/w.md"
+printf 'name: lt\nproject: %s\nworktrees: "false"\nlead_cmd: "echo DASHBOARD-XYZ"\nagents:\n  - {name: lead, role: lead}\n  - {name: w, role: worker, mode: interactive, prompt: .claude-team/agents/w.md}\n' "$LC" > "$LC/lc.yaml"
+LCOUT=$("$CT" spawn "$LC/lc.yaml" --backend herdr --dry-run 2>&1)
+check "lead: explicit lead_cmd runs verbatim" "$(echo "$LCOUT" | grep -F 'pane run <pane:lead>')" "echo DASHBOARD-XYZ"
+# lead_cmd: none -> lead pane gets nothing
+printf 'name: ln\nproject: %s\nworktrees: "false"\nlead_cmd: none\nagents:\n  - {name: lead, role: lead}\n  - {name: w, role: worker, mode: interactive, prompt: .claude-team/agents/w.md}\n' "$LC" > "$LC/ln.yaml"
+LNOUT=$("$CT" spawn "$LC/ln.yaml" --backend herdr --dry-run 2>&1)
+check_eq "lead: lead_cmd=none sends nothing to the lead pane" "$(echo "$LNOUT" | grep -cF 'pane run <pane:lead>')" "0"
+
 # --- verify: pure fixture (no herdr) ---
 VP="$TMP/vproj"; mkdir -p "$VP/.claude-team/manifest" "$TMP/bare.git"
 git init -q --bare "$TMP/bare.git"
