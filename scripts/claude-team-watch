@@ -70,6 +70,7 @@ class Watcher:
         self.reviews = {}         # label -> {"pane": pane_id, "deadline": monotonic}; in-flight
         self._last_live_check = 0.0  # monotonic ts of the last workspace-liveness check
         self._gone_count = 0      # consecutive 'workspace gone' observations (quorum before exit)
+        self._startup_done = False  # run startup_reverify() once (first subscribe)
 
     # ---- output -----------------------------------------------------------
     def emit(self, event, message, **extra):
@@ -617,6 +618,56 @@ class Watcher:
                   label=label, nudges=agent["nudges"])
         return False  # not complete yet; await next idle
 
+    def resolve_finished(self, label, pane):
+        """Run the completion protocol for a worker that finished a turn (idle/done):
+        reviewer re-check, else verify -> collect -> reap-only-if-met. Shared by the
+        live working->idle transition (handle) and the startup re-verify of workers
+        that were already idle when watch started."""
+        if label.endswith("-review") and self.is_our_reviewer(label):
+            self.on_reviewer_finished(label, pane)
+            return
+        verdict = self.protocol_on_finished(label, pane)
+        if verdict:
+            collected = self.collect(label, pane)
+            if collected:
+                self.manifest_mark(label, "collected")
+            # reap ONLY on a verified deliverable — an idle uncontracted agent is
+            # between turns, not done.
+            if self.reap and collected and verdict == "met":
+                if self.reap_tab(label, pane):
+                    self.manifest_mark(label, "reaped")
+
+    def startup_reverify(self):
+        """A worker that finished BEFORE watch started never emits a working->idle
+        transition, so handle() (which fires only on prev=='working') never verifies
+        it — the '--reap misses already-idle workers' blind spot. Once, at startup,
+        run the completion protocol for agent panes that are already idle/done. Skips
+        reviewers and workers already collected/reaped; protocol_on_finished handles
+        the contracted-vs-uncontracted decision (won't reap an uncontracted idle)."""
+        doc = self.manifest() or {}
+        agents = doc.get("agents") or {}
+        try:
+            tabs = self.rpc("tab.list", {"workspace_id": self.ws}).get("tabs", [])
+        except (OSError, RuntimeError, TypeError, ValueError, AttributeError):
+            return
+        for t in tabs:
+            if not isinstance(t, dict):
+                continue
+            label = t.get("label")
+            status = t.get("agent_status")
+            if not label or label.endswith("-review") or status not in ("idle", "done"):
+                continue
+            a = agents.get(label)
+            if not isinstance(a, dict) or a.get("collected") or a.get("reaped"):
+                continue
+            pane = self.pane_for_label(label)
+            if not pane:
+                continue
+            self.last_status[pane] = status  # a later duplicate event won't re-fire this
+            self.emit("startup-reverify",
+                      "%s: already idle at watch start - verifying" % label, label=label)
+            self.resolve_finished(label, pane)
+
     # ---- event dispatch ----------------------------------------------------
     def handle(self, obj, subscribed_panes, known_tabs):
         """Returns True when a re-subscribe (fresh connection) is needed."""
@@ -639,19 +690,7 @@ class Watcher:
                 self.notify_blocked(label, pane)
             elif status in ("idle", "done") and prev == "working":
                 self.emit("finished", "%s: finished" % label, label=label, pane=pane)
-                if label.endswith("-review") and self.is_our_reviewer(label):
-                    self.on_reviewer_finished(label, pane)
-                    return False
-                verdict = self.protocol_on_finished(label, pane)
-                if verdict:
-                    collected = self.collect(label, pane)
-                    if collected:
-                        self.manifest_mark(label, "collected")
-                    # reap ONLY on a verified deliverable — an idle uncontracted
-                    # agent is between turns, not done
-                    if self.reap and collected and verdict == "met":
-                        if self.reap_tab(label, pane):
-                            self.manifest_mark(label, "reaped")
+                self.resolve_finished(label, pane)
             return False
 
         pane = data.get("pane_id") or (data.get("pane") or {}).get("pane_id")
@@ -740,6 +779,11 @@ class Watcher:
             self.emit("watching", "watching %s (%s): %d pane(s)"
                       % (self.session, self.ws, len(panes)),
                       workspace=self.ws, panes=sorted(subscribed))
+            # Once, at first subscribe: verify workers that were ALREADY idle when
+            # watch started (they emit no working->idle transition for handle() to catch).
+            if not self._startup_done:
+                self._startup_done = True
+                self.startup_reverify()
             buf = b""
             while True:  # tick loop: block <=interval for data, then poll reviews
                 # raw recv (makefile buffering drops events); _tick also polls
