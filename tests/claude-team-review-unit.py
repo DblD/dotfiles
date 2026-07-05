@@ -275,5 +275,36 @@ w.clear_review("w1", {"review_spawned": True})
 check("clear_review removes stale verdict", not os.path.exists(os.path.join(rd, "w1.verdict")))
 check("clear_review removes stale review.md", not os.path.exists(os.path.join(rd, "w1.review.md")))
 
+# 22-25. startup_reverify (item 4): verify workers ALREADY idle when watch started —
+#     they emit no working->idle transition, so handle() never catches them. Skips
+#     reviewers, already-collected/reaped workers, and non-idle panes.
+w, _ = mk()
+w.ws = "wsX"
+w.manifest = lambda: {"agents": {
+    "w1": {"checks": {"check": "true"}, "collected": False, "reaped": False},
+    "w2": {"checks": {"check": "true"}, "collected": True,  "reaped": False}}}
+w.rpc = lambda method=None, params=None: {"tabs": [
+    {"label": "w1", "agent_status": "idle"},          # contracted, not collected -> verify
+    {"label": "w2", "agent_status": "idle"},          # already collected -> skip
+    {"label": "w3", "agent_status": "working"},        # not idle -> skip
+    {"label": "rev1-review", "agent_status": "idle"}]} # reviewer -> skip
+w.pane_for_label = lambda l: "pane-" + l
+resolved = []
+w.resolve_finished = lambda label, pane: resolved.append((label, pane))
+w.startup_reverify()
+check("startup: verifies the already-idle contracted worker", resolved == [("w1", "pane-w1")])
+check("startup: skips collected / working / reviewer panes",
+      not any(l in ("w2", "w3", "rev1-review") for l, _ in resolved))
+check("startup: records last_status so a later event won't double-fire",
+      w.last_status.get("pane-w1") == "idle")
+# malformed rpc reply -> no crash, no work
+w, _ = mk(); w.ws = "wsX"
+w.manifest = lambda: {"agents": {}}
+w.rpc = lambda *a, **k: ["not-a-dict"]
+did = []
+w.resolve_finished = lambda *a: did.append(1)
+w.startup_reverify()
+check("startup: malformed rpc reply -> no crash, no work", did == [])
+
 print("UNIT: %d fail" % len(fails))
 sys.exit(1 if fails else 0)
