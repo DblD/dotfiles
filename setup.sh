@@ -20,7 +20,18 @@ ln -sf "$PWD/scripts/bayport-vpn.sh" ~/.bayport-vpn.sh
 ln -sf "$PWD/scripts/bayport-vpn-completion.bash" ~/.bayport-vpn-completion.bash
 mkdir -p ~/.local/bin
 ln -sf "$PWD/scripts/claude-team" ~/.local/bin/claude-team
+ln -sf "$PWD/scripts/claude-yolo-dirs" ~/.local/bin/claude-yolo-dirs
 mkdir -p ~/.config/claude-teams/_templates
+
+# Worker dirs default to bypassPermissions so herdr-resumed agents come back usable
+# rather than dropping to the global "plan" default. Idempotent; skips dirs that are
+# not on this machine, so the same list serves the Mac, dbldframe and the mini.
+if command -v jq &>/dev/null; then
+  echo "Applying Claude yolo worker dirs..."
+  ./scripts/claude-yolo-dirs || echo "  (see above — some entries were refused or failed)"
+else
+  echo "Skipping Claude yolo worker dirs (jq not installed)"
+fi
 
 # Homebrew packages
 if command -v brew &>/dev/null; then

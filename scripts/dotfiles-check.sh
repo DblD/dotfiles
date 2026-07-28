@@ -114,6 +114,7 @@ check_ssh_config() {
 check_scripts_linked() {
   local -A script_links=(
     ["${HOME}/.local/bin/claude-team"]="${REPO_DIR}/scripts/claude-team"
+    ["${HOME}/.local/bin/claude-yolo-dirs"]="${REPO_DIR}/scripts/claude-yolo-dirs"
     ["${HOME}/.bayport-vpn.sh"]="${REPO_DIR}/scripts/bayport-vpn.sh"
     ["${HOME}/.bayport-vpn-completion.bash"]="${REPO_DIR}/scripts/bayport-vpn-completion.bash"
   )
@@ -211,6 +212,22 @@ check_remote_reachable() {
   fi
 }
 
+# ── 11. Claude yolo worker dirs ───────────────────────────────────────────────
+# Drift here is silent and only shows up as agents coming back in plan mode after a
+# herdr restart, so surface it rather than waiting to notice by hand.
+check_claude_yolo_dirs() {
+  if ! command -v jq &>/dev/null; then
+    info "claude-yolo-dirs" "jq not installed — skipped"
+    return
+  fi
+  local out
+  if out="$("${REPO_DIR}/scripts/claude-yolo-dirs" --check 2>&1)"; then
+    pass "claude-yolo-dirs"
+  else
+    fail "claude-yolo-dirs" "$(echo "$out" | grep -E '^(MISSING|REFUSED|FAIL)' | head -3 | tr '\n' ';')"
+  fi
+}
+
 # ── Run all checks ────────────────────────────────────────────────────────────
 check_stow_symlinks
 check_orphaned_links
@@ -222,6 +239,7 @@ check_git_push_state
 check_git_dirty_state
 check_home_bootstrap
 check_remote_reachable
+check_claude_yolo_dirs
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 TOTAL=$((PASS_COUNT + FAIL_COUNT))
