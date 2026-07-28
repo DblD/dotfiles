@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# claude-yolo-dirs — make listed worker directories default to bypassPermissions, so
+# herdr-resumed agents come back usable instead of dropping to the global "plan" default.
+#
+# Reads claude/yolo-dirs.txt (see that file for the why) and writes
+# permissions.defaultMode = "bypassPermissions" into each directory's
+# .claude/settings.local.json. Idempotent: safe to run on every setup.
+#
+#   claude-yolo-dirs           apply
+#   claude-yolo-dirs --check   report only, non-zero if anything is missing//wrong
+#
+# settings.local.json, NOT settings.json: the latter is committed and would impose bypass
+# on anyone who clones the repo. This is a personal, machine-local override.
+set -uo pipefail
+
+REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+MANIFEST="${CLAUDE_YOLO_MANIFEST:-$REPO_DIR/claude/yolo-dirs.txt}"
+MODE="apply"
+[ "${1:-}" = "--check" ] && MODE="check"
+
+# Client-owned paths never get blanket approval — see the manifest header. This is a
+# guard, not a comment, so a careless edit to the list fails loudly instead of quietly
+# switching off the boundary.
+CLIENT_PATTERN='(^|/)(clients|aultech|medical-practice-platform|mw-lab-clients)(/|$)'
+
+command -v jq >/dev/null || { echo "claude-yolo-dirs: jq not found" >&2; exit 1; }
+[ -f "$MANIFEST" ] || { echo "claude-yolo-dirs: no manifest at $MANIFEST" >&2; exit 1; }
+
+applied=0; ok=0; skipped=0; failed=0
+
+while IFS= read -r line || [ -n "$line" ]; do
+  line="${line%%#*}"; line="${line#"${line%%[![:space:]]*}"}"; line="${line%"${line##*[![:space:]]}"}"
+  [ -n "$line" ] || continue
+
+  if printf '%s' "$line" | grep -qE "$CLIENT_PATTERN"; then
+    echo "REFUSED  $line — looks client-owned; client dirs keep the global plan default" >&2
+    failed=$((failed + 1)); continue
+  fi
+
+  d="$HOME/$line"
+  [ -d "$d" ] || { skipped=$((skipped + 1)); continue; }   # not on this machine
+
+  f="$d/.claude/settings.local.json"
+  cur="none"
+  if [ -f "$f" ]; then
+    cur=$(jq -r '.permissions.defaultMode // "unset"' "$f" 2>/dev/null) || {
+      echo "FAIL     $line — .claude/settings.local.json is not valid JSON" >&2
+      failed=$((failed + 1)); continue
+    }
+  fi
+
+  if [ "$cur" = "bypassPermissions" ]; then
+    ok=$((ok + 1))
+    [ "$MODE" = "check" ] && echo "OK       $line"
+    continue
+  fi
+
+  if [ "$MODE" = "check" ]; then
+    echo "MISSING  $line — defaultMode is '$cur'" >&2
+    failed=$((failed + 1)); continue
+  fi
+
+  mkdir -p "$d/.claude"
+  [ -f "$f" ] || echo '{}' > "$f"
+  tmp="$f.tmp.$$"
+  if jq '.permissions.defaultMode = "bypassPermissions"' "$f" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$f"
+  else
+    rm -f "$tmp"; echo "FAIL     $line — jq merge failed" >&2; failed=$((failed + 1)); continue
+  fi
+
+  # Keep the override out of git WITHOUT touching a tracked .gitignore: .git/info/exclude
+  # is local-only. --absolute-git-dir matters — the plain form returns a relative path when
+  # the cwd is elsewhere, which silently writes the exclude to the wrong place.
+  if git -C "$d" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+     && ! git -C "$d" check-ignore -q .claude/settings.local.json 2>/dev/null; then
+    ex="$(git -C "$d" rev-parse --absolute-git-dir)/info/exclude"
+    mkdir -p "$(dirname "$ex")"
+    grep -qxF '.claude/settings.local.json' "$ex" 2>/dev/null \
+      || echo '.claude/settings.local.json' >> "$ex"
+  fi
+
+  echo "SET      $line ($cur -> bypassPermissions)"
+  applied=$((applied + 1))
+done < "$MANIFEST"
+
+if [ "$MODE" = "check" ]; then
+  echo "claude-yolo-dirs: $ok ok, $failed missing/invalid, $skipped not on this machine"
+else
+  echo "claude-yolo-dirs: $applied set, $ok already correct, $skipped not on this machine, $failed failed"
+fi
+[ "$failed" -eq 0 ]
