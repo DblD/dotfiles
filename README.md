@@ -51,7 +51,7 @@ dotfiles/
 ├── zsh/                  # Shell config
 │
 │  Not stowed
-├── nix-darwin/           # macOS system defaults
+│                          # (nix-darwin config moved to nix-config — see below)
 ├── scripts/              # Standalone scripts (symlinked by setup.sh)
 ├── ssh/                  # SSH config (symlinked by setup.sh)
 └── docs/                 # Documentation
@@ -68,7 +68,7 @@ brew install foo
 echo 'brew "foo"' >> ~/.code/dotfiles/Brewfile
 
 # Apply macOS system defaults (rare)
-darwin-rebuild switch --flake ~/.code/dotfiles/nix-darwin
+darwin-rebuild switch --flake ~/nix-config#dblds-air   # see nix-config/docs/operations/darwin-hosts.md
 ```
 
 ## VPN

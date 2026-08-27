@@ -4,7 +4,6 @@
 --ignore=nix-darwin
 --ignore=scripts
 --ignore=docs
---ignore=Brewfile
 --ignore=setup\.sh
 --ignore=README\.md
 --ignore=\.gitignore
