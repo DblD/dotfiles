@@ -1,0 +1,39 @@
+# claude/yolo-dirs.txt — directories whose Claude agents default to bypassPermissions.
+#
+# WHY THIS EXISTS: herdr records only an agent's kind, session id, and cwd for a pane —
+# no argv, no flags. After a server restart it resumes with a bare `claude --resume <id>`,
+# so the agent inherits whatever the settings chain resolves. With a global
+# defaultMode of "plan", every restart handed back plan-mode agents that had to be killed
+# and relaunched under `cy`. Worse, herdr's state dots only track yolo agents — plan-mode
+# ones read as "thinking" — so muster's completion protocol mis-read its own workers.
+#
+# Listing a directory here makes `scripts/claude-yolo-dirs` write
+# permissions.defaultMode = "bypassPermissions" into its .claude/settings.local.json
+# (the gitignored personal-override file — never the committed settings.json, which would
+# impose bypass on everyone who clones).
+#
+# FORMAT: one $HOME-relative path per line. Blank lines and # comments ignored.
+# Paths that don't exist on this machine are skipped, so one shared list serves the Mac,
+# dbldframe, and the mini even though each holds a different subset.
+#
+# DO NOT ADD CLIENT DIRECTORIES. The script hard-refuses paths that look client-owned
+# (clients/, aultech, medical-practice-platform, mw-lab-clients) because blanket-approving
+# actions there cuts against the never-touch-client-prod boundary. Client work keeps the
+# global "plan" default and an explicit human in the loop.
+
+# --- lab / infrastructure repos ---
+.code/nix-config
+.code/muster
+
+# --- incubator + experiments (~/.code/scratch/<name>) ---
+.code/scratch/b60-ai
+.code/scratch/esp32-cam
+.code/scratch/k8s-platform
+.code/scratch/media-platform
+.code/scratch/scott-gpt
+.code/scratch/skool-cli
+.code/scratch/td-mcp
+.code/scratch/td-server
+
+# --- loose scratch ---
+scratch

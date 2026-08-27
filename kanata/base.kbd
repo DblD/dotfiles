@@ -1,0 +1,34 @@
+;; kanata config — macOS (the Mac runs THIS file directly via `kanata --cfg`).
+;; Part of keybinding-unification, Ring 2 (the modifier substrate).
+;;
+;; Caps Lock (dual-role):
+;;   tap  -> Esc          (nvim normal mode)
+;;   hold -> Left Option  (Alt — the Aerospace WM modifier on macOS)
+;;
+;; Home-row Ctrl (dual-role on d and k):
+;;   tap  -> the letter
+;;   hold -> Ctrl
+;; Opposite-hand rule: pressing a SAME-hand key (or space) forces an immediate TAP, so
+;; fast same-hand rolls just type letters; only an opposite-hand chord yields Ctrl. This is
+;; what keeps home-row mods from misfiring mid-typing. Timings (tap/hold ms) are the single
+;; tuning point — lower the hold to make Ctrl snappier, raise it if you get accidental Ctrl.
+;;
+;; SHARED muscle memory with the frame: tap=Esc and the home-row Ctrl (d/k) are IDENTICAL
+;; on both machines. Only caps-HOLD differs by design — it's each OS's window-manager mod:
+;; Option here (Aerospace), Left Super on the frame (Hyprland). The frame's equivalent lives
+;; inline in nix-config hosts/dbldframe/keyboard.nix (services.kanata); keep the d/k logic
+;; and timings in sync with this file.
+
+(defcfg
+  process-unmapped-keys yes)
+
+(defalias
+  cap (tap-hold 200 200 esc lalt)
+  hd  (tap-hold-release-keys 200 200 d lctl (q w e r t a s f g z x c v b spc))
+  hk  (tap-hold-release-keys 200 200 k lctl (y u i o p h j l ; n m , . / spc)))
+
+(defsrc
+  caps d k)
+
+(deflayer base
+  @cap @hd @hk)

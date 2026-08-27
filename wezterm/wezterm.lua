@@ -1,43 +1,43 @@
 local wezterm = require 'wezterm'
 local act = wezterm.action
 
--- Catppuccin themes (light to dark) + custom sepia variant
-local catppuccin_themes = {
-	'Catppuccin Latte',       -- Light
-	'Sepia Latte',            -- Light warm/parchment
-	'Catppuccin Frappe',      -- Light-dark
-	'Catppuccin Macchiato',   -- Dark-light
-	'Catppuccin Mocha',       -- Dark
-}
-
--- Sepia overrides: warm parchment tones on Latte base
+-- Sepia Latte — warm parchment variant of Catppuccin Latte
 local sepia_colors = {
-	background = '#f5ead0',
+	background = '#eadcb8',
 	foreground = '#5c4a32',
 	cursor_bg = '#8a6d4b',
-	cursor_fg = '#f5ead0',
-	selection_bg = '#e0d1b0',
+	cursor_fg = '#eadcb8',
+	selection_bg = '#d4c4a0',
 	selection_fg = '#5c4a32',
 	ansi = {
-		'#ede3d0', -- black (warm parchment — used as code block bg)
+		'#e2d6b8', -- black (warm parchment — code block bg)
 		'#d9b0a0', -- red (warm blush parchment — diff removed bg)
 		'#c5d4b0', -- green (warm sage parchment — diff added bg)
-		'#9e7a2a', -- yellow (amber)
-		'#62728a', -- blue (dusty)
-		'#876080', -- magenta (muted)
-		'#5f8a78', -- cyan (sage)
+		'#8a6a18', -- yellow (deeper amber)
+		'#506890', -- blue (richer)
+		'#7a5075', -- magenta (richer)
+		'#487868', -- cyan (deeper sage)
 		'#5c4a32', -- white (warm dark)
 	},
 	brights = {
-		'#c8b898', -- bright black (warm tan — diff context bg)
-		'#b86060', -- bright red
-		'#6f8e60', -- bright green
-		'#b08a30', -- bright yellow
-		'#7282a0', -- bright blue
-		'#9a7093', -- bright magenta
-		'#70a090', -- bright cyan
+		'#c0b088', -- bright black (warm tan — diff context bg)
+		'#b85050', -- bright red (deeper)
+		'#4d8030', -- bright green (richer, less washed)
+		'#a07820', -- bright yellow (deeper amber)
+		'#5570a0', -- bright blue (deeper)
+		'#8a5880', -- bright magenta (richer)
+		'#408878', -- bright cyan (deeper teal)
 		'#4a3a24', -- bright white
 	},
+}
+
+-- Catppuccin themes (light to dark) + Sepia variant
+local catppuccin_themes = {
+	'Sepia Latte',        -- Warm light
+	'Catppuccin Latte',   -- Light
+	'Catppuccin Frappe',  -- Light-dark
+	'Catppuccin Macchiato', -- Dark-light
+	'Catppuccin Mocha',   -- Dark
 }
 
 -- Build theme picker choices
@@ -92,14 +92,15 @@ config.keys = {
 			end),
 		},
 	},
-	-- Quick toggle: Sepia Latte (light) <-> Mocha (dark) (Ctrl+Shift+L)
+	-- Quick toggle: Sepia Latte (warm light) <-> Mocha (dark) (Ctrl+Shift+L)
 	{
 		key = 'l',
 		mods = 'CTRL|SHIFT',
 		action = wezterm.action_callback(function(window, pane)
 			local overrides = window:get_config_overrides() or {}
-			local has_sepia = overrides.colors and overrides.colors.background == sepia_colors.background
-			if has_sepia then
+			local current = overrides.color_scheme or 'Catppuccin Mocha'
+			local is_light = current == 'Catppuccin Latte' or overrides.colors ~= nil
+			if is_light then
 				overrides.color_scheme = 'Catppuccin Mocha'
 				overrides.colors = nil
 			else
@@ -115,8 +116,11 @@ config.keys = {
 		mods = 'CTRL|SHIFT',
 		action = wezterm.action_callback(function(window, pane)
 			local overrides = window:get_config_overrides() or {}
-			local has_sepia = overrides.colors and overrides.colors.background == sepia_colors.background
-			local current = has_sepia and 'Sepia Latte' or (overrides.color_scheme or 'Catppuccin Mocha')
+			local current = overrides.color_scheme or 'Catppuccin Mocha'
+			-- Detect if we're on sepia (has color overrides on Latte base)
+			if overrides.colors ~= nil then
+				current = 'Sepia Latte'
+			end
 			local next_theme = catppuccin_themes[1]
 			for i, theme in ipairs(catppuccin_themes) do
 				if theme == current then

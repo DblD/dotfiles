@@ -15,4 +15,5 @@ zsh/work.zsh
 result
 *.backup
 *.bak*
+._*
 scripts/__pycache__/
