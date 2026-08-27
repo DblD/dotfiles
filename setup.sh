@@ -107,11 +107,30 @@ with open('$dist_dir/policies.json', 'w') as out:
 
 install_zen_policies
 
-# Shell bootstrap (manual files in ~)
+# Shell bootstrap — files that must live in ~ (not stow-managed)
+echo "Bootstrapping zsh..."
+
+# Remove stale ~/.zshrc symlink from old stow layout
+[ -L ~/.zshrc ] && rm -f ~/.zshrc && echo "  removed stale ~/.zshrc symlink"
+
+# ~/.zshenv — redirects zsh to ZDOTDIR
+cat > ~/.zshenv <<'ZSHENV'
+export ZDOTDIR="$HOME/.config/zsh"
+ZSHENV
+echo "  wrote ~/.zshenv (ZDOTDIR → ~/.config/zsh)"
+
+# ~/.zprofile — brew + nix PATH setup (login shell)
+if [ ! -f ~/.zprofile ] || ! grep -q 'brew shellenv' ~/.zprofile; then
+  cat > ~/.zprofile <<'ZPROFILE'
+eval "$(/opt/homebrew/bin/brew shellenv)"
+ZPROFILE
+  echo "  wrote ~/.zprofile (brew shellenv)"
+else
+  echo "  ~/.zprofile already configured, skipping"
+fi
+
 echo ""
-echo "Manual steps:"
-echo "  1. Ensure ~/.zshenv contains: export ZDOTDIR=\"\$HOME/.config/zsh\""
-echo "  2. Ensure ~/.zprofile contains: eval \"\$(/opt/homebrew/bin/brew shellenv)\""
-echo "  3. Copy zsh/work.zsh.example to ~/.config/zsh/work.zsh and customize"
+echo "Optional manual step:"
+echo "  Copy zsh/work.zsh.example to ~/.config/zsh/work.zsh and customize"
 echo ""
 echo "Done!"
